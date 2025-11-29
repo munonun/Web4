@@ -1,4 +1,4 @@
-<img width="868" height="674" alt="image" src="https://github.com/user-attachments/assets/f9828e37-7e3f-48df-b3d8-4ffab5fdab1e" /># Web4 — A Stateless, Fully Anonymous Next-Generation Network Model
+# Web4 — A Stateless, Fully Anonymous Next-Generation Network Model
 
 Web4 is a novel networking model designed to overcome the inherent structural limits of Web3.  
 Current decentralized systems rely on permanent ledgers, global ordering, timestamps, and graph structures — making full anonymity mathematically impossible.  
