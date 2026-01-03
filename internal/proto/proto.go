@@ -2,7 +2,7 @@
 package proto
 
 import (
-	"crypto/sha256"
+	"crypto/sha3"
 	"encoding/binary"
 )
 
@@ -45,7 +45,9 @@ func IOUBytes(i IOU) []byte {
 	return b
 }
 
-func ContractID(i IOU) [32]byte { return sha256.Sum256(IOUBytes(i)) }
+func ContractID(i IOU) [32]byte {
+	return sha3.Sum256(IOUBytes(i))
+}
 
 func RepayReqBytes(r RepayReq) []byte {
 	b := make([]byte, 0, 32+8+1)

@@ -64,7 +64,11 @@ func main() {
 		}
 
 		iou := proto.IOU{Creditor: to, Debtor: pub, Amount: *amount, Nonce: *nonce}
-		sigB := crypto.Sign(priv, proto.IOUBytes(iou))
+
+		// v0.0.2: sign over SHA3_256(message)
+		iouMsg := proto.IOUBytes(iou)
+		sigB := crypto.Sign(priv, crypto.SHA3_256(iouMsg))
+
 		// NOTE: in real life creditor also signs; for MVP we allow "half-open" then later attach creditor sig.
 		c := proto.Contract{
 			IOU:     iou,
@@ -106,7 +110,11 @@ func main() {
 		copy(cid[:], idBytes)
 
 		req := proto.RepayReq{ContractID: cid, ReqNonce: *reqNonce, Close: true}
-		sig := crypto.Sign(priv, proto.RepayReqBytes(req))
+
+		// v0.0.2: sign over SHA3_256(message)
+		reqMsg := proto.RepayReqBytes(req)
+		sig := crypto.Sign(priv, crypto.SHA3_256(reqMsg))
+
 		_ = pub // (debtor pub already in key file)
 
 		fmt.Println("SEND repay-request")
@@ -144,7 +152,10 @@ func main() {
 		_ = sigB
 
 		ack := proto.Ack{ContractID: cid, ReqNonce: *reqNonce, Decision: uint8(*decision), Close: true}
-		sigA := crypto.Sign(privA, proto.AckBytes(ack))
+
+		// v0.0.2: sign over SHA3_256(message)
+		ackMsg := proto.AckBytes(ack)
+		sigA := crypto.Sign(privA, crypto.SHA3_256(ackMsg))
 
 		if *decision == 1 {
 			if err := st.MarkClosed(cid, *forget); err != nil {
