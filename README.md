@@ -43,15 +43,6 @@ Web4 removes the root cause: **the existence of a global record.**
 
 ---
 
-## Funding goal
-
-I am requesting modest funding (approx. €2500) to support development equipment  
-(ARM hardware for testing, additional storage, and compute resources).  
-As a young independent researcher, this support enables me to continue work on  
-the theoretical model and begin building the PoC in Within February 2026.
-
----
-
 ## License
 
 This project is released under the MIT License.
