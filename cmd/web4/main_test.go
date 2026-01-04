@@ -1,0 +1,271 @@
+package main
+
+import (
+	"bufio"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"web4mvp/internal/crypto"
+	"web4mvp/internal/network"
+	"web4mvp/internal/proto"
+	"web4mvp/internal/store"
+)
+
+func TestOpenCloseAckFlow(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeB, "keygen")
+	runOK(t, homeA, "keygen")
+
+	pubA := loadPub(t, homeA)
+	pubB := loadPub(t, homeB)
+
+	openMsgPath := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "500",
+		"--nonce", "1",
+		"--out", openMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", openMsgPath)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 500, Nonce: 1}
+	cid := proto.ContractID(iou)
+	cidHex := hex.EncodeToString(cid[:])
+
+	closeMsgPath := filepath.Join(t.TempDir(), "close.json")
+	runOK(t, homeB, "close",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--out", closeMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", closeMsgPath)
+
+	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
+	runOK(t, homeA, "ack",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--decision", "1",
+		"--out", ackMsgPath,
+	)
+	runOK(t, homeB, "recv", "--in", ackMsgPath)
+
+	if err := runWithHome(homeA, "close", "--id", cidHex, "--reqnonce", "2"); err == nil || !strings.Contains(err.Error(), "debtor mismatch") {
+		t.Fatalf("expected debtor mismatch error, got: %v", err)
+	}
+
+	closeMsg, err := os.ReadFile(closeMsgPath)
+	if err != nil {
+		t.Fatalf("read close message failed: %v", err)
+	}
+	repayMsg, err := proto.DecodeRepayReqMsg(closeMsg)
+	if err != nil {
+		t.Fatalf("decode repay request failed: %v", err)
+	}
+	if err := runWithHome(homeB, "ack",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--sigb", repayMsg.SigB,
+		"--decision", "1",
+	); err == nil || !strings.Contains(err.Error(), "creditor mismatch") {
+		t.Fatalf("expected creditor mismatch error, got: %v", err)
+	}
+}
+
+func TestQuicRecvOpen(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA := loadPub(t, homeA)
+	pubB := loadPub(t, homeB)
+
+	openMsgPath := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "10",
+		"--nonce", "1",
+		"--out", openMsgPath,
+	)
+	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 10, Nonce: 1}
+	cid := proto.ContractID(iou)
+	cidHex := hex.EncodeToString(cid[:])
+
+	addr := freeUDPAddr(t)
+	root := filepath.Join(homeA, ".web4mvp")
+	_ = os.MkdirAll(root, 0700)
+	st := store.New(
+		filepath.Join(root, "contracts.jsonl"),
+		filepath.Join(root, "acks.jsonl"),
+		filepath.Join(root, "repayreqs.jsonl"),
+	)
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_ = network.ListenAndServeWithReady(addr, ready, func(data []byte) {
+			recvData(data, st)
+			select {
+			case <-done:
+			default:
+				close(done)
+			}
+		})
+	}()
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for quic server ready")
+	}
+
+	msgData, err := os.ReadFile(openMsgPath)
+	if err != nil {
+		t.Fatalf("read open msg failed: %v", err)
+	}
+	if err := network.Send(addr, msgData, true); err != nil {
+		t.Fatalf("quic send failed: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for quic receive")
+	}
+	waitForContract(t, homeA, cidHex, 5*time.Second)
+}
+
+func runOK(t *testing.T, home string, args ...string) {
+	t.Helper()
+	if err := runWithHome(home, args...); err != nil {
+		t.Fatalf("command failed: %v\nargs=%v", err, args)
+	}
+}
+
+func runWithHome(home string, args ...string) error {
+	if err := ensureGoCaches(); err != nil {
+		return err
+	}
+	cmd := exec.Command("go", append([]string{"run", "."}, args...)...)
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	cmd.Dir = wd
+	cmd.Env = applyEnv(os.Environ(),
+		"HOME="+home,
+		"GOMODCACHE="+modCacheDir,
+		"GOCACHE="+goCacheDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("command failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func loadPub(t *testing.T, home string) []byte {
+	t.Helper()
+	root := filepath.Join(home, ".web4mvp")
+	pub, _, err := crypto.LoadKeypair(root)
+	if err != nil {
+		t.Fatalf("load keypair failed: %v", err)
+	}
+	return pub
+}
+
+func waitForContract(t *testing.T, home, cidHex string, timeout time.Duration) {
+	t.Helper()
+	contractsPath := filepath.Join(home, ".web4mvp", "contracts.jsonl")
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(contractsPath)
+		if err == nil && len(data) != 0 {
+			sc := bufio.NewScanner(strings.NewReader(string(data)))
+			for sc.Scan() {
+				var c proto.Contract
+				if err := json.Unmarshal(sc.Bytes(), &c); err == nil {
+					id := proto.ContractID(c.IOU)
+					if hex.EncodeToString(id[:]) == cidHex {
+						return
+					}
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for contract %s", cidHex)
+}
+
+func freeUDPAddr(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen udp failed: %v", err)
+	}
+	defer pc.Close()
+	return pc.LocalAddr().String()
+}
+
+var (
+	cacheOnce   sync.Once
+	modCacheDir string
+	goCacheDir  string
+	cacheErr    error
+)
+
+func ensureGoCaches() error {
+	cacheOnce.Do(func() {
+		modCacheDir, cacheErr = goEnvValue("GOMODCACHE")
+		if cacheErr != nil {
+			return
+		}
+		goCacheDir, cacheErr = goEnvValue("GOCACHE")
+	})
+	return cacheErr
+}
+
+func goEnvValue(key string) (string, error) {
+	cmd := exec.Command("go", "env", key)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func applyEnv(base []string, overrides ...string) []string {
+	out := make([]string, 0, len(base)+len(overrides))
+	overrideKeys := make(map[string]string, len(overrides))
+	for _, kv := range overrides {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		overrideKeys[parts[0]] = kv
+	}
+	for _, kv := range base {
+		parts := strings.SplitN(kv, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if _, exists := overrideKeys[parts[0]]; exists {
+			continue
+		}
+		out = append(out, kv)
+	}
+	for _, kv := range overrides {
+		out = append(out, kv)
+	}
+	return out
+}

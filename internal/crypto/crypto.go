@@ -25,10 +25,10 @@ import (
 //   (즉, MV가 들어갈 자리에 지금은 ed25519가 들어가 있음)
 // -----------------------------------------------------------------------------
 
-const (
-	// 기존 코드 호환용 (현재는 ed25519 pubkey size)
-	PubLen = ed25519.PublicKeySize
+// 기존 코드 호환용 (현재는 ed25519 pubkey size)
+const PubLen = ed25519.PublicKeySize
 
+const (
 	// XChaCha20-Poly1305 sizes
 	XKeySize   = chacha20poly1305.KeySize          // 32
 	XNonceSize = chacha20poly1305.NonceSizeX       // 24
