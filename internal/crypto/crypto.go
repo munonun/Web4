@@ -2,6 +2,7 @@
 package crypto
 
 import (
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/sha3"
@@ -30,8 +32,13 @@ const PubLen = ed25519.PublicKeySize
 
 const (
 	// XChaCha20-Poly1305 sizes
-	XKeySize   = chacha20poly1305.KeySize          // 32
-	XNonceSize = chacha20poly1305.NonceSizeX       // 24
+	XKeySize   = chacha20poly1305.KeySize    // 32
+	XNonceSize = chacha20poly1305.NonceSizeX // 24
+)
+
+const (
+	MaxHKDFOutLen = 1 << 20
+	hkdfLabel     = "web4:"
 )
 
 // -----------------------------------------------------------------------------
@@ -58,6 +65,70 @@ func HMAC_SHA3_512(key, msg []byte) []byte {
 	mac := hmac.New(sha3.New512, key)
 	_, _ = mac.Write(msg)
 	return mac.Sum(nil)
+}
+
+// -----------------------------------------------------------------------------
+// HKDF-like helpers (HMAC-SHA3-256)
+// -----------------------------------------------------------------------------
+
+func Extract(salt, ikm []byte) ([]byte, error) {
+	if len(ikm) == 0 {
+		return nil, errors.New("empty ikm")
+	}
+	if len(salt) == 0 {
+		salt = make([]byte, 32)
+	}
+	return HMAC_SHA3_256(salt, ikm), nil
+}
+
+func Expand(prk, info []byte, outLen int) ([]byte, error) {
+	if len(prk) == 0 {
+		return nil, errors.New("empty prk")
+	}
+	if outLen <= 0 {
+		return nil, errors.New("invalid outLen")
+	}
+	if outLen > MaxHKDFOutLen {
+		return nil, errors.New("outLen too large")
+	}
+	if len(info) == 0 {
+		return nil, errors.New("empty info")
+	}
+	if !strings.HasPrefix(string(info), hkdfLabel) {
+		return nil, fmt.Errorf("missing domain separation label: %s", hkdfLabel)
+	}
+	hashLen := 32
+	n := (outLen + hashLen - 1) / hashLen
+	if n > 255 {
+		return nil, errors.New("outLen too large for HKDF")
+	}
+	okm := make([]byte, 0, n*hashLen)
+	var t []byte
+	for i := 1; i <= n; i++ {
+		buf := make([]byte, 0, len(t)+len(info)+1)
+		buf = append(buf, t...)
+		buf = append(buf, info...)
+		buf = append(buf, byte(i))
+		t = HMAC_SHA3_256(prk, buf)
+		okm = append(okm, t...)
+	}
+	return okm[:outLen], nil
+}
+
+func DeriveKeyE(ikm []byte, context string, outLen int) ([]byte, error) {
+	prk, err := Extract(nil, ikm)
+	if err != nil {
+		return nil, err
+	}
+	return Expand(prk, []byte(context), outLen)
+}
+
+func DeriveKey(ikm []byte, context string, outLen int) []byte {
+	okm, err := DeriveKeyE(ikm, context, outLen)
+	if err != nil {
+		return nil
+	}
+	return okm
 }
 
 // -----------------------------------------------------------------------------
@@ -96,6 +167,45 @@ func XOpen(key32, nonce24, ciphertext, aad []byte) ([]byte, error) {
 		return nil, err
 	}
 	return aead.Open(nil, nonce24, ciphertext, aad)
+}
+
+// -----------------------------------------------------------------------------
+// X25519 ephemeral helpers (optional)
+// -----------------------------------------------------------------------------
+
+func GenerateEphemeral() ([]byte, []byte, error) {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	return priv.Bytes(), priv.PublicKey().Bytes(), nil
+}
+
+func DeriveShared(privKey, peerPub []byte) ([]byte, error) {
+	if len(privKey) == 0 || len(peerPub) == 0 {
+		return nil, errors.New("empty key material")
+	}
+	priv, err := ecdh.X25519().NewPrivateKey(privKey)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := ecdh.X25519().NewPublicKey(peerPub)
+	if err != nil {
+		return nil, err
+	}
+	shared, err := priv.ECDH(pub)
+	if err != nil {
+		return nil, err
+	}
+	prk, err := Extract(nil, shared)
+	if err != nil {
+		return nil, err
+	}
+	okm, err := Expand(prk, []byte("web4:v0:x25519"), XKeySize)
+	if err != nil {
+		return nil, err
+	}
+	return okm, nil
 }
 
 // -----------------------------------------------------------------------------

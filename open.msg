@@ -1,0 +1,1 @@
+{"type":"contract_open","creditor":"672f66970434cfbbc7299175fcc4d47e78ece5c3fdbdc0af75e4d9e623393b76","debtor":"355abb3fe52aa8ea394cee21b2936b97188b02d1c1bba952063d8c1a7d13cae7","amount":430,"nonce":1,"sigB":"ca3011c73f68f730cd6efbd922708bbff25d49ac138678d3dadfcd458b7425f25e0cdfff1bce03f8b2afac7aa7993890a62791a0aff23435dd44066d5219bc06"}

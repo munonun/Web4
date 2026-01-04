@@ -346,6 +346,11 @@ func main() {
 		if err != nil {
 			die("read message failed", err)
 		}
+		payload, err := proto.ReadFrame(bytes.NewReader(data))
+		if err == nil {
+			recvData(payload, st)
+			return
+		}
 		recvData(data, st)
 
 	case "quic-listen":

@@ -16,6 +16,8 @@ import (
 	"time"
 
 	quic "github.com/quic-go/quic-go"
+
+	"web4mvp/internal/proto"
 )
 
 type zeroReader struct{}
@@ -114,6 +116,10 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 			for {
 				stream, err := c.AcceptStream(context.Background())
 				if err != nil {
+					if isBenignAcceptErr(err) {
+						logInfo("quic accept stream closed: %v", err)
+						return
+					}
 					logInfo("quic accept stream error: %v", err)
 					return
 				}
@@ -121,18 +127,16 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 				go func(s *quic.Stream) {
 					defer s.Close()
 					logInfo("read start")
-					data, err := io.ReadAll(s)
+					data, err := proto.ReadFrame(s)
 					if err != nil {
 						if errors.Is(err, io.EOF) {
 							logInfo("quic read error: EOF")
 						} else {
 							logInfo("quic read error: %v", err)
 						}
-					}
-					logInfo("read %d bytes", len(data))
-					if len(data) == 0 {
 						return
 					}
+					logInfo("read %d bytes", len(data))
 					msgType := "unknown"
 					var hdr struct {
 						Type string `json:"type"`
@@ -154,25 +158,46 @@ func Send(addr string, data []byte, insecure bool) error {
 		return err
 	}
 	conn, err := quic.DialAddr(context.Background(), addr, tlsConf, nil)
-    if err != nil { return err }
-    defer conn.CloseWithError(0, "")
-
+	if err != nil {
+		return err
+	}
 	stream, err := conn.OpenStreamSync(context.Background())
-    if err != nil { return err }
-
-    n, err := stream.Write(data)
-    if err != nil { return err }
-    logInfo("wrote %d bytes", n)
-
+	if err != nil {
+		_ = conn.CloseWithError(0, "")
+		return err
+	}
+	frame, err := proto.EncodeFrame(data)
+	if err != nil {
+		_ = conn.CloseWithError(0, "")
+		return err
+	}
+	if _, err := stream.Write(frame); err != nil {
+		_ = conn.CloseWithError(0, "")
+		return err
+	}
 	if err := stream.Close(); err != nil {
-        logInfo("quic stream close error: %v", err)
-        return err
-    }
-
-    time.Sleep(100 * time.Millisecond) // dev/WSL 안정화용(선택)
-    return nil
+		logInfo("quic stream close error: %v", err)
+		_ = conn.CloseWithError(0, "")
+		return err
+	}
+	time.Sleep(100 * time.Millisecond)
+	_ = conn.CloseWithError(0, "")
+	return nil
 }
 
 func logInfo(format string, args ...any) {
 	_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func isBenignAcceptErr(err error) bool {
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+	var appErr *quic.ApplicationError
+	if errors.As(err, &appErr) {
+		if appErr.ErrorCode == 0 && appErr.Remote {
+			return true
+		}
+	}
+	return false
 }
