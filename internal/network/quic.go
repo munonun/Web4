@@ -95,39 +95,41 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 	}
 	listener, err := quic.ListenAddr(addr, tlsConf, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "quic listen error: %v\n", err)
+		logInfo("quic listen error: %v", err)
 		return err
 	}
+	logInfo("quic listen ready: %s", addr)
 	if ready != nil {
 		close(ready)
 	}
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "quic accept error: %v\n", err)
+			logInfo("quic accept error: %v", err)
 			return err
 		}
+		logInfo("accepted connection")
 		go func() {
 			c := conn
 			for {
 				stream, err := c.AcceptStream(context.Background())
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "quic accept stream error: %v\n", err)
+					logInfo("quic accept stream error: %v", err)
 					return
 				}
-				fmt.Println("accepted stream")
+				logInfo("accepted stream")
 				go func(s *quic.Stream) {
 					defer s.Close()
-					fmt.Println("read start")
+					logInfo("read start")
 					data, err := io.ReadAll(s)
 					if err != nil {
 						if errors.Is(err, io.EOF) {
-							fmt.Fprintln(os.Stderr, "quic read error: EOF")
+							logInfo("quic read error: EOF")
 						} else {
-							fmt.Fprintf(os.Stderr, "quic read error: %v\n", err)
+							logInfo("quic read error: %v", err)
 						}
 					}
-					fmt.Printf("read %d bytes\n", len(data))
+					logInfo("read %d bytes", len(data))
 					if len(data) == 0 {
 						return
 					}
@@ -138,7 +140,7 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 					if err := json.Unmarshal(data, &hdr); err == nil && hdr.Type != "" {
 						msgType = hdr.Type
 					}
-					fmt.Printf("read %d bytes, type=%s, calling recv\n", len(data), msgType)
+					logInfo("read %d bytes, type=%s, calling recv", len(data), msgType)
 					handle(data)
 				}(stream)
 			}
@@ -152,19 +154,25 @@ func Send(addr string, data []byte, insecure bool) error {
 		return err
 	}
 	conn, err := quic.DialAddr(context.Background(), addr, tlsConf, nil)
-	if err != nil {
-		return err
-	}
+    if err != nil { return err }
+    defer conn.CloseWithError(0, "")
+
 	stream, err := conn.OpenStreamSync(context.Background())
-	if err != nil {
-		return err
-	}
-	if _, err := stream.Write(data); err != nil {
-		return err
-	}
+    if err != nil { return err }
+
+    n, err := stream.Write(data)
+    if err != nil { return err }
+    logInfo("wrote %d bytes", n)
+
 	if err := stream.Close(); err != nil {
-		fmt.Fprintf(os.Stderr, "quic stream close error: %v\n", err)
-		return err
-	}
-	return nil
+        logInfo("quic stream close error: %v", err)
+        return err
+    }
+
+    time.Sleep(100 * time.Millisecond) // dev/WSL 안정화용(선택)
+    return nil
+}
+
+func logInfo(format string, args ...any) {
+	_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
