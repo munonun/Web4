@@ -3,6 +3,7 @@ package proto
 
 import (
 	"crypto/sha3"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -18,9 +19,11 @@ type IOU struct {
 
 type Contract struct {
 	IOU
-	SigCred []byte
-	SigDebt []byte
-	Status  string // OPEN/CLOSED
+	SigCred      []byte
+	SigDebt      []byte
+	EphemeralPub []byte
+	Sealed       []byte
+	Status       string // OPEN/CLOSED
 }
 
 type RepayReq struct {
@@ -30,10 +33,12 @@ type RepayReq struct {
 }
 
 type Ack struct {
-	ContractID [32]byte
-	ReqNonce   uint64
-	Decision   uint8 // 1 accept, 0 reject
-	Close      bool
+	ContractID   [32]byte
+	ReqNonce     uint64
+	Decision     uint8 // 1 accept, 0 reject
+	Close        bool
+	EphemeralPub []byte
+	Sealed       []byte
 }
 
 const (
@@ -43,29 +48,35 @@ const (
 )
 
 type ContractOpenMsg struct {
-	Type     string `json:"type"`
-	Creditor string `json:"creditor"`
-	Debtor   string `json:"debtor"`
-	Amount   uint64 `json:"amount"`
-	Nonce    uint64 `json:"nonce"`
-	SigB     string `json:"sigB"`
-	SigA     string `json:"sigA,omitempty"`
+	Type         string `json:"type"`
+	Creditor     string `json:"creditor"`
+	Debtor       string `json:"debtor"`
+	Amount       uint64 `json:"amount"`
+	Nonce        uint64 `json:"nonce"`
+	EphemeralPub string `json:"ephemeral_pub"`
+	Sealed       string `json:"sealed"`
+	SigB         string `json:"sigB"`
+	SigA         string `json:"sigA,omitempty"`
 }
 
 type RepayReqMsg struct {
-	Type       string `json:"type"`
-	ContractID string `json:"contract_id"`
-	ReqNonce   uint64 `json:"reqnonce"`
-	Close      bool   `json:"close"`
-	SigB       string `json:"sigB"`
+	Type         string `json:"type"`
+	ContractID   string `json:"contract_id"`
+	ReqNonce     uint64 `json:"reqnonce"`
+	Close        bool   `json:"close"`
+	EphemeralPub string `json:"ephemeral_pub"`
+	Sealed       string `json:"sealed"`
+	SigB         string `json:"sigB"`
 }
 
 type AckMsg struct {
-	Type       string `json:"type"`
-	ContractID string `json:"contract_id"`
-	Decision   uint8  `json:"decision"`
-	Close      bool   `json:"close"`
-	SigA       string `json:"sigA"`
+	Type         string `json:"type"`
+	ContractID   string `json:"contract_id"`
+	Decision     uint8  `json:"decision"`
+	Close        bool   `json:"close"`
+	EphemeralPub string `json:"ephemeral_pub"`
+	Sealed       string `json:"sealed"`
+	SigA         string `json:"sigA"`
 }
 
 func IOUBytes(i IOU) []byte {
@@ -106,6 +117,18 @@ func AckBytes(a Ack) []byte {
 	b = append(b, tmp...)
 	b = append(b, a.Decision)
 	if a.Close {
+		b = append(b, 1)
+	} else {
+		b = append(b, 0)
+	}
+	return b
+}
+
+func AckHeaderBytes(contractID [32]byte, decision uint8, close bool) []byte {
+	b := make([]byte, 0, 32+1+1)
+	b = append(b, contractID[:]...)
+	b = append(b, decision)
+	if close {
 		b = append(b, 1)
 	} else {
 		b = append(b, 0)
@@ -160,12 +183,14 @@ func DecodeAckMsg(data []byte) (AckMsg, error) {
 
 func ContractOpenMsgFromContract(c Contract) ContractOpenMsg {
 	m := ContractOpenMsg{
-		Type:     MsgTypeContractOpen,
-		Creditor: hex.EncodeToString(c.IOU.Creditor),
-		Debtor:   hex.EncodeToString(c.IOU.Debtor),
-		Amount:   c.IOU.Amount,
-		Nonce:    c.IOU.Nonce,
-		SigB:     hex.EncodeToString(c.SigDebt),
+		Type:         MsgTypeContractOpen,
+		Creditor:     hex.EncodeToString(c.IOU.Creditor),
+		Debtor:       hex.EncodeToString(c.IOU.Debtor),
+		Amount:       c.IOU.Amount,
+		Nonce:        c.IOU.Nonce,
+		EphemeralPub: base64.StdEncoding.EncodeToString(c.EphemeralPub),
+		Sealed:       base64.StdEncoding.EncodeToString(c.Sealed),
+		SigB:         hex.EncodeToString(c.SigDebt),
 	}
 	if len(c.SigCred) != 0 {
 		m.SigA = hex.EncodeToString(c.SigCred)
@@ -189,6 +214,14 @@ func ContractFromOpenMsg(m ContractOpenMsg) (Contract, error) {
 	if err != nil {
 		return Contract{}, fmt.Errorf("bad sigB hex")
 	}
+	eph, err := base64.StdEncoding.DecodeString(m.EphemeralPub)
+	if err != nil {
+		return Contract{}, fmt.Errorf("bad ephemeral pub")
+	}
+	sealed, err := base64.StdEncoding.DecodeString(m.Sealed)
+	if err != nil {
+		return Contract{}, fmt.Errorf("bad sealed")
+	}
 	var sigA []byte
 	if m.SigA != "" {
 		sigA, err = hex.DecodeString(m.SigA)
@@ -203,19 +236,23 @@ func ContractFromOpenMsg(m ContractOpenMsg) (Contract, error) {
 			Amount:   m.Amount,
 			Nonce:    m.Nonce,
 		},
-		SigCred: sigA,
-		SigDebt: sigB,
-		Status:  "OPEN",
+		SigCred:      sigA,
+		SigDebt:      sigB,
+		EphemeralPub: eph,
+		Sealed:       sealed,
+		Status:       "OPEN",
 	}, nil
 }
 
-func RepayReqMsgFromReq(r RepayReq, sigB []byte) RepayReqMsg {
+func RepayReqMsgFromReq(r RepayReq, sigB, ephPub, sealed []byte) RepayReqMsg {
 	return RepayReqMsg{
-		Type:       MsgTypeRepayReq,
-		ContractID: hex.EncodeToString(r.ContractID[:]),
-		ReqNonce:   r.ReqNonce,
-		Close:      r.Close,
-		SigB:       hex.EncodeToString(sigB),
+		Type:         MsgTypeRepayReq,
+		ContractID:   hex.EncodeToString(r.ContractID[:]),
+		ReqNonce:     r.ReqNonce,
+		Close:        r.Close,
+		EphemeralPub: base64.StdEncoding.EncodeToString(ephPub),
+		Sealed:       base64.StdEncoding.EncodeToString(sealed),
+		SigB:         hex.EncodeToString(sigB),
 	}
 }
 
@@ -238,11 +275,13 @@ func RepayReqFromMsg(m RepayReqMsg) (RepayReq, []byte, error) {
 
 func AckMsgFromAck(a Ack, sigA []byte) AckMsg {
 	return AckMsg{
-		Type:       MsgTypeAck,
-		ContractID: hex.EncodeToString(a.ContractID[:]),
-		Decision:   a.Decision,
-		Close:      a.Close,
-		SigA:       hex.EncodeToString(sigA),
+		Type:         MsgTypeAck,
+		ContractID:   hex.EncodeToString(a.ContractID[:]),
+		Decision:     a.Decision,
+		Close:        a.Close,
+		EphemeralPub: base64.StdEncoding.EncodeToString(a.EphemeralPub),
+		Sealed:       base64.StdEncoding.EncodeToString(a.Sealed),
+		SigA:         hex.EncodeToString(sigA),
 	}
 }
 
@@ -260,5 +299,102 @@ func AckFromMsg(m AckMsg) (Ack, []byte, error) {
 	if err != nil {
 		return Ack{}, nil, fmt.Errorf("bad sigA hex")
 	}
-	return Ack{ContractID: cid, Decision: m.Decision, Close: m.Close}, sigA, nil
+	eph, err := base64.StdEncoding.DecodeString(m.EphemeralPub)
+	if err != nil {
+		return Ack{}, nil, fmt.Errorf("bad ephemeral pub")
+	}
+	sealed, err := base64.StdEncoding.DecodeString(m.Sealed)
+	if err != nil {
+		return Ack{}, nil, fmt.Errorf("bad sealed")
+	}
+	return Ack{ContractID: cid, Decision: m.Decision, Close: m.Close, EphemeralPub: eph, Sealed: sealed}, sigA, nil
+}
+
+type OpenPayload struct {
+	Type     string `json:"type"`
+	Creditor string `json:"creditor"`
+	Debtor   string `json:"debtor"`
+	Amount   uint64 `json:"amount"`
+	Nonce    uint64 `json:"nonce"`
+}
+
+type RepayPayload struct {
+	Type       string `json:"type"`
+	ContractID string `json:"contract_id"`
+	ReqNonce   uint64 `json:"reqnonce"`
+	Close      bool   `json:"close"`
+}
+
+type AckPayload struct {
+	Type       string `json:"type"`
+	ContractID string `json:"contract_id"`
+	Decision   uint8  `json:"decision"`
+	Close      bool   `json:"close"`
+}
+
+func EncodeOpenPayload(credHex, debtHex string, amount, nonce uint64) ([]byte, error) {
+	p := OpenPayload{
+		Type:     MsgTypeContractOpen,
+		Creditor: credHex,
+		Debtor:   debtHex,
+		Amount:   amount,
+		Nonce:    nonce,
+	}
+	return json.Marshal(p)
+}
+
+func EncodeRepayPayload(contractID string, reqNonce uint64, close bool) ([]byte, error) {
+	p := RepayPayload{
+		Type:       MsgTypeRepayReq,
+		ContractID: contractID,
+		ReqNonce:   reqNonce,
+		Close:      close,
+	}
+	return json.Marshal(p)
+}
+
+func EncodeAckPayload(contractID string, decision uint8, close bool) ([]byte, error) {
+	p := AckPayload{
+		Type:       MsgTypeAck,
+		ContractID: contractID,
+		Decision:   decision,
+		Close:      close,
+	}
+	return json.Marshal(p)
+}
+
+func OpenSignBytes(iou IOU, ephPub, sealed []byte) []byte {
+	b := make([]byte, 0, len(iou.Creditor)+len(iou.Debtor)+16+len(ephPub)+len(sealed))
+	b = append(b, IOUBytes(iou)...)
+	b = append(b, ephPub...)
+	b = append(b, sealed...)
+	return b
+}
+
+func RepayReqSignBytes(r RepayReq, ephPub, sealed []byte) []byte {
+	b := make([]byte, 0, 32+8+1+len(ephPub)+len(sealed))
+	b = append(b, RepayReqBytes(r)...)
+	b = append(b, ephPub...)
+	b = append(b, sealed...)
+	return b
+}
+
+func AckSignBytes(contractID [32]byte, decision uint8, close bool, ephPub, sealed []byte) []byte {
+	b := make([]byte, 0, 32+1+1+len(ephPub)+len(sealed))
+	b = append(b, AckHeaderBytes(contractID, decision, close)...)
+	b = append(b, ephPub...)
+	b = append(b, sealed...)
+	return b
+}
+
+func DecodeSealedFields(ephB64, sealedB64 string) ([]byte, []byte, error) {
+	eph, err := base64.StdEncoding.DecodeString(ephB64)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bad ephemeral pub")
+	}
+	sealed, err := base64.StdEncoding.DecodeString(sealedB64)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bad sealed")
+	}
+	return eph, sealed, nil
 }

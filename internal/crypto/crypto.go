@@ -6,9 +6,11 @@ import (
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -169,6 +171,20 @@ func XOpen(key32, nonce24, ciphertext, aad []byte) ([]byte, error) {
 	return aead.Open(nil, nonce24, ciphertext, aad)
 }
 
+func XSealWithNonce(key32, nonce24, plaintext, aad []byte) ([]byte, error) {
+	if len(key32) != XKeySize {
+		return nil, fmt.Errorf("bad key size: need %d", XKeySize)
+	}
+	if len(nonce24) != XNonceSize {
+		return nil, fmt.Errorf("bad nonce size: need %d", XNonceSize)
+	}
+	aead, err := chacha20poly1305.NewX(key32)
+	if err != nil {
+		return nil, err
+	}
+	return aead.Seal(nil, nonce24, plaintext, aad), nil
+}
+
 // -----------------------------------------------------------------------------
 // X25519 ephemeral helpers (optional)
 // -----------------------------------------------------------------------------
@@ -179,6 +195,21 @@ func GenerateEphemeral() ([]byte, []byte, error) {
 		return nil, nil, err
 	}
 	return priv.Bytes(), priv.PublicKey().Bytes(), nil
+}
+
+func X25519Shared(privKey, peerPub []byte) ([]byte, error) {
+	if len(privKey) == 0 || len(peerPub) == 0 {
+		return nil, errors.New("empty key material")
+	}
+	priv, err := ecdh.X25519().NewPrivateKey(privKey)
+	if err != nil {
+		return nil, err
+	}
+	pub, err := ecdh.X25519().NewPublicKey(peerPub)
+	if err != nil {
+		return nil, err
+	}
+	return priv.ECDH(pub)
 }
 
 func DeriveShared(privKey, peerPub []byte) ([]byte, error) {
@@ -206,6 +237,66 @@ func DeriveShared(privKey, peerPub []byte) ([]byte, error) {
 		return nil, err
 	}
 	return okm, nil
+}
+
+func Ed25519PrivToX25519(privKey []byte) ([]byte, error) {
+	if len(privKey) != ed25519.PrivateKeySize {
+		return nil, errors.New("bad ed25519 private key size")
+	}
+	seed := ed25519.PrivateKey(privKey).Seed()
+	sum := sha512.Sum512(seed)
+	k := make([]byte, 32)
+	copy(k, sum[:32])
+	k[0] &= 248
+	k[31] &= 127
+	k[31] |= 64
+	return k, nil
+}
+
+func Ed25519PubToX25519(pubKey []byte) ([]byte, error) {
+	if len(pubKey) != ed25519.PublicKeySize {
+		return nil, errors.New("bad ed25519 public key size")
+	}
+	y := make([]byte, 32)
+	copy(y, pubKey)
+	y[31] &= 0x7f
+	yInt := leBytesToInt(y)
+	p := fieldP()
+	one := big.NewInt(1)
+	num := new(big.Int).Add(yInt, one)
+	num.Mod(num, p)
+	den := new(big.Int).Sub(one, yInt)
+	den.Mod(den, p)
+	inv := new(big.Int).ModInverse(den, p)
+	if inv == nil {
+		return nil, errors.New("invalid ed25519 public key")
+	}
+	u := new(big.Int).Mul(num, inv)
+	u.Mod(u, p)
+	return intToLEBytes(u, 32), nil
+}
+
+func fieldP() *big.Int {
+	one := big.NewInt(1)
+	p := new(big.Int).Lsh(one, 255)
+	return p.Sub(p, big.NewInt(19))
+}
+
+func leBytesToInt(b []byte) *big.Int {
+	rev := make([]byte, len(b))
+	for i := range b {
+		rev[i] = b[len(b)-1-i]
+	}
+	return new(big.Int).SetBytes(rev)
+}
+
+func intToLEBytes(v *big.Int, size int) []byte {
+	b := v.Bytes()
+	out := make([]byte, size)
+	for i := range b {
+		out[i] = b[len(b)-1-i]
+	}
+	return out
 }
 
 // -----------------------------------------------------------------------------

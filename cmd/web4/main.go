@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -42,6 +43,43 @@ func findContractByID(st *store.Store, cid [32]byte) (*proto.Contract, error) {
 		}
 	}
 	return nil, fmt.Errorf("contract not found")
+}
+
+func e2eSeal(msgType string, contractID [32]byte, reqNonce uint64, peerEdPub, payload []byte) ([]byte, []byte, error) {
+	ephPriv, ephPub, err := crypto.GenerateEphemeral()
+	if err != nil {
+		return nil, nil, err
+	}
+	peerXPub, err := crypto.Ed25519PubToX25519(peerEdPub)
+	if err != nil {
+		return nil, nil, err
+	}
+	shared, err := crypto.X25519Shared(ephPriv, peerXPub)
+	if err != nil {
+		return nil, nil, err
+	}
+	key, err := crypto.DeriveKeyE(shared, "web4:v0:e2e:"+msgType, crypto.XKeySize)
+	if err != nil {
+		return nil, nil, err
+	}
+	nonce := e2eNonce(contractID, reqNonce, ephPub)
+	sealed, err := crypto.XSealWithNonce(key, nonce, payload, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ephPub, sealed, nil
+}
+
+func e2eNonce(contractID [32]byte, reqNonce uint64, ephPub []byte) []byte {
+	var tmp [8]byte
+	binary.BigEndian.PutUint64(tmp[:], reqNonce)
+	buf := make([]byte, 0, len("web4:v0:nonce|")+32+8+len(ephPub))
+	buf = append(buf, []byte("web4:v0:nonce|")...)
+	buf = append(buf, contractID[:]...)
+	buf = append(buf, tmp[:]...)
+	buf = append(buf, ephPub...)
+	sum := crypto.SHA3_256(buf)
+	return sum[:crypto.XNonceSize]
 }
 
 func recvData(data []byte, st *store.Store) {
@@ -147,22 +185,34 @@ func main() {
 		}
 
 		iou := proto.IOU{Creditor: to, Debtor: pub, Amount: *amount, Nonce: *nonce}
+		cid := proto.ContractID(iou)
+		credHex := hex.EncodeToString(to)
+		debtHex := hex.EncodeToString(pub)
+		payload, err := proto.EncodeOpenPayload(credHex, debtHex, *amount, *nonce)
+		if err != nil {
+			die("encode open payload failed", err)
+		}
+		ephPub, sealed, err := e2eSeal(proto.MsgTypeContractOpen, cid, 0, to, payload)
+		if err != nil {
+			die("e2e seal failed", err)
+		}
 
 		// v0.0.2: sign over SHA3_256(message)
-		iouMsg := proto.IOUBytes(iou)
+		iouMsg := proto.OpenSignBytes(iou, ephPub, sealed)
 		sigB := crypto.Sign(priv, crypto.SHA3_256(iouMsg))
 
 		// NOTE: in real life creditor also signs; for MVP we allow "half-open" then later attach creditor sig.
 		c := proto.Contract{
-			IOU:     iou,
-			SigCred: nil,
-			SigDebt: sigB,
-			Status:  "OPEN",
+			IOU:          iou,
+			SigCred:      nil,
+			SigDebt:      sigB,
+			EphemeralPub: ephPub,
+			Sealed:       sealed,
+			Status:       "OPEN",
 		}
 		if err := st.AddContract(c); err != nil {
 			die("store failed", err)
 		}
-		id := proto.ContractID(iou)
 		if *outPath != "" {
 			msg := proto.ContractOpenMsgFromContract(c)
 			data, err := proto.EncodeContractOpenMsg(msg)
@@ -174,7 +224,7 @@ func main() {
 			}
 			return
 		}
-		fmt.Println("OPEN", hex.EncodeToString(id[:]))
+		fmt.Println("OPEN", hex.EncodeToString(cid[:]))
 
 	case "list":
 		cs, err := st.ListContracts()
@@ -213,15 +263,23 @@ func main() {
 		}
 
 		req := proto.RepayReq{ContractID: cid, ReqNonce: *reqNonce, Close: true}
+		payload, err := proto.EncodeRepayPayload(*idHex, *reqNonce, true)
+		if err != nil {
+			die("encode repay payload failed", err)
+		}
+		ephPub, sealed, err := e2eSeal(proto.MsgTypeRepayReq, cid, *reqNonce, c.IOU.Creditor, payload)
+		if err != nil {
+			die("e2e seal failed", err)
+		}
 
 		// v0.0.2: sign over SHA3_256(message)
-		reqMsg := proto.RepayReqBytes(req)
+		reqMsg := proto.RepayReqSignBytes(req, ephPub, sealed)
 		sig := crypto.Sign(priv, crypto.SHA3_256(reqMsg))
 
 		_ = pub // (debtor pub already in key file)
 
 		if *outPath != "" {
-			msg := proto.RepayReqMsgFromReq(req, sig)
+			msg := proto.RepayReqMsgFromReq(req, sig, ephPub, sealed)
 			data, err := proto.EncodeRepayReqMsg(msg)
 			if err != nil {
 				die("encode message failed", err)
@@ -266,17 +324,19 @@ func main() {
 		var cid [32]byte
 		copy(cid[:], idBytes)
 
+		reqMsg, err := st.FindRepayReq(*idHex, *reqNonce)
+		if err != nil {
+			die("find repay request failed", err)
+		}
+		if reqMsg == nil {
+			die("missing repay request", fmt.Errorf("recv a repay request first"))
+		}
 		if *sigBHex == "" {
-			reqMsg, err := st.FindRepayReq(*idHex, *reqNonce)
-			if err != nil {
-				die("find repay request failed", err)
-			}
-			if reqMsg == nil || reqMsg.SigB == "" {
+			if reqMsg.SigB == "" {
 				die("missing sigb", fmt.Errorf("provide --sigb or recv a repay request"))
 			}
 			*sigBHex = reqMsg.SigB
 		}
-
 		sigB, err := hex.DecodeString(*sigBHex)
 		if err != nil {
 			die("invalid sigb", err)
@@ -289,9 +349,13 @@ func main() {
 		if !bytes.Equal(c.IOU.Creditor, pubA) {
 			die("creditor mismatch", fmt.Errorf("only creditor can ack"))
 		}
-		req := proto.RepayReq{ContractID: cid, ReqNonce: *reqNonce, Close: true}
-		reqMsg := proto.RepayReqBytes(req)
-		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqMsg), sigB) {
+		ephPub, sealed, err := proto.DecodeSealedFields(reqMsg.EphemeralPub, reqMsg.Sealed)
+		if err != nil {
+			die("invalid repay request fields", err)
+		}
+		req := proto.RepayReq{ContractID: cid, ReqNonce: *reqNonce, Close: reqMsg.Close}
+		reqSign := proto.RepayReqSignBytes(req, ephPub, sealed)
+		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqSign), sigB) {
 			die("invalid sigb", fmt.Errorf("debtor signature check failed"))
 		}
 
@@ -301,10 +365,20 @@ func main() {
 			Decision:   uint8(*decision),
 			Close:      *decision == 1,
 		}
+		ackPayload, err := proto.EncodeAckPayload(*idHex, ack.Decision, ack.Close)
+		if err != nil {
+			die("encode ack payload failed", err)
+		}
+		ackEph, ackSealed, err := e2eSeal(proto.MsgTypeAck, cid, *reqNonce, c.IOU.Debtor, ackPayload)
+		if err != nil {
+			die("e2e seal failed", err)
+		}
+		ack.EphemeralPub = ackEph
+		ack.Sealed = ackSealed
 
 		// v0.0.2: sign over SHA3_256(message)
-		ackMsg := proto.AckBytes(ack)
-		sigA := crypto.Sign(privA, crypto.SHA3_256(ackMsg))
+		ackSign := proto.AckSignBytes(cid, ack.Decision, ack.Close, ackEph, ackSealed)
+		sigA := crypto.Sign(privA, crypto.SHA3_256(ackSign))
 
 		if *decision == 1 {
 			if err := st.MarkClosed(cid, *forget); err != nil {
