@@ -189,12 +189,70 @@ func XSealWithNonce(key32, nonce24, plaintext, aad []byte) ([]byte, error) {
 // X25519 ephemeral helpers (optional)
 // -----------------------------------------------------------------------------
 
-func GenerateEphemeral() ([]byte, []byte, error) {
+type Ephemeral struct {
+	priv      *ecdh.PrivateKey
+	privBytes []byte
+	pub       []byte
+	destroyed bool
+}
+
+func (e *Ephemeral) String() string {
+	return "Ephemeral{REDACTED}"
+}
+
+func (e *Ephemeral) GoString() string {
+	return "crypto.Ephemeral{REDACTED}"
+}
+
+func (e *Ephemeral) Public() ([]byte, error) {
+	if e == nil || e.destroyed {
+		return nil, errors.New("ephemeral key destroyed")
+	}
+	out := make([]byte, len(e.pub))
+	copy(out, e.pub)
+	return out, nil
+}
+
+func (e *Ephemeral) Shared(peerPub []byte) ([]byte, error) {
+	if e == nil || e.destroyed {
+		return nil, errors.New("ephemeral key destroyed")
+	}
+	if len(peerPub) == 0 {
+		return nil, errors.New("empty key material")
+	}
+	pub, err := ecdh.X25519().NewPublicKey(peerPub)
+	if err != nil {
+		return nil, err
+	}
+	return e.priv.ECDH(pub)
+}
+
+func (e *Ephemeral) Destroy() {
+	if e == nil || e.destroyed {
+		return
+	}
+	for i := range e.privBytes {
+		e.privBytes[i] = 0
+	}
+	for i := range e.pub {
+		e.pub[i] = 0
+	}
+	e.priv = nil
+	e.destroyed = true
+}
+
+func GenerateEphemeral() (*Ephemeral, error) {
 	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	return priv.Bytes(), priv.PublicKey().Bytes(), nil
+	privBytes := priv.Bytes()
+	privCopy := make([]byte, len(privBytes))
+	copy(privCopy, privBytes)
+	pubBytes := priv.PublicKey().Bytes()
+	pubCopy := make([]byte, len(pubBytes))
+	copy(pubCopy, pubBytes)
+	return &Ephemeral{priv: priv, privBytes: privCopy, pub: pubCopy}, nil
 }
 
 func X25519Shared(privKey, peerPub []byte) ([]byte, error) {

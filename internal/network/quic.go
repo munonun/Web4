@@ -86,6 +86,45 @@ func clientTLSConfig(insecure bool) (*tls.Config, error) {
 	}, nil
 }
 
+const (
+	maxIncomingStreams    = 64
+	maxIncomingUniStreams = 64
+	maxIdleTimeout        = 20 * time.Second
+	keepAlivePeriod       = 10 * time.Second
+	handshakeIdleTimeout  = 10 * time.Second
+
+	maxConnHandlers   = 128
+	maxStreamHandlers = 128
+	acquireTimeout    = 100 * time.Millisecond
+	streamRWTimeout   = 5 * time.Second
+
+	streamBusyErrCode quic.StreamErrorCode = 0x10
+)
+
+type Semaphore struct {
+	ch chan struct{}
+}
+
+func NewSemaphore(n int) *Semaphore {
+	return &Semaphore{ch: make(chan struct{}, n)}
+}
+
+func (s *Semaphore) Acquire(ctx context.Context) error {
+	select {
+	case s.ch <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Semaphore) Release() {
+	select {
+	case <-s.ch:
+	default:
+	}
+}
+
 func ListenAndServe(addr string, handle func([]byte)) error {
 	return ListenAndServeWithReady(addr, nil, handle)
 }
@@ -95,7 +134,14 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 	if err != nil {
 		return err
 	}
-	listener, err := quic.ListenAddr(addr, tlsConf, nil)
+	quicConf := &quic.Config{
+		MaxIncomingStreams:    maxIncomingStreams,
+		MaxIncomingUniStreams: maxIncomingUniStreams,
+		MaxIdleTimeout:        maxIdleTimeout,
+		KeepAlivePeriod:       keepAlivePeriod,
+		HandshakeIdleTimeout:  handshakeIdleTimeout,
+	}
+	listener, err := quic.ListenAddr(addr, tlsConf, quicConf)
 	if err != nil {
 		logInfo("quic listen error: %v", err)
 		return err
@@ -104,14 +150,25 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 	if ready != nil {
 		close(ready)
 	}
+	connSem := NewSemaphore(maxConnHandlers)
+	streamSem := NewSemaphore(maxStreamHandlers)
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
 			logInfo("quic accept error: %v", err)
 			return err
 		}
+		acceptCtx, cancel := context.WithTimeout(context.Background(), acquireTimeout)
+		if err := connSem.Acquire(acceptCtx); err != nil {
+			cancel()
+			_ = conn.CloseWithError(0, "server busy")
+			logInfo("quic connection rejected: %v", err)
+			continue
+		}
+		cancel()
 		logInfo("accepted connection")
 		go func() {
+			defer connSem.Release()
 			c := conn
 			for {
 				stream, err := c.AcceptStream(context.Background())
@@ -124,10 +181,19 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 					return
 				}
 				logInfo("accepted stream")
+				streamCtx, streamCancel := context.WithTimeout(context.Background(), acquireTimeout)
+				if err := streamSem.Acquire(streamCtx); err != nil {
+					streamCancel()
+					closeStreamWithError(stream, streamBusyErrCode, "server busy")
+					logInfo("quic stream rejected: %v", err)
+					continue
+				}
+				streamCancel()
 				go func(s *quic.Stream) {
+					defer streamSem.Release()
 					defer s.Close()
 					logInfo("read start")
-					data, err := proto.ReadFrame(s)
+					data, err := readFrameWithTimeout(s, streamRWTimeout)
 					if err != nil {
 						if errors.Is(err, io.EOF) {
 							logInfo("quic read error: EOF")
@@ -157,7 +223,12 @@ func Send(addr string, data []byte, insecure bool) error {
 	if err != nil {
 		return err
 	}
-	conn, err := quic.DialAddr(context.Background(), addr, tlsConf, nil)
+	quicConf := &quic.Config{
+		MaxIdleTimeout:       maxIdleTimeout,
+		KeepAlivePeriod:      keepAlivePeriod,
+		HandshakeIdleTimeout: handshakeIdleTimeout,
+	}
+	conn, err := quic.DialAddr(context.Background(), addr, tlsConf, quicConf)
 	if err != nil {
 		return err
 	}
@@ -166,12 +237,7 @@ func Send(addr string, data []byte, insecure bool) error {
 		_ = conn.CloseWithError(0, "")
 		return err
 	}
-	frame, err := proto.EncodeFrame(data)
-	if err != nil {
-		_ = conn.CloseWithError(0, "")
-		return err
-	}
-	if _, err := stream.Write(frame); err != nil {
+	if err := writeFrameWithTimeout(stream, streamRWTimeout, data); err != nil {
 		_ = conn.CloseWithError(0, "")
 		return err
 	}
@@ -187,6 +253,70 @@ func Send(addr string, data []byte, insecure bool) error {
 
 func logInfo(format string, args ...any) {
 	_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func readFrameWithTimeout(stream *quic.Stream, timeout time.Duration) ([]byte, error) {
+	if d, ok := any(stream).(interface {
+		SetReadDeadline(time.Time) error
+	}); ok {
+		_ = d.SetReadDeadline(time.Now().Add(timeout))
+		return proto.ReadFrame(stream)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		data, err := proto.ReadFrame(stream)
+		ch <- result{data: data, err: err}
+	}()
+	select {
+	case res := <-ch:
+		return res.data, res.err
+	case <-ctx.Done():
+		closeStreamWithError(stream, streamBusyErrCode, "read timeout")
+		return nil, ctx.Err()
+	}
+}
+
+func writeFrameWithTimeout(stream *quic.Stream, timeout time.Duration, payload []byte) error {
+	if d, ok := any(stream).(interface {
+		SetWriteDeadline(time.Time) error
+	}); ok {
+		_ = d.SetWriteDeadline(time.Now().Add(timeout))
+		return proto.WriteFrame(stream, payload)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- proto.WriteFrame(stream, payload)
+	}()
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		closeStreamWithError(stream, streamBusyErrCode, "write timeout")
+		return ctx.Err()
+	}
+}
+
+func closeStreamWithError(stream *quic.Stream, code quic.StreamErrorCode, msg string) {
+	type canceler interface {
+		CancelRead(quic.StreamErrorCode)
+		CancelWrite(quic.StreamErrorCode)
+	}
+	if c, ok := any(stream).(canceler); ok {
+		c.CancelRead(code)
+		c.CancelWrite(code)
+	}
+	_ = stream.Close()
+	if msg != "" {
+		logInfo("quic stream closed: %s", msg)
+	}
 }
 
 func isBenignAcceptErr(err error) bool {

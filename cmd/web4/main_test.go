@@ -53,7 +53,9 @@ func TestOpenCloseAckFlow(t *testing.T) {
 		"--out", closeMsgPath,
 	)
 	runOK(t, homeA, "recv", "--in", closeMsgPath)
-	runOK(t, homeB, "recv", "--in", closeMsgPath)
+	if err := runWithHome(homeB, "recv", "--in", closeMsgPath); err == nil || !strings.Contains(err.Error(), "sealed repay request failed") {
+		t.Fatalf("expected recipient decrypt failure, got: %v", err)
+	}
 
 	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
 	runOK(t, homeA, "ack",
@@ -206,9 +208,362 @@ func TestRepayReqSealedTamper(t *testing.T) {
 		t.Fatalf("write tampered failed: %v", err)
 	}
 
-	runOK(t, homeA, "recv", "--in", tamperedPath)
-	if err := runWithHome(homeA, "ack", "--id", cidHex, "--reqnonce", "1", "--decision", "1"); err == nil || !strings.Contains(err.Error(), "invalid sigb") {
+	if err := runWithHome(homeA, "recv", "--in", tamperedPath); err == nil || !strings.Contains(err.Error(), "invalid sigb") {
 		t.Fatalf("expected invalid sigb error, got: %v", err)
+	}
+}
+
+func TestAckSigTamperRejectedOnRecv(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA := loadPub(t, homeA)
+	pubB := loadPub(t, homeB)
+
+	openMsgPath := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "3",
+		"--nonce", "1",
+		"--out", openMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", openMsgPath)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 3, Nonce: 1}
+	cid := proto.ContractID(iou)
+	cidHex := hex.EncodeToString(cid[:])
+
+	closeMsgPath := filepath.Join(t.TempDir(), "close.json")
+	runOK(t, homeB, "close",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--out", closeMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", closeMsgPath)
+
+	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
+	runOK(t, homeA, "ack",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--decision", "1",
+		"--out", ackMsgPath,
+	)
+	raw, err := os.ReadFile(ackMsgPath)
+	if err != nil {
+		t.Fatalf("read ack failed: %v", err)
+	}
+	var msg proto.AckMsg
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("decode ack failed: %v", err)
+	}
+	sig, err := hex.DecodeString(msg.SigA)
+	if err != nil {
+		t.Fatalf("decode sigA failed: %v", err)
+	}
+	if len(sig) == 0 {
+		t.Fatalf("sigA empty")
+	}
+	sig[0] ^= 0xff
+	msg.SigA = hex.EncodeToString(sig)
+	tampered, err := json.Marshal(msg)
+	if err != nil {
+		t.Fatalf("encode tampered ack failed: %v", err)
+	}
+	tamperedPath := filepath.Join(t.TempDir(), "ack-tampered.json")
+	if err := os.WriteFile(tamperedPath, tampered, 0600); err != nil {
+		t.Fatalf("write tampered ack failed: %v", err)
+	}
+
+	if err := runWithHome(homeB, "recv", "--in", tamperedPath); err == nil || !strings.Contains(err.Error(), "invalid siga") {
+		t.Fatalf("expected invalid siga error, got: %v", err)
+	}
+}
+
+func TestE2ESealFreshEphemeralPerCall(t *testing.T) {
+	pub, _, err := crypto.GenKeypair()
+	if err != nil {
+		t.Fatalf("generate keypair failed: %v", err)
+	}
+	var cid [32]byte
+	copy(cid[:], []byte("web4:e2e:seal:fresh:ephemeral"))
+	payload := []byte("payload")
+
+	ephPub1, sealed1, err := e2eSeal(proto.MsgTypeContractOpen, cid, 0, pub, payload)
+	if err != nil {
+		t.Fatalf("e2eSeal first call failed: %v", err)
+	}
+	ephPub2, sealed2, err := e2eSeal(proto.MsgTypeContractOpen, cid, 0, pub, payload)
+	if err != nil {
+		t.Fatalf("e2eSeal second call failed: %v", err)
+	}
+
+	if bytes.Equal(ephPub1, ephPub2) {
+		t.Fatalf("expected different ephemeral public keys per call")
+	}
+	if bytes.Equal(sealed1, sealed2) {
+		t.Fatalf("expected different sealed outputs per call")
+	}
+}
+
+func TestRecvRejectsOversizeAck(t *testing.T) {
+	home := t.TempDir()
+	runOK(t, home, "keygen")
+	data := oversizedPayload(t, proto.MsgTypeAck, maxAckSize)
+	inPath := filepath.Join(t.TempDir(), "ack-oversize.json")
+	if err := os.WriteFile(inPath, data, 0600); err != nil {
+		t.Fatalf("write oversize ack failed: %v", err)
+	}
+	if err := runWithHome(home, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "message too large") {
+		t.Fatalf("expected size rejection, got: %v", err)
+	}
+}
+
+func TestRecvRejectsOversizeRepayReq(t *testing.T) {
+	home := t.TempDir()
+	runOK(t, home, "keygen")
+	data := oversizedPayload(t, proto.MsgTypeRepayReq, maxRepayReqSize)
+	inPath := filepath.Join(t.TempDir(), "repay-oversize.json")
+	if err := os.WriteFile(inPath, data, 0600); err != nil {
+		t.Fatalf("write oversize repay req failed: %v", err)
+	}
+	if err := runWithHome(home, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "message too large") {
+		t.Fatalf("expected size rejection, got: %v", err)
+	}
+}
+
+func TestRecvRejectsMismatchedOpenPayload(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA, _ := loadKeypair(t, homeA)
+	pubB, privB := loadKeypair(t, homeB)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 5, Nonce: 1}
+	cid := proto.ContractID(iou)
+	payload, err := proto.EncodeOpenPayload(hex.EncodeToString(pubA), hex.EncodeToString(pubB), 999, 1)
+	if err != nil {
+		t.Fatalf("encode open payload failed: %v", err)
+	}
+	ephPub, sealed, err := e2eSeal(proto.MsgTypeContractOpen, cid, 0, pubA, payload)
+	if err != nil {
+		t.Fatalf("e2e seal failed: %v", err)
+	}
+	signBytes := proto.OpenSignBytes(iou, ephPub, sealed)
+	sigB := crypto.Sign(privB, crypto.SHA3_256(signBytes))
+	msg := proto.ContractOpenMsgFromContract(proto.Contract{
+		IOU:          iou,
+		SigDebt:      sigB,
+		EphemeralPub: ephPub,
+		Sealed:       sealed,
+		Status:       "OPEN",
+	})
+	data, err := proto.EncodeContractOpenMsg(msg)
+	if err != nil {
+		t.Fatalf("encode open msg failed: %v", err)
+	}
+	inPath := filepath.Join(t.TempDir(), "open-mismatch.json")
+	if err := os.WriteFile(inPath, data, 0600); err != nil {
+		t.Fatalf("write open msg failed: %v", err)
+	}
+	if err := runWithHome(homeA, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "payload mismatch") {
+		t.Fatalf("expected payload mismatch, got: %v", err)
+	}
+}
+
+func TestRecvRejectsAckWithoutRepayReq(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA, privA := loadKeypair(t, homeA)
+	pubB, _ := loadKeypair(t, homeB)
+
+	openMsgPath := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "5",
+		"--nonce", "1",
+		"--out", openMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", openMsgPath)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 5, Nonce: 1}
+	cid := proto.ContractID(iou)
+	cidHex := hex.EncodeToString(cid[:])
+
+	ackPayload, err := proto.EncodeAckPayload(cidHex, 1, true)
+	if err != nil {
+		t.Fatalf("encode ack payload failed: %v", err)
+	}
+	ackEph, ackSealed, err := e2eSeal(proto.MsgTypeAck, cid, 1, pubB, ackPayload)
+	if err != nil {
+		t.Fatalf("e2e seal ack failed: %v", err)
+	}
+	ack := proto.Ack{
+		ContractID:   cid,
+		ReqNonce:     1,
+		Decision:     1,
+		Close:        true,
+		EphemeralPub: ackEph,
+		Sealed:       ackSealed,
+	}
+	ackSign := proto.AckSignBytes(cid, ack.Decision, ack.Close, ackEph, ackSealed)
+	sigA := crypto.Sign(privA, crypto.SHA3_256(ackSign))
+	ackMsg := proto.AckMsgFromAck(ack, sigA)
+	data, err := proto.EncodeAckMsg(ackMsg)
+	if err != nil {
+		t.Fatalf("encode ack msg failed: %v", err)
+	}
+	inPath := filepath.Join(t.TempDir(), "ack-no-req.json")
+	if err := os.WriteFile(inPath, data, 0600); err != nil {
+		t.Fatalf("write ack msg failed: %v", err)
+	}
+	if err := runWithHome(homeB, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "missing repay request") {
+		t.Fatalf("expected missing repay request, got: %v", err)
+	}
+}
+
+func TestRecvRejectsAfterClosed(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA := loadPub(t, homeA)
+	pubB := loadPub(t, homeB)
+
+	openMsgPath := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "10",
+		"--nonce", "1",
+		"--out", openMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", openMsgPath)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 10, Nonce: 1}
+	cid := proto.ContractID(iou)
+	cidHex := hex.EncodeToString(cid[:])
+
+	closeMsgPath := filepath.Join(t.TempDir(), "close.json")
+	runOK(t, homeB, "close",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--out", closeMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", closeMsgPath)
+
+	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
+	runOK(t, homeA, "ack",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--decision", "1",
+		"--out", ackMsgPath,
+	)
+	runOK(t, homeB, "recv", "--in", ackMsgPath)
+
+	closeMsgPath2 := filepath.Join(t.TempDir(), "close2.json")
+	runOK(t, homeB, "close",
+		"--id", cidHex,
+		"--reqnonce", "2",
+		"--out", closeMsgPath2,
+	)
+	if err := runWithHome(homeA, "recv", "--in", closeMsgPath2); err == nil || !strings.Contains(err.Error(), "contract already closed") {
+		t.Fatalf("expected closed rejection, got: %v", err)
+	}
+}
+
+func TestRepayReqDuplicateRecv(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA := loadPub(t, homeA)
+
+	openMsgPath := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "6",
+		"--nonce", "1",
+		"--out", openMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", openMsgPath)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: loadPub(t, homeB), Amount: 6, Nonce: 1}
+	cid := proto.ContractID(iou)
+	cidHex := hex.EncodeToString(cid[:])
+
+	closeMsgPath := filepath.Join(t.TempDir(), "close.json")
+	runOK(t, homeB, "close",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--out", closeMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", closeMsgPath)
+	runOK(t, homeA, "recv", "--in", closeMsgPath)
+
+	count := countLines(t, filepath.Join(homeA, ".web4mvp", "repayreqs.jsonl"))
+	if count != 1 {
+		t.Fatalf("expected 1 repay request, got %d", count)
+	}
+}
+
+func TestAckDuplicateRecv(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA := loadPub(t, homeA)
+
+	openMsgPath := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "7",
+		"--nonce", "1",
+		"--out", openMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", openMsgPath)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: loadPub(t, homeB), Amount: 7, Nonce: 1}
+	cid := proto.ContractID(iou)
+	cidHex := hex.EncodeToString(cid[:])
+
+	closeMsgPath := filepath.Join(t.TempDir(), "close.json")
+	runOK(t, homeB, "close",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--out", closeMsgPath,
+	)
+	runOK(t, homeA, "recv", "--in", closeMsgPath)
+
+	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
+	runOK(t, homeA, "ack",
+		"--id", cidHex,
+		"--reqnonce", "1",
+		"--decision", "1",
+		"--out", ackMsgPath,
+	)
+	runOK(t, homeB, "recv", "--in", ackMsgPath)
+	if err := runWithHome(homeB, "recv", "--in", ackMsgPath); err == nil || !strings.Contains(err.Error(), "contract already closed") {
+		t.Fatalf("expected closed rejection, got: %v", err)
+	}
+
+	count := countLines(t, filepath.Join(homeB, ".web4mvp", "acks.jsonl"))
+	if count != 1 {
+		t.Fatalf("expected 1 ack, got %d", count)
 	}
 }
 
@@ -241,11 +596,12 @@ func TestQuicRecvOpen(t *testing.T) {
 		filepath.Join(root, "acks.jsonl"),
 		filepath.Join(root, "repayreqs.jsonl"),
 	)
+	selfPub, selfPriv := loadKeypair(t, homeA)
 	ready := make(chan struct{})
 	done := make(chan struct{})
 	go func() {
 		_ = network.ListenAndServeWithReady(addr, ready, func(data []byte) {
-			recvData(data, st)
+			recvData(data, st, selfPub, selfPriv)
 			select {
 			case <-done:
 			default:
@@ -347,6 +703,16 @@ func waitForContract(t *testing.T, home, cidHex string, timeout time.Duration) {
 	t.Fatalf("timeout waiting for contract %s", cidHex)
 }
 
+func oversizedPayload(t *testing.T, msgType string, maxSize int) []byte {
+	t.Helper()
+	pad := strings.Repeat("a", maxSize)
+	payload := []byte(fmt.Sprintf(`{"type":"%s","pad":"%s"}`, msgType, pad))
+	if len(payload) <= maxSize {
+		t.Fatalf("payload not oversized: %d <= %d", len(payload), maxSize)
+	}
+	return payload
+}
+
 func freeUDPAddr(t *testing.T) string {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -394,6 +760,22 @@ func e2eNonceForTest(contractID [32]byte, reqNonce uint64, ephPub []byte) []byte
 	buf = append(buf, ephPub...)
 	sum := crypto.SHA3_256(buf)
 	return sum[:crypto.XNonceSize]
+}
+
+func countLines(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	count := 0
+	for sc.Scan() {
+		if len(sc.Bytes()) != 0 {
+			count++
+		}
+	}
+	return count
 }
 
 func applyEnv(base []string, overrides ...string) []string {

@@ -47,8 +47,15 @@ const (
 	MsgTypeAck          = "ack"
 )
 
+const (
+	ProtoVersion = "0.0.2"
+	Suite        = "ed25519+x25519+xchacha20poly1305+sha3+hmacsha3hkdf"
+)
+
 type ContractOpenMsg struct {
 	Type         string `json:"type"`
+	ProtoVersion string `json:"proto_version"`
+	Suite        string `json:"suite"`
 	Creditor     string `json:"creditor"`
 	Debtor       string `json:"debtor"`
 	Amount       uint64 `json:"amount"`
@@ -61,6 +68,8 @@ type ContractOpenMsg struct {
 
 type RepayReqMsg struct {
 	Type         string `json:"type"`
+	ProtoVersion string `json:"proto_version"`
+	Suite        string `json:"suite"`
 	ContractID   string `json:"contract_id"`
 	ReqNonce     uint64 `json:"reqnonce"`
 	Close        bool   `json:"close"`
@@ -71,6 +80,8 @@ type RepayReqMsg struct {
 
 type AckMsg struct {
 	Type         string `json:"type"`
+	ProtoVersion string `json:"proto_version"`
+	Suite        string `json:"suite"`
 	ContractID   string `json:"contract_id"`
 	Decision     uint8  `json:"decision"`
 	Close        bool   `json:"close"`
@@ -140,12 +151,21 @@ func EncodeContractOpenMsg(m ContractOpenMsg) ([]byte, error) {
 	if m.Type == "" {
 		m.Type = MsgTypeContractOpen
 	}
+	if m.ProtoVersion == "" {
+		m.ProtoVersion = ProtoVersion
+	}
+	if m.Suite == "" {
+		m.Suite = Suite
+	}
 	return json.Marshal(m)
 }
 
 func DecodeContractOpenMsg(data []byte) (ContractOpenMsg, error) {
 	var m ContractOpenMsg
 	if err := json.Unmarshal(data, &m); err != nil {
+		return ContractOpenMsg{}, err
+	}
+	if err := ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
 		return ContractOpenMsg{}, err
 	}
 	return m, nil
@@ -155,12 +175,21 @@ func EncodeRepayReqMsg(m RepayReqMsg) ([]byte, error) {
 	if m.Type == "" {
 		m.Type = MsgTypeRepayReq
 	}
+	if m.ProtoVersion == "" {
+		m.ProtoVersion = ProtoVersion
+	}
+	if m.Suite == "" {
+		m.Suite = Suite
+	}
 	return json.Marshal(m)
 }
 
 func DecodeRepayReqMsg(data []byte) (RepayReqMsg, error) {
 	var m RepayReqMsg
 	if err := json.Unmarshal(data, &m); err != nil {
+		return RepayReqMsg{}, err
+	}
+	if err := ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
 		return RepayReqMsg{}, err
 	}
 	return m, nil
@@ -170,6 +199,12 @@ func EncodeAckMsg(m AckMsg) ([]byte, error) {
 	if m.Type == "" {
 		m.Type = MsgTypeAck
 	}
+	if m.ProtoVersion == "" {
+		m.ProtoVersion = ProtoVersion
+	}
+	if m.Suite == "" {
+		m.Suite = Suite
+	}
 	return json.Marshal(m)
 }
 
@@ -178,12 +213,17 @@ func DecodeAckMsg(data []byte) (AckMsg, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return AckMsg{}, err
 	}
+	if err := ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
+		return AckMsg{}, err
+	}
 	return m, nil
 }
 
 func ContractOpenMsgFromContract(c Contract) ContractOpenMsg {
 	m := ContractOpenMsg{
 		Type:         MsgTypeContractOpen,
+		ProtoVersion: ProtoVersion,
+		Suite:        Suite,
 		Creditor:     hex.EncodeToString(c.IOU.Creditor),
 		Debtor:       hex.EncodeToString(c.IOU.Debtor),
 		Amount:       c.IOU.Amount,
@@ -247,6 +287,8 @@ func ContractFromOpenMsg(m ContractOpenMsg) (Contract, error) {
 func RepayReqMsgFromReq(r RepayReq, sigB, ephPub, sealed []byte) RepayReqMsg {
 	return RepayReqMsg{
 		Type:         MsgTypeRepayReq,
+		ProtoVersion: ProtoVersion,
+		Suite:        Suite,
 		ContractID:   hex.EncodeToString(r.ContractID[:]),
 		ReqNonce:     r.ReqNonce,
 		Close:        r.Close,
@@ -276,6 +318,8 @@ func RepayReqFromMsg(m RepayReqMsg) (RepayReq, []byte, error) {
 func AckMsgFromAck(a Ack, sigA []byte) AckMsg {
 	return AckMsg{
 		Type:         MsgTypeAck,
+		ProtoVersion: ProtoVersion,
+		Suite:        Suite,
 		ContractID:   hex.EncodeToString(a.ContractID[:]),
 		Decision:     a.Decision,
 		Close:        a.Close,
@@ -397,4 +441,14 @@ func DecodeSealedFields(ephB64, sealedB64 string) ([]byte, []byte, error) {
 		return nil, nil, fmt.Errorf("bad sealed")
 	}
 	return eph, sealed, nil
+}
+
+func ValidateWireMeta(version, suite string) error {
+	if version != "" && version != ProtoVersion {
+		return fmt.Errorf("proto version mismatch")
+	}
+	if suite != "" && suite != Suite {
+		return fmt.Errorf("suite mismatch")
+	}
+	return nil
 }
