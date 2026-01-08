@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"web4mvp/internal/crypto"
+	"web4mvp/internal/math4"
 	"web4mvp/internal/network"
 	"web4mvp/internal/proto"
 	"web4mvp/internal/store"
@@ -334,6 +335,60 @@ func TestRecvRejectsOversizeRepayReq(t *testing.T) {
 	}
 }
 
+func TestRecvRejectsBurstUpdates(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA := loadPub(t, homeA)
+
+	openMsgPath1 := filepath.Join(t.TempDir(), "open1.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "4",
+		"--nonce", "1",
+		"--out", openMsgPath1,
+	)
+	openMsgPath2 := filepath.Join(t.TempDir(), "open2.json")
+	runOK(t, homeB, "open",
+		"--to", hex.EncodeToString(pubA),
+		"--amount", "4",
+		"--nonce", "2",
+		"--out", openMsgPath2,
+	)
+	data1, err := os.ReadFile(openMsgPath1)
+	if err != nil {
+		t.Fatalf("read open1 failed: %v", err)
+	}
+	data2, err := os.ReadFile(openMsgPath2)
+	if err != nil {
+		t.Fatalf("read open2 failed: %v", err)
+	}
+
+	root := filepath.Join(homeA, ".web4mvp")
+	st := store.New(
+		filepath.Join(root, "contracts.jsonl"),
+		filepath.Join(root, "acks.jsonl"),
+		filepath.Join(root, "repayreqs.jsonl"),
+	)
+	selfPub, selfPriv := loadKeypair(t, homeA)
+	checker := math4.NewLocalChecker(math4.Options{
+		MaxAbsV:          5,
+		MaxAbsS:          6,
+		AlphaNumerator:   1,
+		AlphaDenominator: 1,
+	})
+
+	if err := recvData(data1, st, selfPub, selfPriv, checker); err != nil {
+		t.Fatalf("expected first recv ok, got %v", err)
+	}
+	if err := recvData(data2, st, selfPub, selfPriv, checker); err == nil || !strings.Contains(err.Error(), "smoothness") {
+		t.Fatalf("expected smoothness rejection, got %v", err)
+	}
+}
+
 func TestRecvRejectsMismatchedOpenPayload(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()
@@ -597,11 +652,19 @@ func TestQuicRecvOpen(t *testing.T) {
 		filepath.Join(root, "repayreqs.jsonl"),
 	)
 	selfPub, selfPriv := loadKeypair(t, homeA)
+	checker := math4.NewLocalChecker(math4.Options{})
 	ready := make(chan struct{})
 	done := make(chan struct{})
+	errCh := make(chan error, 1)
 	go func() {
 		_ = network.ListenAndServeWithReady(addr, ready, func(data []byte) {
-			recvData(data, st, selfPub, selfPriv)
+			if err := recvData(data, st, selfPub, selfPriv, checker); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
 			select {
 			case <-done:
 			default:
@@ -627,6 +690,11 @@ func TestQuicRecvOpen(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("timeout waiting for quic receive")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("recv failed: %v", err)
+	default:
 	}
 	waitForContract(t, homeA, cidHex, 5*time.Second)
 }

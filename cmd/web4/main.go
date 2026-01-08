@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"web4mvp/internal/crypto"
+	"web4mvp/internal/math4"
 	"web4mvp/internal/network"
 	"web4mvp/internal/proto"
 	"web4mvp/internal/store"
@@ -132,200 +134,239 @@ func e2eNonce(contractID [32]byte, reqNonce uint64, ephPub []byte) []byte {
 	return sum[:crypto.XNonceSize]
 }
 
-func recvData(data []byte, st *store.Store, selfPub, selfPriv []byte) {
+type recvError struct {
+	msg string
+	err error
+}
+
+func (e recvError) Error() string {
+	return fmt.Sprintf("%s: %v", e.msg, e.err)
+}
+
+func updateFromParties(a, b []byte, v uint64) (math4.Update, error) {
+	if len(a) != 32 || len(b) != 32 {
+		return math4.Update{}, fmt.Errorf("invalid party id length")
+	}
+	if v > math.MaxInt64 {
+		return math4.Update{}, fmt.Errorf("delta too large")
+	}
+	var A, B [32]byte
+	copy(A[:], a)
+	copy(B[:], b)
+	return math4.Update{A: A, B: B, V: int64(v)}, nil
+}
+
+func recvData(data []byte, st *store.Store, selfPub, selfPriv []byte, checker math4.LocalChecker) *recvError {
 	var hdr struct {
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(data, &hdr); err != nil {
-		die("decode message type failed", err)
+		return &recvError{msg: "decode message type failed", err: err}
 	}
 	if err := enforceTypeMax(hdr.Type, len(data)); err != nil {
-		die("message too large", err)
+		return &recvError{msg: "message too large", err: err}
 	}
 
 	switch hdr.Type {
 	case proto.MsgTypeContractOpen:
 		m, err := proto.DecodeContractOpenMsg(data)
 		if err != nil {
-			die("decode contract open failed", err)
+			return &recvError{msg: "decode contract open failed", err: err}
 		}
 		if err := proto.ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
-			die("invalid wire metadata", err)
+			return &recvError{msg: "invalid wire metadata", err: err}
 		}
 		c, err := proto.ContractFromOpenMsg(m)
 		if err != nil {
-			die("invalid contract open", err)
+			return &recvError{msg: "invalid contract open", err: err}
 		}
 		id := proto.ContractID(c.IOU)
 		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(proto.OpenSignBytes(c.IOU, c.EphemeralPub, c.Sealed)), c.SigDebt) {
-			die("invalid sigb", fmt.Errorf("debtor signature check failed"))
+			return &recvError{msg: "invalid sigb", err: fmt.Errorf("debtor signature check failed")}
 		}
 		plain, err := e2eOpen(proto.MsgTypeContractOpen, id, 0, selfPriv, c.EphemeralPub, c.Sealed)
 		if err != nil {
-			die("sealed open failed", err)
+			return &recvError{msg: "sealed open failed", err: err}
 		}
 		var p proto.OpenPayload
 		if err := json.Unmarshal(plain, &p); err != nil {
-			die("decode open payload failed", err)
+			return &recvError{msg: "decode open payload failed", err: err}
 		}
 		if p.Type != proto.MsgTypeContractOpen ||
 			!strings.EqualFold(p.Creditor, m.Creditor) ||
 			!strings.EqualFold(p.Debtor, m.Debtor) ||
 			p.Amount != m.Amount ||
 			p.Nonce != m.Nonce {
-			die("open payload mismatch", fmt.Errorf("payload/header mismatch"))
+			return &recvError{msg: "open payload mismatch", err: fmt.Errorf("payload/header mismatch")}
 		}
 		if existing, _ := findContractByID(st, id); existing != nil {
 			if existing.Status == "CLOSED" {
-				die("contract already closed", fmt.Errorf("cannot reopen closed contract"))
+				return &recvError{msg: "contract already closed", err: fmt.Errorf("cannot reopen closed contract")}
 			}
 			fmt.Println("RECV OPEN duplicate", hex.EncodeToString(id[:]))
-			return
+			return nil
+		}
+		update, err := updateFromParties(c.IOU.Debtor, c.IOU.Creditor, c.IOU.Amount)
+		if err != nil {
+			return &recvError{msg: "invalid update", err: err}
+		}
+		if err := checker.Check(update); err != nil {
+			return &recvError{msg: "local constraint rejected", err: err}
 		}
 		if err := st.AddContract(c); err != nil {
-			die("store contract failed", err)
+			return &recvError{msg: "store contract failed", err: err}
 		}
 		fmt.Println("RECV OPEN", hex.EncodeToString(id[:]))
 
 	case proto.MsgTypeRepayReq:
 		m, err := proto.DecodeRepayReqMsg(data)
 		if err != nil {
-			die("decode repay request failed", err)
+			return &recvError{msg: "decode repay request failed", err: err}
 		}
 		if err := proto.ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
-			die("invalid wire metadata", err)
+			return &recvError{msg: "invalid wire metadata", err: err}
 		}
 		req, sigB, err := proto.RepayReqFromMsg(m)
 		if err != nil {
-			die("invalid repay request", err)
+			return &recvError{msg: "invalid repay request", err: err}
 		}
 		cidBytes, err := hex.DecodeString(m.ContractID)
 		if err != nil || len(cidBytes) != 32 {
-			die("invalid contract id", fmt.Errorf("bad contract_id"))
+			return &recvError{msg: "invalid contract id", err: fmt.Errorf("bad contract_id")}
 		}
 		var cid [32]byte
 		copy(cid[:], cidBytes)
 		c, err := findContractByID(st, cid)
 		if err != nil {
-			die("contract lookup failed", err)
+			return &recvError{msg: "contract lookup failed", err: err}
 		}
 		if c == nil {
-			die("unknown contract", fmt.Errorf("missing contract for repay request"))
+			return &recvError{msg: "unknown contract", err: fmt.Errorf("missing contract for repay request")}
 		}
 		if c.Status == "CLOSED" {
-			die("contract already closed", fmt.Errorf("reject repay request"))
+			return &recvError{msg: "contract already closed", err: fmt.Errorf("reject repay request")}
 		}
 		ephPub, sealed, err := proto.DecodeSealedFields(m.EphemeralPub, m.Sealed)
 		if err != nil {
-			die("invalid repay request fields", err)
+			return &recvError{msg: "invalid repay request fields", err: err}
 		}
 		reqSign := proto.RepayReqSignBytes(req, ephPub, sealed)
 		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqSign), sigB) {
-			die("invalid sigb", fmt.Errorf("debtor signature check failed"))
+			return &recvError{msg: "invalid sigb", err: fmt.Errorf("debtor signature check failed")}
 		}
 		plain, err := e2eOpen(proto.MsgTypeRepayReq, cid, req.ReqNonce, selfPriv, ephPub, sealed)
 		if err != nil {
-			die("sealed repay request failed", err)
+			return &recvError{msg: "sealed repay request failed", err: err}
 		}
 		var p proto.RepayPayload
 		if err := json.Unmarshal(plain, &p); err != nil {
-			die("decode repay payload failed", err)
+			return &recvError{msg: "decode repay payload failed", err: err}
 		}
 		if p.Type != proto.MsgTypeRepayReq ||
 			!strings.EqualFold(p.ContractID, m.ContractID) ||
 			p.ReqNonce != m.ReqNonce ||
 			p.Close != m.Close {
-			die("repay payload mismatch", fmt.Errorf("payload/header mismatch"))
+			return &recvError{msg: "repay payload mismatch", err: fmt.Errorf("payload/header mismatch")}
 		}
 		if exists, err := st.HasRepayReq(m.ContractID, m.ReqNonce); err == nil && exists {
 			fmt.Println("RECV REPAY-REQ duplicate", m.ContractID)
-			return
+			return nil
 		}
 		if maxNonce, ok, err := st.MaxRepayReqNonce(m.ContractID); err != nil {
-			die("repay request scan failed", err)
+			return &recvError{msg: "repay request scan failed", err: err}
 		} else if ok && req.ReqNonce <= maxNonce {
-			die("repay req nonce out of order", fmt.Errorf("non-monotonic reqnonce"))
+			return &recvError{msg: "repay req nonce out of order", err: fmt.Errorf("non-monotonic reqnonce")}
 		}
 		if err := st.AddRepayReqIfNew(m); err != nil {
-			die("store repay request failed", err)
+			return &recvError{msg: "store repay request failed", err: err}
 		}
 		fmt.Println("RECV REPAY-REQ", m.ContractID)
 
 	case proto.MsgTypeAck:
 		m, err := proto.DecodeAckMsg(data)
 		if err != nil {
-			die("decode ack failed", err)
+			return &recvError{msg: "decode ack failed", err: err}
 		}
 		if err := proto.ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
-			die("invalid wire metadata", err)
+			return &recvError{msg: "invalid wire metadata", err: err}
 		}
 		a, sigA, err := proto.AckFromMsg(m)
 		if err != nil {
-			die("invalid ack", err)
+			return &recvError{msg: "invalid ack", err: err}
 		}
 		c, err := findContractByID(st, a.ContractID)
 		if err != nil {
-			die("contract lookup failed", err)
+			return &recvError{msg: "contract lookup failed", err: err}
 		}
 		if c == nil {
-			die("unknown contract", fmt.Errorf("missing contract for ack"))
+			return &recvError{msg: "unknown contract", err: fmt.Errorf("missing contract for ack")}
 		}
 		if c.Status == "CLOSED" {
-			die("contract already closed", fmt.Errorf("reject ack"))
+			return &recvError{msg: "contract already closed", err: fmt.Errorf("reject ack")}
 		}
 		maxNonce, ok, err := st.MaxRepayReqNonce(m.ContractID)
 		if err != nil {
-			die("repay req scan failed", err)
+			return &recvError{msg: "repay req scan failed", err: err}
 		}
 		if !ok {
-			die("missing repay request", fmt.Errorf("ack without repay request"))
+			return &recvError{msg: "missing repay request", err: fmt.Errorf("ack without repay request")}
 		}
 		reqMsg, err := st.FindRepayReq(m.ContractID, maxNonce)
 		if err != nil {
-			die("repay req lookup failed", err)
+			return &recvError{msg: "repay req lookup failed", err: err}
 		}
 		if reqMsg == nil {
-			die("missing repay request", fmt.Errorf("ack without repay request"))
+			return &recvError{msg: "missing repay request", err: fmt.Errorf("ack without repay request")}
 		}
 		ackSign := proto.AckSignBytes(a.ContractID, a.Decision, a.Close, a.EphemeralPub, a.Sealed)
 		if !crypto.Verify(c.IOU.Creditor, crypto.SHA3_256(ackSign), sigA) {
-			die("invalid siga", fmt.Errorf("creditor signature check failed"))
+			return &recvError{msg: "invalid siga", err: fmt.Errorf("creditor signature check failed")}
 		}
 		if reqMsg.Close != a.Close {
-			die("ack close mismatch", fmt.Errorf("close flag mismatch"))
+			return &recvError{msg: "ack close mismatch", err: fmt.Errorf("close flag mismatch")}
 		}
 		plain, err := e2eOpen(proto.MsgTypeAck, a.ContractID, maxNonce, selfPriv, a.EphemeralPub, a.Sealed)
 		if err != nil {
-			die("sealed ack failed", err)
+			return &recvError{msg: "sealed ack failed", err: err}
 		}
 		var p proto.AckPayload
 		if err := json.Unmarshal(plain, &p); err != nil {
-			die("decode ack payload failed", err)
+			return &recvError{msg: "decode ack payload failed", err: err}
 		}
 		if p.Type != proto.MsgTypeAck ||
 			!strings.EqualFold(p.ContractID, m.ContractID) ||
 			p.Decision != m.Decision ||
 			p.Close != m.Close {
-			die("ack payload mismatch", fmt.Errorf("payload/header mismatch"))
+			return &recvError{msg: "ack payload mismatch", err: fmt.Errorf("payload/header mismatch")}
 		}
 		a.ReqNonce = maxNonce
 		if exists, err := st.HasAck(m.ContractID, maxNonce); err == nil && exists {
 			fmt.Println("RECV ACK duplicate", m.ContractID)
-			return
+			return nil
+		}
+		if a.Decision == 1 {
+			update, err := updateFromParties(c.IOU.Creditor, c.IOU.Debtor, c.IOU.Amount)
+			if err != nil {
+				return &recvError{msg: "invalid update", err: err}
+			}
+			if err := checker.Check(update); err != nil {
+				return &recvError{msg: "local constraint rejected", err: err}
+			}
 		}
 		if err := st.AddAckIfNew(a, sigA); err != nil {
-			die("store ack failed", err)
+			return &recvError{msg: "store ack failed", err: err}
 		}
 		if a.Decision == 1 {
 			if err := st.MarkClosed(a.ContractID, false); err != nil {
-				die("mark closed failed", err)
+				return &recvError{msg: "mark closed failed", err: err}
 			}
 		}
 		fmt.Println("RECV ACK", m.ContractID)
 
 	default:
-		die("unknown message type", fmt.Errorf("%s", hdr.Type))
+		return &recvError{msg: "unknown message type", err: fmt.Errorf("%s", hdr.Type)}
 	}
+	return nil
 }
 func main() {
 	if len(os.Args) < 2 {
@@ -341,6 +382,7 @@ func main() {
 		filepath.Join(root, "acks.jsonl"),
 		filepath.Join(root, "repayreqs.jsonl"),
 	)
+	checker := math4.NewLocalChecker(math4.Options{})
 
 	switch os.Args[1] {
 
@@ -623,10 +665,14 @@ func main() {
 		}
 		payload, err := proto.ReadFrame(bytes.NewReader(data))
 		if err == nil {
-			recvData(payload, st, selfPub, selfPriv)
+			if err := recvData(payload, st, selfPub, selfPriv, checker); err != nil {
+				die(err.msg, err.err)
+			}
 			return
 		}
-		recvData(data, st, selfPub, selfPriv)
+		if err := recvData(data, st, selfPub, selfPriv, checker); err != nil {
+			die(err.msg, err.err)
+		}
 
 	case "quic-listen":
 		fs := flag.NewFlagSet("quic-listen", flag.ExitOnError)
@@ -642,7 +688,9 @@ func main() {
 			die("load keys failed", err)
 		}
 		if err := network.ListenAndServe(*addr, func(data []byte) {
-			recvData(data, st, selfPub, selfPriv)
+			if err := recvData(data, st, selfPub, selfPriv, checker); err != nil {
+				die(err.msg, err.err)
+			}
 		}); err != nil {
 			die("quic listen failed", err)
 		}
