@@ -3,6 +3,7 @@ package math4
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 type Update struct {
@@ -16,16 +17,23 @@ type LocalChecker interface {
 }
 
 type Options struct {
-	MaxAbsV          int64
-	MaxAbsS          int64
-	AlphaNumerator   int64
-	AlphaDenominator int64
+	MaxAbsV           int64
+	MaxAbsS           int64
+	AlphaNumerator    int64
+	AlphaDenominator  int64
+	ColdStartMaxAbsV  int64
+	ColdStartMaxAbsS  int64
+	ColdStartUpdates  int64
+	ColdStartDuration time.Duration
+	Now               func() time.Time
 }
 
 type Checker struct {
 	mu     sync.Mutex
 	opts   Options
 	scores map[[32]byte]int64
+	start  time.Time
+	count  int64
 }
 
 // NOTE: These are MVP-level heuristic guards for local constraint checking.
@@ -34,6 +42,7 @@ const (
 	defaultMaxAbsV        int64 = 1_000_000
 	defaultAlphaNumerator int64 = 9
 	defaultAlphaDenom     int64 = 10
+	defaultColdUpdates    int64 = 10
 )
 
 func NewLocalChecker(opts Options) *Checker {
@@ -41,6 +50,7 @@ func NewLocalChecker(opts Options) *Checker {
 	return &Checker{
 		opts:   norm,
 		scores: make(map[[32]byte]int64),
+		start:  norm.Now(),
 	}
 }
 
@@ -55,6 +65,18 @@ func normalizeOptions(opts Options) Options {
 		opts.AlphaNumerator = defaultAlphaNumerator
 		opts.AlphaDenominator = defaultAlphaDenom
 	}
+	if opts.Now == nil {
+		opts.Now = time.Now
+	}
+	if opts.ColdStartUpdates == 0 && opts.ColdStartDuration == 0 {
+		opts.ColdStartUpdates = defaultColdUpdates
+	}
+	if opts.ColdStartMaxAbsV <= 0 {
+		opts.ColdStartMaxAbsV = clampMin(opts.MaxAbsV/2, 1)
+	}
+	if opts.ColdStartMaxAbsS <= 0 {
+		opts.ColdStartMaxAbsS = clampMin(opts.MaxAbsS/2, 1)
+	}
 	return opts
 }
 
@@ -65,22 +87,23 @@ func (c *Checker) Check(u Update) error {
 	if u.V <= 0 {
 		return fmt.Errorf("V must be positive")
 	}
-	if u.V > c.opts.MaxAbsV {
-		return fmt.Errorf("V exceeds MaxAbsV")
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	maxV, maxS := c.limits()
+	if u.V > maxV {
+		return fmt.Errorf("V exceeds MaxAbsV")
+	}
 	decayA := c.decay(c.scores[u.A])
 	decayB := c.decay(c.scores[u.B])
 	sA := decayA - u.V
 	sB := decayB + u.V
-	if abs64(sA) > c.opts.MaxAbsS || abs64(sB) > c.opts.MaxAbsS {
+	if abs64(sA) > maxS || abs64(sB) > maxS {
 		return fmt.Errorf("smoothness threshold exceeded")
 	}
 	c.scores[u.A] = sA
 	c.scores[u.B] = sB
+	c.count++
 	return nil
 }
 
@@ -91,6 +114,26 @@ func (c *Checker) decay(v int64) int64 {
 func abs64(v int64) int64 {
 	if v < 0 {
 		return -v
+	}
+	return v
+}
+
+func (c *Checker) limits() (int64, int64) {
+	if c.opts.ColdStartUpdates <= 0 && c.opts.ColdStartDuration <= 0 {
+		return c.opts.MaxAbsV, c.opts.MaxAbsS
+	}
+	if c.opts.ColdStartUpdates > 0 && c.count < c.opts.ColdStartUpdates {
+		return c.opts.ColdStartMaxAbsV, c.opts.ColdStartMaxAbsS
+	}
+	if c.opts.ColdStartDuration > 0 && c.opts.Now().Sub(c.start) < c.opts.ColdStartDuration {
+		return c.opts.ColdStartMaxAbsV, c.opts.ColdStartMaxAbsS
+	}
+	return c.opts.MaxAbsV, c.opts.MaxAbsS
+}
+
+func clampMin(v, min int64) int64 {
+	if v < min {
+		return min
 	}
 	return v
 }

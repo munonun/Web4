@@ -54,7 +54,7 @@ func TestOpenCloseAckFlow(t *testing.T) {
 		"--out", closeMsgPath,
 	)
 	runOK(t, homeA, "recv", "--in", closeMsgPath)
-	if err := runWithHome(homeB, "recv", "--in", closeMsgPath); err == nil || !strings.Contains(err.Error(), "sealed repay request failed") {
+	if err := runWithHome(homeB, "recv", "--in", closeMsgPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected recipient decrypt failure, got: %v", err)
 	}
 
@@ -209,7 +209,7 @@ func TestRepayReqSealedTamper(t *testing.T) {
 		t.Fatalf("write tampered failed: %v", err)
 	}
 
-	if err := runWithHome(homeA, "recv", "--in", tamperedPath); err == nil || !strings.Contains(err.Error(), "invalid sigb") {
+	if err := runWithHome(homeA, "recv", "--in", tamperedPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected invalid sigb error, got: %v", err)
 	}
 }
@@ -278,7 +278,7 @@ func TestAckSigTamperRejectedOnRecv(t *testing.T) {
 		t.Fatalf("write tampered ack failed: %v", err)
 	}
 
-	if err := runWithHome(homeB, "recv", "--in", tamperedPath); err == nil || !strings.Contains(err.Error(), "invalid siga") {
+	if err := runWithHome(homeB, "recv", "--in", tamperedPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected invalid siga error, got: %v", err)
 	}
 }
@@ -312,12 +312,12 @@ func TestE2ESealFreshEphemeralPerCall(t *testing.T) {
 func TestRecvRejectsOversizeAck(t *testing.T) {
 	home := t.TempDir()
 	runOK(t, home, "keygen")
-	data := oversizedPayload(t, proto.MsgTypeAck, maxAckSize)
+	data := oversizedPayload(t, proto.MsgTypeAck, proto.MaxAckSize)
 	inPath := filepath.Join(t.TempDir(), "ack-oversize.json")
 	if err := os.WriteFile(inPath, data, 0600); err != nil {
 		t.Fatalf("write oversize ack failed: %v", err)
 	}
-	if err := runWithHome(home, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "message too large") {
+	if err := runWithHome(home, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected size rejection, got: %v", err)
 	}
 }
@@ -325,12 +325,12 @@ func TestRecvRejectsOversizeAck(t *testing.T) {
 func TestRecvRejectsOversizeRepayReq(t *testing.T) {
 	home := t.TempDir()
 	runOK(t, home, "keygen")
-	data := oversizedPayload(t, proto.MsgTypeRepayReq, maxRepayReqSize)
+	data := oversizedPayload(t, proto.MsgTypeRepayReq, proto.MaxRepayReqSize)
 	inPath := filepath.Join(t.TempDir(), "repay-oversize.json")
 	if err := os.WriteFile(inPath, data, 0600); err != nil {
 		t.Fatalf("write oversize repay req failed: %v", err)
 	}
-	if err := runWithHome(home, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "message too large") {
+	if err := runWithHome(home, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected size rejection, got: %v", err)
 	}
 }
@@ -379,6 +379,7 @@ func TestRecvRejectsBurstUpdates(t *testing.T) {
 		MaxAbsS:          6,
 		AlphaNumerator:   1,
 		AlphaDenominator: 1,
+		ColdStartUpdates: -1,
 	})
 
 	if err := recvData(data1, st, selfPub, selfPriv, checker); err != nil {
@@ -426,7 +427,7 @@ func TestRecvRejectsMismatchedOpenPayload(t *testing.T) {
 	if err := os.WriteFile(inPath, data, 0600); err != nil {
 		t.Fatalf("write open msg failed: %v", err)
 	}
-	if err := runWithHome(homeA, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "payload mismatch") {
+	if err := runWithHome(homeA, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected payload mismatch, got: %v", err)
 	}
 }
@@ -481,7 +482,7 @@ func TestRecvRejectsAckWithoutRepayReq(t *testing.T) {
 	if err := os.WriteFile(inPath, data, 0600); err != nil {
 		t.Fatalf("write ack msg failed: %v", err)
 	}
-	if err := runWithHome(homeB, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "missing repay request") {
+	if err := runWithHome(homeB, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected missing repay request, got: %v", err)
 	}
 }
@@ -532,7 +533,7 @@ func TestRecvRejectsAfterClosed(t *testing.T) {
 		"--reqnonce", "2",
 		"--out", closeMsgPath2,
 	)
-	if err := runWithHome(homeA, "recv", "--in", closeMsgPath2); err == nil || !strings.Contains(err.Error(), "contract already closed") {
+	if err := runWithHome(homeA, "recv", "--in", closeMsgPath2); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected closed rejection, got: %v", err)
 	}
 }
@@ -612,7 +613,7 @@ func TestAckDuplicateRecv(t *testing.T) {
 		"--out", ackMsgPath,
 	)
 	runOK(t, homeB, "recv", "--in", ackMsgPath)
-	if err := runWithHome(homeB, "recv", "--in", ackMsgPath); err == nil || !strings.Contains(err.Error(), "contract already closed") {
+	if err := runWithHome(homeB, "recv", "--in", ackMsgPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
 		t.Fatalf("expected closed rejection, got: %v", err)
 	}
 

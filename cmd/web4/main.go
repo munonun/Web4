@@ -25,6 +25,11 @@ func die(msg string, err error) {
 	os.Exit(1)
 }
 
+func dieMsg(msg string) {
+	fmt.Fprintln(os.Stderr, msg)
+	os.Exit(1)
+}
+
 func homeDir() string {
 	h, _ := os.UserHomeDir()
 	return filepath.Join(h, ".web4mvp")
@@ -35,22 +40,11 @@ func writeMsg(outPath string, data []byte) error {
 }
 
 const (
-	maxContractOpenSize = 32 << 10
-	maxRepayReqSize     = 8 << 10
-	maxAckSize          = 8 << 10
+	invalidMessage = "invalid message"
 )
 
 func maxSizeForType(t string) int {
-	switch t {
-	case proto.MsgTypeContractOpen:
-		return maxContractOpenSize
-	case proto.MsgTypeRepayReq:
-		return maxRepayReqSize
-	case proto.MsgTypeAck:
-		return maxAckSize
-	default:
-		return proto.MaxFrameSize
-	}
+	return proto.MaxSizeForType(t)
 }
 
 func enforceTypeMax(t string, n int) error {
@@ -663,25 +657,36 @@ func main() {
 		if err != nil {
 			die("read message failed", err)
 		}
-		payload, err := proto.ReadFrame(bytes.NewReader(data))
+		payload, err := proto.ReadFrameWithTypeCap(bytes.NewReader(data), proto.SoftMaxFrameSize, proto.MaxSizeForType)
 		if err == nil {
 			if err := recvData(payload, st, selfPub, selfPriv, checker); err != nil {
-				die(err.msg, err.err)
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
+				}
+				dieMsg(invalidMessage)
 			}
 			return
 		}
 		if err := recvData(data, st, selfPub, selfPriv, checker); err != nil {
-			die(err.msg, err.err)
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
+			}
+			dieMsg(invalidMessage)
 		}
 
 	case "quic-listen":
 		fs := flag.NewFlagSet("quic-listen", flag.ExitOnError)
 		addr := fs.String("addr", "", "listen addr (host:port)")
 		_ = fs.Bool("insecure", false, "skip certificate verification (client only)")
+		devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
 		_ = fs.Parse(os.Args[2:])
 		if *addr == "" {
 			die("missing --addr", fmt.Errorf("address required"))
 		}
+		if !*devTLS {
+			dieMsg("dev TLS disabled by default; pass --devtls to enable")
+		}
+		fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 		fmt.Println("QUIC LISTEN", *addr)
 		selfPub, selfPriv, err := crypto.LoadKeypair(root)
 		if err != nil {
@@ -689,7 +694,10 @@ func main() {
 		}
 		if err := network.ListenAndServe(*addr, func(data []byte) {
 			if err := recvData(data, st, selfPub, selfPriv, checker); err != nil {
-				die(err.msg, err.err)
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
+				}
+				dieMsg(invalidMessage)
 			}
 		}); err != nil {
 			die("quic listen failed", err)
@@ -700,6 +708,7 @@ func main() {
 		addr := fs.String("addr", "", "server addr (host:port)")
 		inPath := fs.String("in", "", "message file path")
 		insecure := fs.Bool("insecure", false, "skip certificate verification")
+		devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
 		_ = fs.Parse(os.Args[2:])
 		if *addr == "" {
 			die("missing --addr", fmt.Errorf("address required"))
@@ -707,6 +716,10 @@ func main() {
 		if *inPath == "" {
 			die("missing --in", fmt.Errorf("path required"))
 		}
+		if !*devTLS {
+			dieMsg("dev TLS disabled by default; pass --devtls to enable")
+		}
+		fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 		data, err := os.ReadFile(*inPath)
 		if err != nil {
 			die("read message failed", err)

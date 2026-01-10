@@ -32,10 +32,11 @@ func (zeroReader) Read(p []byte) (int, error) {
 func devTLSCert() (tls.Certificate, []byte, error) {
 	seed := sha256.Sum256([]byte("web4-quic-dev-key"))
 	priv := ed25519.NewKeyFromSeed(seed[:])
+	now := time.Now()
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Unix(0, 0),
-		NotAfter:     time.Unix(0, 0).Add(365 * 24 * time.Hour),
+		NotBefore:    now.Add(-1 * time.Hour),
+		NotAfter:     now.Add(3650 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		DNSNames:     []string{"localhost"},
@@ -97,6 +98,8 @@ const (
 	maxStreamHandlers = 128
 	acquireTimeout    = 100 * time.Millisecond
 	streamRWTimeout   = 5 * time.Second
+	maxConnsPerIP     = 4
+	maxStreamsPerIP   = 32
 
 	streamBusyErrCode quic.StreamErrorCode = 0x10
 )
@@ -152,15 +155,23 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 	}
 	connSem := NewSemaphore(maxConnHandlers)
 	streamSem := NewSemaphore(maxStreamHandlers)
+	ipLimits := newIPLimiter(maxConnsPerIP, maxStreamsPerIP)
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
 			logInfo("quic accept error: %v", err)
 			return err
 		}
+		ip := remoteIP(conn.RemoteAddr())
+		if !ipLimits.acquireConn(ip) {
+			_ = conn.CloseWithError(0, "too many connections")
+			logInfo("quic connection rejected: per-ip limit")
+			continue
+		}
 		acceptCtx, cancel := context.WithTimeout(context.Background(), acquireTimeout)
 		if err := connSem.Acquire(acceptCtx); err != nil {
 			cancel()
+			ipLimits.releaseConn(ip)
 			_ = conn.CloseWithError(0, "server busy")
 			logInfo("quic connection rejected: %v", err)
 			continue
@@ -169,6 +180,7 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 		logInfo("accepted connection")
 		go func() {
 			defer connSem.Release()
+			defer ipLimits.releaseConn(ip)
 			c := conn
 			for {
 				stream, err := c.AcceptStream(context.Background())
@@ -181,9 +193,15 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 					return
 				}
 				logInfo("accepted stream")
+				if !ipLimits.acquireStream(ip) {
+					closeStreamWithError(stream, streamBusyErrCode, "per-ip stream limit")
+					logInfo("quic stream rejected: per-ip limit")
+					continue
+				}
 				streamCtx, streamCancel := context.WithTimeout(context.Background(), acquireTimeout)
 				if err := streamSem.Acquire(streamCtx); err != nil {
 					streamCancel()
+					ipLimits.releaseStream(ip)
 					closeStreamWithError(stream, streamBusyErrCode, "server busy")
 					logInfo("quic stream rejected: %v", err)
 					continue
@@ -191,6 +209,7 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 				streamCancel()
 				go func(s *quic.Stream) {
 					defer streamSem.Release()
+					defer ipLimits.releaseStream(ip)
 					defer s.Close()
 					logInfo("read start")
 					data, err := readFrameWithTimeout(s, streamRWTimeout)
@@ -255,12 +274,23 @@ func logInfo(format string, args ...any) {
 	_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
+func remoteIP(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
 func readFrameWithTimeout(stream *quic.Stream, timeout time.Duration) ([]byte, error) {
 	if d, ok := any(stream).(interface {
 		SetReadDeadline(time.Time) error
 	}); ok {
 		_ = d.SetReadDeadline(time.Now().Add(timeout))
-		return proto.ReadFrame(stream)
+		return proto.ReadFrameWithTypeCap(stream, proto.SoftMaxFrameSize, proto.MaxSizeForType)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -270,7 +300,7 @@ func readFrameWithTimeout(stream *quic.Stream, timeout time.Duration) ([]byte, e
 	}
 	ch := make(chan result, 1)
 	go func() {
-		data, err := proto.ReadFrame(stream)
+		data, err := proto.ReadFrameWithTypeCap(stream, proto.SoftMaxFrameSize, proto.MaxSizeForType)
 		ch <- result{data: data, err: err}
 	}()
 	select {

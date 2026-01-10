@@ -52,6 +52,25 @@ const (
 	Suite        = "ed25519+x25519+xchacha20poly1305+sha3+hmacsha3hkdf"
 )
 
+const (
+	MaxContractOpenSize = 32 << 10
+	MaxRepayReqSize     = 8 << 10
+	MaxAckSize          = 8 << 10
+)
+
+func MaxSizeForType(t string) int {
+	switch t {
+	case MsgTypeContractOpen:
+		return MaxContractOpenSize
+	case MsgTypeRepayReq:
+		return MaxRepayReqSize
+	case MsgTypeAck:
+		return MaxAckSize
+	default:
+		return MaxFrameSize
+	}
+}
+
 type ContractOpenMsg struct {
 	Type         string `json:"type"`
 	ProtoVersion string `json:"proto_version"`
