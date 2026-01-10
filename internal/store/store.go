@@ -351,6 +351,10 @@ func appendJSONL(path string, v any) error {
 	return syncFile(f)
 }
 
+func AppendJSONL(path string, v any) error {
+	return appendJSONL(path, v)
+}
+
 func rotateIfNeeded(path string, addBytes int) error {
 	if MaxLinesPerFile <= 0 && MaxBytesPerFile <= 0 {
 		return nil

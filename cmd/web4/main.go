@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,8 @@ import (
 	"web4mvp/internal/crypto"
 	"web4mvp/internal/math4"
 	"web4mvp/internal/network"
+	"web4mvp/internal/node"
+	"web4mvp/internal/peer"
 	"web4mvp/internal/proto"
 	"web4mvp/internal/store"
 )
@@ -150,7 +153,7 @@ func updateFromParties(a, b []byte, v uint64) (math4.Update, error) {
 	return math4.Update{A: A, B: B, V: int64(v)}, nil
 }
 
-func recvData(data []byte, st *store.Store, selfPub, selfPriv []byte, checker math4.LocalChecker) *recvError {
+func recvData(data []byte, st *store.Store, self *node.Node, checker math4.LocalChecker) *recvError {
 	var hdr struct {
 		Type string `json:"type"`
 	}
@@ -160,8 +163,22 @@ func recvData(data []byte, st *store.Store, selfPub, selfPriv []byte, checker ma
 	if err := enforceTypeMax(hdr.Type, len(data)); err != nil {
 		return &recvError{msg: "message too large", err: err}
 	}
+	if self == nil {
+		return &recvError{msg: "node unavailable", err: fmt.Errorf("missing node")}
+	}
 
 	switch hdr.Type {
+	case proto.MsgTypeNodeHello:
+		m, err := proto.DecodeNodeHelloMsg(data)
+		if err != nil {
+			return &recvError{msg: "decode node hello failed", err: err}
+		}
+		peerInfo, err := self.AcceptHello(m)
+		if err != nil {
+			return &recvError{msg: "invalid node hello", err: err}
+		}
+		fmt.Println("RECV NODE HELLO", hex.EncodeToString(peerInfo.NodeID[:]))
+
 	case proto.MsgTypeContractOpen:
 		m, err := proto.DecodeContractOpenMsg(data)
 		if err != nil {
@@ -178,7 +195,7 @@ func recvData(data []byte, st *store.Store, selfPub, selfPriv []byte, checker ma
 		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(proto.OpenSignBytes(c.IOU, c.EphemeralPub, c.Sealed)), c.SigDebt) {
 			return &recvError{msg: "invalid sigb", err: fmt.Errorf("debtor signature check failed")}
 		}
-		plain, err := e2eOpen(proto.MsgTypeContractOpen, id, 0, selfPriv, c.EphemeralPub, c.Sealed)
+		plain, err := e2eOpen(proto.MsgTypeContractOpen, id, 0, self.PrivKey, c.EphemeralPub, c.Sealed)
 		if err != nil {
 			return &recvError{msg: "sealed open failed", err: err}
 		}
@@ -248,7 +265,7 @@ func recvData(data []byte, st *store.Store, selfPub, selfPriv []byte, checker ma
 		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqSign), sigB) {
 			return &recvError{msg: "invalid sigb", err: fmt.Errorf("debtor signature check failed")}
 		}
-		plain, err := e2eOpen(proto.MsgTypeRepayReq, cid, req.ReqNonce, selfPriv, ephPub, sealed)
+		plain, err := e2eOpen(proto.MsgTypeRepayReq, cid, req.ReqNonce, self.PrivKey, ephPub, sealed)
 		if err != nil {
 			return &recvError{msg: "sealed repay request failed", err: err}
 		}
@@ -319,7 +336,7 @@ func recvData(data []byte, st *store.Store, selfPub, selfPriv []byte, checker ma
 		if reqMsg.Close != a.Close {
 			return &recvError{msg: "ack close mismatch", err: fmt.Errorf("close flag mismatch")}
 		}
-		plain, err := e2eOpen(proto.MsgTypeAck, a.ContractID, maxNonce, selfPriv, a.EphemeralPub, a.Sealed)
+		plain, err := e2eOpen(proto.MsgTypeAck, a.ContractID, maxNonce, self.PrivKey, a.EphemeralPub, a.Sealed)
 		if err != nil {
 			return &recvError{msg: "sealed ack failed", err: err}
 		}
@@ -364,7 +381,7 @@ func recvData(data []byte, st *store.Store, selfPub, selfPriv []byte, checker ma
 }
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: web4 <keygen|open|list|close|ack|recv|quic-listen|quic-send>")
+		fmt.Println("usage: web4 <keygen|open|list|close|ack|recv|quic-listen|quic-send|node>")
 		os.Exit(1)
 	}
 
@@ -649,7 +666,7 @@ func main() {
 		if *inPath == "" {
 			die("missing --in", fmt.Errorf("path required"))
 		}
-		selfPub, selfPriv, err := crypto.LoadKeypair(root)
+		self, err := node.NewNode(root, node.Options{})
 		if err != nil {
 			die("load keys failed", err)
 		}
@@ -659,7 +676,7 @@ func main() {
 		}
 		payload, err := proto.ReadFrameWithTypeCap(bytes.NewReader(data), proto.SoftMaxFrameSize, proto.MaxSizeForType)
 		if err == nil {
-			if err := recvData(payload, st, selfPub, selfPriv, checker); err != nil {
+			if err := recvData(payload, st, self, checker); err != nil {
 				if os.Getenv("WEB4_DEBUG") == "1" {
 					fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
 				}
@@ -667,7 +684,7 @@ func main() {
 			}
 			return
 		}
-		if err := recvData(data, st, selfPub, selfPriv, checker); err != nil {
+		if err := recvData(data, st, self, checker); err != nil {
 			if os.Getenv("WEB4_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
 			}
@@ -688,12 +705,12 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 		fmt.Println("QUIC LISTEN", *addr)
-		selfPub, selfPriv, err := crypto.LoadKeypair(root)
+		self, err := node.NewNode(root, node.Options{})
 		if err != nil {
 			die("load keys failed", err)
 		}
-		if err := network.ListenAndServe(*addr, func(data []byte) {
-			if err := recvData(data, st, selfPub, selfPriv, checker); err != nil {
+		if err := network.ListenAndServe(*addr, *devTLS, func(data []byte) {
+			if err := recvData(data, st, self, checker); err != nil {
 				if os.Getenv("WEB4_DEBUG") == "1" {
 					fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
 				}
@@ -724,8 +741,81 @@ func main() {
 		if err != nil {
 			die("read message failed", err)
 		}
-		if err := network.Send(*addr, data, *insecure); err != nil {
+		if err := network.Send(*addr, data, *insecure, *devTLS); err != nil {
 			die("quic send failed", err)
+		}
+
+	case "node":
+		if len(os.Args) < 3 {
+			dieMsg("usage: web4 node <id|list|hello>")
+		}
+		switch os.Args[2] {
+		case "id":
+			self, err := node.NewNode(root, node.Options{})
+			if err != nil {
+				die("load node failed", err)
+			}
+			fmt.Println("node_id:", hex.EncodeToString(self.ID[:]))
+			fmt.Println("pub:", hex.EncodeToString(self.PubKey))
+		case "list":
+			self, err := node.NewNode(root, node.Options{})
+			if err != nil {
+				die("load node failed", err)
+			}
+			for _, p := range self.Peers.List() {
+				if len(p.PubKey) == 0 {
+					fmt.Printf("addr=%s\n", p.Addr)
+					continue
+				}
+				fmt.Printf("%s  %s\n", hex.EncodeToString(p.NodeID[:]), hex.EncodeToString(p.PubKey))
+			}
+		case "hello":
+			fs := flag.NewFlagSet("node hello", flag.ExitOnError)
+			addr := fs.String("addr", "", "target addr (host:port)")
+			devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
+			_ = fs.Parse(os.Args[3:])
+			if *addr == "" {
+				die("missing --addr", fmt.Errorf("address required"))
+			}
+			if !*devTLS {
+				dieMsg("dev TLS disabled by default; pass --devtls to enable")
+			}
+			fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
+
+			fail := func(msg string, err error) {
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					die(msg, err)
+				}
+				dieMsg(invalidMessage)
+			}
+
+			self, err := node.NewNode(root, node.Options{})
+			if err != nil {
+				fail("load node failed", err)
+			}
+			var nonceBytes [8]byte
+			if _, err := rand.Read(nonceBytes[:]); err != nil {
+				fail("nonce generation failed", err)
+			}
+			nonce := binary.BigEndian.Uint64(nonceBytes[:])
+			msg, err := self.Hello(nonce)
+			if err != nil {
+				fail("node hello failed", err)
+			}
+			data, err := proto.EncodeNodeHelloMsg(msg)
+			if err != nil {
+				fail("encode node hello failed", err)
+			}
+			if err := enforceTypeMax(proto.MsgTypeNodeHello, len(data)); err != nil {
+				fail("node hello too large", err)
+			}
+			if err := network.Send(*addr, data, false, *devTLS); err != nil {
+				fail("node hello send failed", err)
+			}
+			_ = self.Peers.Upsert(peer.Peer{Addr: *addr}, false)
+			fmt.Println("OK node hello sent")
+		default:
+			dieMsg("usage: web4 node <id|list|hello>")
 		}
 
 	default:

@@ -66,6 +66,8 @@ func MaxSizeForType(t string) int {
 		return MaxRepayReqSize
 	case MsgTypeAck:
 		return MaxAckSize
+	case MsgTypeNodeHello:
+		return MaxNodeHelloSize
 	default:
 		return MaxFrameSize
 	}

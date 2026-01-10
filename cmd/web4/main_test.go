@@ -20,6 +20,8 @@ import (
 	"web4mvp/internal/crypto"
 	"web4mvp/internal/math4"
 	"web4mvp/internal/network"
+	"web4mvp/internal/node"
+	"web4mvp/internal/peer"
 	"web4mvp/internal/proto"
 	"web4mvp/internal/store"
 )
@@ -373,7 +375,10 @@ func TestRecvRejectsBurstUpdates(t *testing.T) {
 		filepath.Join(root, "acks.jsonl"),
 		filepath.Join(root, "repayreqs.jsonl"),
 	)
-	selfPub, selfPriv := loadKeypair(t, homeA)
+	self, err := node.NewNode(root, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
 	checker := math4.NewLocalChecker(math4.Options{
 		MaxAbsV:          5,
 		MaxAbsS:          6,
@@ -382,10 +387,10 @@ func TestRecvRejectsBurstUpdates(t *testing.T) {
 		ColdStartUpdates: -1,
 	})
 
-	if err := recvData(data1, st, selfPub, selfPriv, checker); err != nil {
+	if err := recvData(data1, st, self, checker); err != nil {
 		t.Fatalf("expected first recv ok, got %v", err)
 	}
-	if err := recvData(data2, st, selfPub, selfPriv, checker); err == nil || !strings.Contains(err.Error(), "smoothness") {
+	if err := recvData(data2, st, self, checker); err == nil || !strings.Contains(err.Error(), "smoothness") {
 		t.Fatalf("expected smoothness rejection, got %v", err)
 	}
 }
@@ -652,14 +657,17 @@ func TestQuicRecvOpen(t *testing.T) {
 		filepath.Join(root, "acks.jsonl"),
 		filepath.Join(root, "repayreqs.jsonl"),
 	)
-	selfPub, selfPriv := loadKeypair(t, homeA)
+	self, err := node.NewNode(root, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
 	checker := math4.NewLocalChecker(math4.Options{})
 	ready := make(chan struct{})
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		_ = network.ListenAndServeWithReady(addr, ready, func(data []byte) {
-			if err := recvData(data, st, selfPub, selfPriv, checker); err != nil {
+		_ = network.ListenAndServeWithReady(addr, ready, false, func(data []byte) {
+			if err := recvData(data, st, self, checker); err != nil {
 				select {
 				case errCh <- err:
 				default:
@@ -683,7 +691,7 @@ func TestQuicRecvOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read open msg failed: %v", err)
 	}
-	if err := network.Send(addr, msgData, true); err != nil {
+	if err := network.Send(addr, msgData, true, false); err != nil {
 		t.Fatalf("quic send failed: %v", err)
 	}
 
@@ -749,6 +757,75 @@ func loadKeypair(t *testing.T, home string) ([]byte, []byte) {
 	return pub, priv
 }
 
+func TestQuicNodeHello(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	addr := freeUDPAddr(t)
+	root := filepath.Join(homeB, ".web4mvp")
+	_ = os.MkdirAll(root, 0700)
+	st := store.New(
+		filepath.Join(root, "contracts.jsonl"),
+		filepath.Join(root, "acks.jsonl"),
+		filepath.Join(root, "repayreqs.jsonl"),
+	)
+	self, err := node.NewNode(root, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+	checker := math4.NewLocalChecker(math4.Options{})
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		_ = network.ListenAndServeWithReady(addr, ready, true, func(data []byte) {
+			if err := recvData(data, st, self, checker); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+				return
+			}
+			select {
+			case <-done:
+			default:
+				close(done)
+			}
+		})
+	}()
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for quic server ready")
+	}
+
+	if err := runWithHome(homeA, "node", "hello", "--devtls", "--addr", addr); err != nil {
+		t.Fatalf("node hello failed: %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("recv error: %v", err)
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for node hello")
+	}
+
+	senderPub := loadPub(t, homeA)
+	senderID := node.DeriveNodeID(senderPub)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if hasPeerID(self.Peers.List(), senderID) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected sender in peer store")
+}
+
 func waitForContract(t *testing.T, home, cidHex string, timeout time.Duration) {
 	t.Helper()
 	contractsPath := filepath.Join(home, ".web4mvp", "contracts.jsonl")
@@ -770,6 +847,15 @@ func waitForContract(t *testing.T, home, cidHex string, timeout time.Duration) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("timeout waiting for contract %s", cidHex)
+}
+
+func hasPeerID(peers []peer.Peer, id [32]byte) bool {
+	for _, p := range peers {
+		if p.NodeID == id {
+			return true
+		}
+	}
+	return false
 }
 
 func oversizedPayload(t *testing.T, msgType string, maxSize int) []byte {

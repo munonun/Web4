@@ -7,12 +7,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
@@ -53,10 +55,15 @@ func devTLSCert() (tls.Certificate, []byte, error) {
 	return cert, der, nil
 }
 
-func serverTLSConfig() (*tls.Config, error) {
+func serverTLSConfig(devTLS bool) (*tls.Config, error) {
 	cert, _, err := devTLSCert()
 	if err != nil {
 		return nil, err
+	}
+	if devTLS {
+		if err := persistDevTLSCert(cert.Certificate[0]); err != nil {
+			return nil, err
+		}
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -64,23 +71,30 @@ func serverTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-func clientTLSConfig(insecure bool) (*tls.Config, error) {
-	_, der, err := devTLSCert()
-	if err != nil {
-		return nil, err
-	}
+func clientTLSConfig(insecure bool, devTLS bool) (*tls.Config, error) {
 	if insecure {
 		return &tls.Config{
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"web4-quic"},
 		}, nil
 	}
-	cert, err := x509.ParseCertificate(der)
+	if devTLS {
+		pool, err := loadDevTLSCertPool()
+		if err != nil {
+			return nil, err
+		}
+		return &tls.Config{
+			RootCAs:    pool,
+			NextProtos: []string{"web4-quic"},
+		}, nil
+	}
+	pool, err := x509.SystemCertPool()
 	if err != nil {
 		return nil, err
 	}
-	pool := x509.NewCertPool()
-	pool.AddCert(cert)
+	if pool == nil {
+		pool = x509.NewCertPool()
+	}
 	return &tls.Config{
 		RootCAs:    pool,
 		NextProtos: []string{"web4-quic"},
@@ -128,12 +142,12 @@ func (s *Semaphore) Release() {
 	}
 }
 
-func ListenAndServe(addr string, handle func([]byte)) error {
-	return ListenAndServeWithReady(addr, nil, handle)
+func ListenAndServe(addr string, devTLS bool, handle func([]byte)) error {
+	return ListenAndServeWithReady(addr, nil, devTLS, handle)
 }
 
-func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]byte)) error {
-	tlsConf, err := serverTLSConfig()
+func ListenAndServeWithReady(addr string, ready chan<- struct{}, devTLS bool, handle func([]byte)) error {
+	tlsConf, err := serverTLSConfig(devTLS)
 	if err != nil {
 		return err
 	}
@@ -237,8 +251,8 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, handle func([]b
 	}
 }
 
-func Send(addr string, data []byte, insecure bool) error {
-	tlsConf, err := clientTLSConfig(insecure)
+func Send(addr string, data []byte, insecure bool, devTLS bool) error {
+	tlsConf, err := clientTLSConfig(insecure, devTLS)
 	if err != nil {
 		return err
 	}
@@ -268,6 +282,56 @@ func Send(addr string, data []byte, insecure bool) error {
 	time.Sleep(100 * time.Millisecond)
 	_ = conn.CloseWithError(0, "")
 	return nil
+}
+
+func devTLSCertPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".web4mvp", "devtls_ca.pem"), nil
+}
+
+func persistDevTLSCert(der []byte) error {
+	path, err := devTLSCertPath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return os.WriteFile(path, pemBytes, 0600)
+}
+
+func loadDevTLSCertPool() (*x509.CertPool, error) {
+	path, err := devTLSCertPath()
+	if err != nil {
+		return nil, err
+	}
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			_, der, err := devTLSCert()
+			if err != nil {
+				return nil, err
+			}
+			if err := persistDevTLSCert(der); err != nil {
+				return nil, err
+			}
+			pemBytes = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		} else {
+			return nil, err
+		}
+	}
+	pool, _ := x509.SystemCertPool()
+	if pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("invalid devtls_ca.pem")
+	}
+	return pool, nil
 }
 
 func logInfo(format string, args ...any) {
