@@ -1,54 +1,65 @@
-# Web4 — A Stateless, Fully Anonymous Next-Generation Network Model
+# Web4 MVP
 
-Web4 is a novel networking model designed to overcome the inherent structural limits of Web3.  
-Current decentralized systems rely on permanent ledgers, global ordering, timestamps, and graph structures — making full anonymity mathematically impossible.  
-Web4 proposes a radical alternative: a system with _no global history_, _no traceable state_, and _no consensus dependency_, enabling information-theoretic anonymity.
+This repository contains a hardened MVP implementation of the Web4 model.
 
-📄 **Whitepaper:** [Web4.pdf](Web4.pdf)
+Web4 is an attempt to remove the structural causes of deanonymization and coercion
+in distributed systems by eliminating global ordering, permanent history, and
+consensus-driven state. Instead of ledgers or blockchains, Web4 relies on stateless,
+end-to-end encrypted message flows that are validated strictly at receive time.
 
----
+This codebase is not a conceptual proof-of-concept. It is a tested and abuse-hardened
+MVP that demonstrates the Web4 approach as running software. The design is grounded
+in the accompanying whitepaper (Web4.pdf), but the repository intentionally focuses
+on implementation correctness rather than theoretical exposition.
 
-## Why Web4?
+At its core, the system implements end-to-end encrypted message exchange with
+per-message perfect forward secrecy. There is no global ledger, no consensus layer,
+no timestamps, and no attempt to construct a shared notion of history. All protocol
+semantics are enforced locally at receive time, and correctness is defined strictly
+in terms of cryptographic validity, bounded behavior, and local invariants.
 
-Web3 systems (blockchains, DAGs, rollups) fundamentally expose metadata:
+Messages are sealed and signed, providing tamper detection and replay protection.
+External error handling is deliberately coarse: all invalid inputs are rejected
+with a generic error to avoid signature, state, or decryption oracles. Detailed
+failure information is only available in explicit debug mode.
 
-- Global ordering leaks correlation patterns
-- Graph analysis can deanonymize users
-- Permanent ledgers reveal identity through history
-- Consensus tends toward centralization
-- Perfect anonymity becomes theoretically impossible
+Transport is implemented over QUIC and hardened against local denial-of-service.
+Connections and streams are limited on a per-IP basis, oversized frames are rejected
+early based on message type, and deterministic development TLS is gated explicitly
+behind a dev flag. Local storage is append-only and rotates automatically under
+size and line caps to prevent disk-fill attacks, while still preserving lookup
+correctness across rotated files.
 
-Web4 removes the root cause: **the existence of a global record.**
+The system also enforces a local mathematical guard on state transitions. Updates
+are bounded in magnitude, and stricter limits are applied immediately after restart
+to prevent cold-start burst abuse. This enforcement is intentionally local and does
+not rely on any global coordination.
 
----
+The repository is structured around a single CLI entry point in `cmd/web4`, with
+internal packages handling cryptography, wire framing, storage, transport, and
+local invariant checking. A real-world smoke test script (`scripts/smoke.sh`) is
+provided to validate runtime behavior under actual conditions rather than mocks.
 
-## Core Ideas
+All changes are expected to pass both unit tests and real-world smoke tests. The
+smoke test performs actual actions to verify store rotation under disk pressure,
+recv oracle suppression, and QUIC per-IP limiter behavior. It can be run as follows:
 
-- Stateless and history-free communication
-- No consensus, no miners, no stakers
-- No global ledger (unlike blockchain, DAG, or rollups)
-- Information-theoretic anonymity as a design goal
-- Self-contained transactions that leave no trace
-- Fully open, libre-licensed, community-driven architecture
+```bash
+To run tests:
+go test ./...
 
----
+WEB4_STORE_MAX_BYTES=65536 ./scripts/smoke.sh
+```
 
-## Roadmap (Initial)
+The project is currently in an MVP, pre-P2P state. The core protocol, cryptographic
+layer, local invariants, and transport hardening are implemented and tested. Peer
+discovery, routing, and any form of network-level aggregation are intentionally
+out of scope at this stage and will be built on top of the existing, hardened core.
 
-- Phase 1 — Formalize mathematical model (in progress)
-- Phase 2 — Implement minimal PoC of stateless exchange
-- Phase 3 — Build reference protocol for developers
-- Phase 4 — Provide testnet-like simulation environment
-- Phase 5 — Public review and cryptographic evaluation
+Web4 deliberately avoids the construction of global truth. Instead, it limits itself
+to enforcing what can be enforced locally, cryptographically, and deterministically.
+This repository exists to demonstrate that such a system can be built, tested, and
+reasoned about as real software.
 
----
-
-## License
-
-This project is released under the MIT License.
-
----
-
-## Contact
-
-For questions or inquiries: [nonnnu@protonmail.com](mailto:nonnnu@protonmail.com)
+This is experimental research software. There are no stability guarantees, no
+backwards compatibility promises, and no claims of production readiness.

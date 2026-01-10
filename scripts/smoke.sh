@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
+: "${WEB4_STORE_MAX_BYTES:?set WEB4_STORE_MAX_BYTES (e.g. 65536) to run smoke tests}"
 pass() {
 	echo "PASS: $1"
 }
