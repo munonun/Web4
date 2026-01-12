@@ -68,6 +68,12 @@ func MaxSizeForType(t string) int {
 		return MaxAckSize
 	case MsgTypeNodeHello:
 		return MaxNodeHelloSize
+	case MsgTypePeerExchangeReq:
+		return MaxPeerExchangeReqSize
+	case MsgTypePeerExchangeResp:
+		return MaxPeerExchangeRespSize
+	case MsgTypeGossipPush:
+		return MaxGossipPushSize
 	default:
 		return MaxFrameSize
 	}
@@ -85,6 +91,8 @@ type ContractOpenMsg struct {
 	Sealed       string `json:"sealed"`
 	SigB         string `json:"sigB"`
 	SigA         string `json:"sigA,omitempty"`
+	FromNodeID   string `json:"from_node_id,omitempty"`
+	SigFrom      string `json:"sig_from,omitempty"`
 }
 
 type RepayReqMsg struct {
@@ -97,6 +105,8 @@ type RepayReqMsg struct {
 	EphemeralPub string `json:"ephemeral_pub"`
 	Sealed       string `json:"sealed"`
 	SigB         string `json:"sigB"`
+	FromNodeID   string `json:"from_node_id,omitempty"`
+	SigFrom      string `json:"sig_from,omitempty"`
 }
 
 type AckMsg struct {
@@ -109,6 +119,8 @@ type AckMsg struct {
 	EphemeralPub string `json:"ephemeral_pub"`
 	Sealed       string `json:"sealed"`
 	SigA         string `json:"sigA"`
+	FromNodeID   string `json:"from_node_id,omitempty"`
+	SigFrom      string `json:"sig_from,omitempty"`
 }
 
 func IOUBytes(i IOU) []byte {

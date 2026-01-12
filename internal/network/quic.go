@@ -60,18 +60,13 @@ func serverTLSConfig(devTLS bool) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if devTLS {
-		if err := persistDevTLSCert(cert.Certificate[0]); err != nil {
-			return nil, err
-		}
-	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		NextProtos:   []string{"web4-quic"},
 	}, nil
 }
 
-func clientTLSConfig(insecure bool, devTLS bool) (*tls.Config, error) {
+func clientTLSConfig(insecure bool, devTLS bool, devTLSCAPath string) (*tls.Config, error) {
 	if insecure {
 		return &tls.Config{
 			InsecureSkipVerify: true,
@@ -79,7 +74,13 @@ func clientTLSConfig(insecure bool, devTLS bool) (*tls.Config, error) {
 		}, nil
 	}
 	if devTLS {
-		pool, err := loadDevTLSCertPool()
+		var pool *x509.CertPool
+		var err error
+		if devTLSCAPath != "" {
+			pool, err = loadDevTLSCertPoolFromPath(devTLSCAPath)
+		} else {
+			pool, err = loadDevTLSCertPool()
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -147,6 +148,24 @@ func ListenAndServe(addr string, devTLS bool, handle func([]byte)) error {
 }
 
 func ListenAndServeWithReady(addr string, ready chan<- struct{}, devTLS bool, handle func([]byte)) error {
+	return ListenAndServeWithResponder(addr, ready, devTLS, func(data []byte) ([]byte, error) {
+		handle(data)
+		return nil, nil
+	})
+}
+
+func ListenAndServeWithResponder(addr string, ready chan<- struct{}, devTLS bool, handle func([]byte) ([]byte, error)) error {
+	return ListenAndServeWithResponderFrom(addr, ready, devTLS, func(_ string, data []byte) ([]byte, error) {
+		return handle(data)
+	})
+}
+
+func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS bool, handle func(string, []byte) ([]byte, error)) error {
+	if devTLS {
+		if err := ensureDevTLSCA(); err != nil {
+			return err
+		}
+	}
 	tlsConf, err := serverTLSConfig(devTLS)
 	if err != nil {
 		return err
@@ -176,6 +195,7 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, devTLS bool, ha
 			logInfo("quic accept error: %v", err)
 			return err
 		}
+		remoteAddr := conn.RemoteAddr().String()
 		ip := remoteIP(conn.RemoteAddr())
 		if !ipLimits.acquireConn(ip) {
 			_ = conn.CloseWithError(0, "too many connections")
@@ -221,7 +241,7 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, devTLS bool, ha
 					continue
 				}
 				streamCancel()
-				go func(s *quic.Stream) {
+				go func(s *quic.Stream, sender string) {
 					defer streamSem.Release()
 					defer ipLimits.releaseStream(ip)
 					defer s.Close()
@@ -244,15 +264,33 @@ func ListenAndServeWithReady(addr string, ready chan<- struct{}, devTLS bool, ha
 						msgType = hdr.Type
 					}
 					logInfo("read %d bytes, type=%s, calling recv", len(data), msgType)
-					handle(data)
-				}(stream)
+					resp, err := handle(sender, data)
+					if err != nil {
+						logInfo("quic handler error: %v", err)
+						return
+					}
+					if len(resp) > 0 {
+						if err := writeFrameWithTimeout(s, streamRWTimeout, resp); err != nil {
+							logInfo("quic write error: %v", err)
+							return
+						}
+					}
+				}(stream, remoteAddr)
 			}
 		}()
 	}
 }
 
-func Send(addr string, data []byte, insecure bool, devTLS bool) error {
-	tlsConf, err := clientTLSConfig(insecure, devTLS)
+func ensureDevTLSCA() error {
+	_, der, err := devTLSCert()
+	if err != nil {
+		return err
+	}
+	return persistDevTLSCert(der)
+}
+
+func Send(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) error {
+	tlsConf, err := clientTLSConfig(insecure, devTLS, devTLSCAPath)
 	if err != nil {
 		return err
 	}
@@ -284,6 +322,44 @@ func Send(addr string, data []byte, insecure bool, devTLS bool) error {
 	return nil
 }
 
+func Exchange(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) ([]byte, error) {
+	tlsConf, err := clientTLSConfig(insecure, devTLS, devTLSCAPath)
+	if err != nil {
+		return nil, err
+	}
+	quicConf := &quic.Config{
+		MaxIdleTimeout:       maxIdleTimeout,
+		KeepAlivePeriod:      keepAlivePeriod,
+		HandshakeIdleTimeout: handshakeIdleTimeout,
+	}
+	conn, err := quic.DialAddr(context.Background(), addr, tlsConf, quicConf)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, err
+	}
+	if err := writeFrameWithTimeout(stream, streamRWTimeout, data); err != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, err
+	}
+	resp, err := readFrameWithTimeout(stream, streamRWTimeout)
+	if err != nil {
+		_ = conn.CloseWithError(0, "")
+		return nil, err
+	}
+	if err := stream.Close(); err != nil {
+		logInfo("quic stream close error: %v", err)
+		_ = conn.CloseWithError(0, "")
+		return nil, err
+	}
+	time.Sleep(100 * time.Millisecond)
+	_ = conn.CloseWithError(0, "")
+	return resp, nil
+}
+
 func devTLSCertPath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -309,9 +385,17 @@ func loadDevTLSCertPool() (*x509.CertPool, error) {
 	if err != nil {
 		return nil, err
 	}
+	return loadDevTLSCertPoolWithFallback(path, true)
+}
+
+func loadDevTLSCertPoolFromPath(path string) (*x509.CertPool, error) {
+	return loadDevTLSCertPoolWithFallback(path, false)
+}
+
+func loadDevTLSCertPoolWithFallback(path string, allowFallback bool) (*x509.CertPool, error) {
 	pemBytes, err := os.ReadFile(path)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) && allowFallback {
 			_, der, err := devTLSCert()
 			if err != nil {
 				return nil, err
@@ -329,7 +413,7 @@ func loadDevTLSCertPool() (*x509.CertPool, error) {
 		pool = x509.NewCertPool()
 	}
 	if !pool.AppendCertsFromPEM(pemBytes) {
-		return nil, fmt.Errorf("invalid devtls_ca.pem")
+		return nil, fmt.Errorf("invalid devtls CA PEM")
 	}
 	return pool, nil
 }

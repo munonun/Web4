@@ -3,6 +3,7 @@ package node
 import (
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -12,25 +13,46 @@ import (
 )
 
 type Node struct {
-	ID      [32]byte
-	PubKey  []byte
-	PrivKey []byte
-	Peers   *peer.Store
+	ID         [32]byte
+	PubKey     []byte
+	PrivKey    []byte
+	Peers      *peer.Store
+	Members    *peer.MemberStore
+	Candidates *peer.CandidatePool
 }
 
 type Options struct {
-	PeerStorePath string
-	PeerStoreCap  int
-	PeerStoreTTL  time.Duration
-	PeerStoreLoad int
+	PeerStorePath   string
+	PeerStoreCap    int
+	PeerStoreTTL    time.Duration
+	PeerStoreLoad   int
+	MemberStorePath string
+	MemberStoreCap  int
+	MemberStoreTTL  time.Duration
+	MemberStoreLoad int
+	CandidateCap    int
+	CandidateTTL    time.Duration
 }
 
 const defaultPeerBook = "peers.jsonl"
+const defaultMemberBook = "members.jsonl"
 
 func NewNode(home string, opts Options) (*Node, error) {
+	if err := os.MkdirAll(home, 0700); err != nil {
+		return nil, err
+	}
 	pub, priv, err := crypto.LoadKeypair(home)
 	if err != nil {
-		return nil, err
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		pub, priv, err = crypto.GenKeypair()
+		if err != nil {
+			return nil, err
+		}
+		if err := crypto.SaveKeypair(home, pub, priv); err != nil {
+			return nil, err
+		}
 	}
 	id := DeriveNodeID(pub)
 	path := opts.PeerStorePath
@@ -45,11 +67,26 @@ func NewNode(home string, opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	memberPath := opts.MemberStorePath
+	if memberPath == "" {
+		memberPath = filepath.Join(home, defaultMemberBook)
+	}
+	members, err := peer.NewMemberStore(memberPath, peer.MemberOptions{
+		Cap:       opts.MemberStoreCap,
+		TTL:       opts.MemberStoreTTL,
+		LoadLimit: opts.MemberStoreLoad,
+	})
+	if err != nil {
+		return nil, err
+	}
+	candidates := peer.NewCandidatePool(opts.CandidateCap, opts.CandidateTTL)
 	return &Node{
-		ID:      id,
-		PubKey:  pub,
-		PrivKey: priv,
-		Peers:   peers,
+		ID:         id,
+		PubKey:     pub,
+		PrivKey:    priv,
+		Peers:      peers,
+		Members:    members,
+		Candidates: candidates,
 	}, nil
 }
 
@@ -60,16 +97,17 @@ func DeriveNodeID(pub []byte) [32]byte {
 	return id
 }
 
-func (n *Node) Hello(nonce uint64) (proto.NodeHelloMsg, error) {
+func (n *Node) Hello(nonce uint64, advertiseAddr string) (proto.NodeHelloMsg, error) {
 	if n == nil {
 		return proto.NodeHelloMsg{}, fmt.Errorf("nil node")
 	}
-	hash := proto.NodeHelloHash(n.ID, n.PubKey, nonce)
+	hash := proto.NodeHelloHash(n.ID, n.PubKey, advertiseAddr, nonce)
 	sig := crypto.Sign(n.PrivKey, hash[:])
 	return proto.NodeHelloMsg{
 		Type:   proto.MsgTypeNodeHello,
 		NodeID: hex.EncodeToString(n.ID[:]),
 		PubKey: hex.EncodeToString(n.PubKey),
+		Addr:   advertiseAddr,
 		Nonce:  nonce,
 		Sig:    hex.EncodeToString(sig),
 	}, nil
@@ -96,11 +134,11 @@ func VerifyHello(m proto.NodeHelloMsg) (peer.Peer, error) {
 	if derived := DeriveNodeID(pub); derived != id {
 		return peer.Peer{}, fmt.Errorf("node_id mismatch")
 	}
-	hash := proto.NodeHelloHash(id, pub, m.Nonce)
+	hash := proto.NodeHelloHash(id, pub, m.Addr, m.Nonce)
 	if !crypto.Verify(pub, hash[:], sig) {
 		return peer.Peer{}, fmt.Errorf("invalid signature")
 	}
-	return peer.Peer{NodeID: id, PubKey: pub}, nil
+	return peer.Peer{NodeID: id, PubKey: pub, Addr: m.Addr}, nil
 }
 
 func (n *Node) AcceptHello(m proto.NodeHelloMsg) (peer.Peer, error) {

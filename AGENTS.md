@@ -1,36 +1,33 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-This is a small Go CLI MVP. Key paths:
-- `cmd/web4/main.go`: CLI entry point and command routing.
-- `internal/crypto`, `internal/proto`, `internal/store`: core crypto, protocol types, and local storage.
-- `README.md`: product/status notes and high-level command list.
-Runtime data is written to `~/.web4mvp` (local keys plus `contracts.jsonl` and `acks.jsonl`).
+- `cmd/web4/` is the CLI entry point (binary build target).
+- `internal/` holds core packages (crypto, proto, network/QUIC, peer/store, state, math4, node).
+- `scripts/` contains operational tooling like the real-world smoke test.
+- `docs/` contains design notes; `VULN.md` tracks risks and mitigations.
 
 ## Build, Test, and Development Commands
-- `go run ./cmd/web4`: run the CLI directly during development.
-- `go build ./cmd/web4`: produce the `web4` binary.
-- `go test ./...`: run all Go tests (none exist yet, but use this as the standard check).
-CLI examples: `web4 keygen`, `web4 open --to <hex> --amount 1 --nonce 1`, `web4 list`.
+- `go build -o ./web4 ./cmd/web4` builds the CLI binary locally.
+- `go test ./...` runs the unit test suite across all packages.
+- `WEB4_STORE_MAX_BYTES=65536 ./scripts/smoke.sh` runs the smoke test that exercises QUIC, recv error handling, and store rotation.
 
 ## Coding Style & Naming Conventions
-Follow standard Go conventions:
-- Formatting: `gofmt` (tabs for indentation, gofmt-managed alignment).
-- Naming: `CamelCase` for exported identifiers, `lowerCamel` for unexported, short package names like `crypto`.
-- Keep protocol fields stable; changes in `internal/proto` impact stored data and command interop.
+- Follow standard Go formatting (use `gofmt`); tabs for indentation.
+- Package names are short and lowercase (Go convention).
+- Exported identifiers use `PascalCase`, unexported use `camelCase`.
+- Test files use `*_test.go` and live next to the code they cover.
 
 ## Testing Guidelines
-No automated tests are currently present. When adding tests:
-- Place them alongside code as `*_test.go` in the same package.
-- Prefer table-driven tests for protocol serialization and storage behavior.
-- Run `go test ./...` before opening a PR.
+- Unit tests are in `*_test.go` under `cmd/` and `internal/`.
+- Run `go test ./...` before submitting changes.
+- Smoke testing is required for changes that touch transport, storage, or recv logic; it needs `WEB4_STORE_MAX_BYTES` set and may open local QUIC listeners.
 
 ## Commit & Pull Request Guidelines
-Git history uses short, descriptive summaries (often with a version tag, e.g., `v0.0.2: ...`).
-For PRs:
-- Include a brief summary, how you tested (`go test ./...` or manual CLI steps), and any data format changes.
-- Link related issues if applicable and call out breaking protocol/storage changes.
+- Commit messages follow short, imperative summaries (e.g., "Update README").
+- Keep commits focused and scoped to a single change.
+- PRs should include: a brief summary, rationale, and test output (e.g., `go test ./...`, smoke test if applicable).
 
-## Security & Configuration Tips
-Keys are stored unencrypted in `~/.web4mvp` (`pub.hex`, `priv.hex`). Treat that directory as sensitive and avoid committing or syncing it.
-This project is a research prototype; do not use with real value.
+## Security & Configuration Notes
+- Detailed recv errors are gated behind `WEB4_DEBUG=1`; keep default behavior generic.
+- `--devtls` is for development only; avoid shipping it in production configs.
+- Review `VULN.md` when modifying cryptography, validation, or transport.

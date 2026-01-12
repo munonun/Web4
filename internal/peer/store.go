@@ -88,25 +88,74 @@ func NewStore(path string, opts Options) (*Store, error) {
 }
 
 func (s *Store) Upsert(p Peer, persist bool) error {
-	if len(p.PubKey) == 0 && p.Addr == "" && isZeroNodeID(p.NodeID) {
-		return fmt.Errorf("empty peer")
+	if isZeroNodeID(p.NodeID) {
+		return fmt.Errorf("missing node_id")
+	}
+	logDebug := func(peer Peer) {
+		if os.Getenv("WEB4_DEBUG") != "1" {
+			return
+		}
+		pubNodeID := deriveNodeIDFromPub(peer.PubKey)
+		xpub, _ := crypto.Ed25519PubToX25519(peer.PubKey)
+		xhash := crypto.SHA3_256(xpub)
+		fmt.Fprintf(os.Stderr, "peer upsert: node_id=%x addr=%s pub_node_id=%x x25519_pub_hash=%x\n", peer.NodeID[:], peer.Addr, pubNodeID[:], xhash[:])
 	}
 	key := keyForPeer(p)
-	if key == "" {
-		return fmt.Errorf("invalid peer key")
+
+	s.mu.Lock()
+	s.pruneLocked()
+	if p.Addr != "" {
+		for el := s.order.Front(); el != nil; el = el.Next() {
+			ent := el.Value.(*entry)
+			if ent.peer.NodeID == p.NodeID {
+				continue
+			}
+			if ent.peer.Addr == p.Addr {
+				fmt.Fprintf(os.Stderr, "peer addr conflict: addr=%s new_node_id=%x old_node_id=%x\n", p.Addr, p.NodeID[:], ent.peer.NodeID[:])
+				ent.peer.Addr = ""
+				ent.expiresAt = time.Now().Add(s.ttl)
+				s.order.MoveToFront(el)
+				rec := diskPeer{
+					NodeID: hex.EncodeToString(ent.peer.NodeID[:]),
+					PubKey: hex.EncodeToString(ent.peer.PubKey),
+					Addr:   "",
+				}
+				_ = store.AppendJSONL(s.path, rec)
+				break
+			}
+		}
+	}
+	var existing *entry
+	var existingEl *list.Element
+	if el, ok := s.hot[key]; ok {
+		existingEl = el
+		existing = el.Value.(*entry)
+		if p.Addr == "" {
+			p.Addr = existing.peer.Addr
+		}
+		if len(p.PubKey) == 0 {
+			p.PubKey = existing.peer.PubKey
+		}
+	}
+	if len(p.PubKey) == 0 {
+		s.mu.Unlock()
+		return fmt.Errorf("missing pubkey")
+	}
+	derived := deriveNodeIDFromPub(p.PubKey)
+	if derived != p.NodeID {
+		s.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "peer upsert rejected: node_id/pubkey mismatch node_id=%x pub_node_id=%x addr=%s\n", p.NodeID[:], derived[:], p.Addr)
+		return fmt.Errorf("node_id/pubkey mismatch")
 	}
 	pub := make([]byte, len(p.PubKey))
 	copy(pub, p.PubKey)
 	p.PubKey = pub
-
-	s.mu.Lock()
-	s.pruneLocked()
-	if el, ok := s.hot[key]; ok {
-		ent := el.Value.(*entry)
-		ent.peer = p
-		ent.expiresAt = time.Now().Add(s.ttl)
-		s.order.MoveToFront(el)
+	if existing != nil {
+		existing.peer = p
+		existing.expiresAt = time.Now().Add(s.ttl)
+		s.order.MoveToFront(existingEl)
 		s.mu.Unlock()
+		logDebug(p)
 		if !persist || len(p.PubKey) == 0 {
 			return nil
 		}
@@ -125,6 +174,7 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	s.hot[key] = el
 	s.mu.Unlock()
 
+	logDebug(p)
 	if !persist || len(p.PubKey) == 0 {
 		return nil
 	}
@@ -145,7 +195,7 @@ func (s *Store) List() []Peer {
 		p := ent.peer
 		pub := make([]byte, len(p.PubKey))
 		copy(pub, p.PubKey)
-		out = append(out, Peer{NodeID: p.NodeID, PubKey: pub})
+		out = append(out, Peer{NodeID: p.NodeID, PubKey: pub, Addr: p.Addr})
 	}
 	s.mu.Unlock()
 	return out
@@ -157,6 +207,17 @@ func (s *Store) Len() int {
 	n := len(s.hot)
 	s.mu.Unlock()
 	return n
+}
+
+func (s *Store) Refresh() error {
+	if s == nil {
+		return nil
+	}
+	limit := s.cap
+	if limit <= 0 {
+		limit = DefaultCap
+	}
+	return s.loadLast(limit)
 }
 
 func (s *Store) pruneLocked() {
@@ -257,13 +318,14 @@ func peerScanPaths(path string) []string {
 }
 
 func keyForPeer(p Peer) string {
-	if !isZeroNodeID(p.NodeID) {
-		return hex.EncodeToString(p.NodeID[:])
-	}
-	if p.Addr != "" {
-		return "addr:" + p.Addr
-	}
-	return ""
+	return hex.EncodeToString(p.NodeID[:])
+}
+
+func deriveNodeIDFromPub(pub []byte) [32]byte {
+	sum := crypto.SHA3_256(pub)
+	var id [32]byte
+	copy(id[:], sum)
+	return id
 }
 
 func isZeroNodeID(id [32]byte) bool {

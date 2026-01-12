@@ -27,7 +27,7 @@ func TestVerifyHello(t *testing.T) {
 		PubKey:  pub,
 		PrivKey: priv,
 	}
-	msg, err := n.Hello(42)
+	msg, err := n.Hello(42, "")
 	if err != nil {
 		t.Fatalf("hello failed: %v", err)
 	}
@@ -45,5 +45,19 @@ func TestVerifyHello(t *testing.T) {
 	msg.NodeID = hex.EncodeToString(make([]byte, 32))
 	if _, err := VerifyHello(msg); err == nil {
 		t.Fatalf("expected error for bad node id")
+	}
+}
+
+func TestNewNodeGeneratesKeys(t *testing.T) {
+	dir := t.TempDir()
+	n, err := NewNode(dir, Options{})
+	if err != nil {
+		t.Fatalf("new node failed: %v", err)
+	}
+	if len(n.PubKey) == 0 || len(n.PrivKey) == 0 {
+		t.Fatalf("expected keypair to be generated")
+	}
+	if _, _, err := crypto.LoadKeypair(dir); err != nil {
+		t.Fatalf("expected keypair persisted: %v", err)
 	}
 }

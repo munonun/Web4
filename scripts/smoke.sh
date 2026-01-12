@@ -10,10 +10,53 @@ fail() {
 	exit 1
 }
 
+pick_port() {
+	local fallback="$1"
+	local port=""
+	if command -v python3 >/dev/null 2>&1; then
+		port="$(python3 - <<'PY' 2>/dev/null || true
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+	fi
+	if [[ -z "${port}" ]]; then
+		port="${fallback}"
+	fi
+	printf '%s' "${port}"
+}
+
+declare -A USED_PORTS=()
+
+pick_unique_port() {
+	local fallback="$1"
+	local p=""
+	for _ in $(seq 1 200); do
+		p="$(pick_port "${fallback}")"
+		# 중복이면 다시
+		if [[ -n "${USED_PORTS[${p}]:-}" ]]; then
+			continue
+		fi
+		USED_PORTS["${p}"]=1
+		printf '%s' "${p}"
+		return 0
+	done
+	echo "FAIL: could not pick unique port" >&2
+	exit 1
+}
+
 TMPA="$(mktemp -d)"
 TMPB="$(mktemp -d)"
+TMPC="$(mktemp -d)"
+TMPD="$(mktemp -d)"
 TMPWORK="$(mktemp -d)"
 SERVER_PID=""
+SERVER_PID_B=""
+SERVER_PID_C=""
+SERVER_PID_A=""
 
 cleanup() {
 	local status=$?
@@ -21,7 +64,19 @@ cleanup() {
 		kill "${SERVER_PID}" 2>/dev/null || true
 		wait "${SERVER_PID}" 2>/dev/null || true
 	fi
-	rm -rf "${TMPA}" "${TMPB}" "${TMPWORK}"
+	if [[ -n "${SERVER_PID_B}" ]]; then
+		kill "${SERVER_PID_B}" 2>/dev/null || true
+		wait "${SERVER_PID_B}" 2>/dev/null || true
+	fi
+	if [[ -n "${SERVER_PID_C}" ]]; then
+		kill "${SERVER_PID_C}" 2>/dev/null || true
+		wait "${SERVER_PID_C}" 2>/dev/null || true
+	fi
+	if [[ -n "${SERVER_PID_A}" ]]; then
+		kill "${SERVER_PID_A}" 2>/dev/null || true
+		wait "${SERVER_PID_A}" 2>/dev/null || true
+	fi
+	rm -rf "${TMPA}" "${TMPB}" "${TMPC}" "${TMPD}" "${TMPWORK}"
 	exit "${status}"
 }
 trap cleanup EXIT
@@ -35,6 +90,14 @@ run_a() {
 
 run_b() {
 	HOME="${TMPB}" "${WEB4_BIN}" "$@"
+}
+
+run_c() {
+	HOME="${TMPC}" "${WEB4_BIN}" "$@"
+}
+
+run_d() {
+	HOME="${TMPD}" "${WEB4_BIN}" "$@"
 }
 
 prefill_jsonl() {
@@ -99,6 +162,8 @@ PY
 
 run_a keygen >/dev/null
 run_b keygen >/dev/null
+run_c keygen >/dev/null
+run_d keygen >/dev/null
 PUBA="$(cat "${TMPA}/.web4mvp/pub.hex")"
 
 contracts_path="${TMPA}/.web4mvp/contracts.jsonl"
@@ -143,7 +208,7 @@ run_b close --id "${orphan_cid}" --reqnonce 1 --out "${orphan_close}" >/dev/null
 check_invalid_recv() {
 	local file="$1"
 	local out
-	out="$(HOME="${TMPA}" "${WEB4_BIN}" recv --in "${file}" 2>&1 || true)"
+	out="$(WEB4_DEBUG= HOME="${TMPA}" "${WEB4_BIN}" recv --in "${file}" 2>&1 || true)"
 	printf '%s\n' "${out}" | grep -q "invalid message" || {
 		fail "check 2 (recv oracle): missing generic invalid message"
 	}
@@ -170,18 +235,51 @@ quic_fail() {
 	exit 1
 }
 
-if command -v python3 >/dev/null 2>&1; then
-	PORT="$(python3 - <<'PY'
-import socket
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-print(s.getsockname()[1])
-s.close()
-PY
-)"
-else
-	PORT="42424"
-fi
+run_checked() {
+	local label="$1"
+	shift
+	local logs=()
+	local quiet=0
+	while [[ "${1:-}" == "--log" ]]; do
+		logs+=("$2")
+		shift 2
+	done
+	if [[ "${1:-}" == "--quiet" ]]; then
+		quiet=1
+		shift
+	fi
+	local cmd_display=""
+	if [[ "$#" -gt 0 ]]; then
+		cmd_display="$(printf '%q ' "$@")"
+	fi
+	local out=""
+	if [[ "${quiet}" -eq 1 ]]; then
+		out="$("$@" 2>&1)" || {
+			echo "Command failed (${label}): ${cmd_display}"
+			printf '%s\n' "${out}"
+			for log in "${logs[@]}"; do
+				if [[ -n "${log}" && -f "${log}" ]]; then
+					echo "Log tail (${log}):"
+					tail -n 50 "${log}" || true
+				fi
+			done
+			quic_fail "${label}"
+		}
+		return
+	fi
+	if ! "$@"; then
+		echo "Command failed (${label}): ${cmd_display}"
+		for log in "${logs[@]}"; do
+			if [[ -n "${log}" && -f "${log}" ]]; then
+				echo "Log tail (${log}):"
+				tail -n 50 "${log}" || true
+			fi
+		done
+		quic_fail "${label}"
+	fi
+}
+
+PORT="$(pick_unique_port 42424)"
 
 quic_msg="${TMPWORK}/quic_open.json"
 run_b open --to "${PUBA}" --amount 5 --nonce 9900 --out "${quic_msg}" >/dev/null
@@ -222,7 +320,7 @@ elif command -v lsof >/dev/null 2>&1; then
 	done
 else
 	for _ in $(seq 1 5); do
-		if env HOME="${TMPB}" "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT}" --in "${quic_msg}" >/dev/null 2>&1; then
+		if env HOME="${TMPB}" "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${quic_msg}" >/dev/null 2>&1; then
 			listening=1
 			break
 		fi
@@ -239,11 +337,11 @@ total=$((cap + 2))
 client_dir="${TMPWORK}/clients"
 mkdir -p "${client_dir}"
 pids=()
-echo "QUIC client command: env HOME=${TMPB} ${WEB4_BIN} quic-send --devtls --addr 127.0.0.1:${PORT} --in ${quic_msg}"
+echo "QUIC client command: env HOME=${TMPB} ${WEB4_BIN} quic-send --devtls --addr 127.0.0.1:${PORT} --devtls-ca ${TMPA}/.web4mvp/devtls_ca.pem --in ${quic_msg}"
 
 for i in $(seq 1 "${total}"); do
 	log="${client_dir}/client_${i}.log"
-	(env HOME="${TMPB}" "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT}" --in "${quic_msg}" >"${log}" 2>&1) &
+	(env HOME="${TMPB}" "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${quic_msg}" >"${log}" 2>&1) &
 	pids+=($!)
 done
 
@@ -285,5 +383,374 @@ kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 SERVER_PID=""
 pass "check 3 (QUIC per-IP limiter)"
+
+PORT="$(pick_unique_port 42425)"
+
+server_log="${TMPWORK}/quic_hello_server.log"
+echo "Starting QUIC server: env HOME=${TMPB} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORT}"
+env HOME="${TMPB}" "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORT}" >"${server_log}" 2>&1 &
+SERVER_PID=$!
+
+ready=0
+for _ in $(seq 1 50); do
+	if grep -qE 'quic listen ready|QUIC LISTEN' "${server_log}"; then
+		ready=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${ready}" -ne 1 ]]; then
+	quic_fail "check 4 (QUIC node hello): server did not start"
+fi
+
+for _ in $(seq 1 20); do
+	if [[ -f "${TMPB}/.web4mvp/devtls_ca.pem" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+if [[ ! -f "${TMPB}/.web4mvp/devtls_ca.pem" ]]; then
+	quic_fail "check 4 (QUIC node hello): missing devtls CA"
+fi
+
+NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
+run_a node hello --devtls --addr "127.0.0.1:${PORT}" --devtls-ca "${TMPB}/.web4mvp/devtls_ca.pem" >/dev/null
+
+found=0
+for _ in $(seq 1 40); do
+	if run_b node list | grep -q "${NODEIDA}"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -ne 1 ]]; then
+	quic_fail "check 4 (QUIC node hello): peer not recorded"
+fi
+
+kill "${SERVER_PID}" 2>/dev/null || true
+wait "${SERVER_PID}" 2>/dev/null || true
+SERVER_PID=""
+pass "check 4 (QUIC node hello)"
+
+PORT="$(pick_unique_port 42426)"
+PORTB="$(pick_unique_port 42427)"
+PORTC="$(pick_unique_port 42428)"
+PORTA_HELLO="$(pick_unique_port 42429)"
+PORTD="$(pick_unique_port 42430)"
+while [[ "${PORTD}" == "${PORTB}" || "${PORTD}" == "${PORTC}" || "${PORTD}" == "${PORTA_HELLO}" ]]; do
+	PORTD="$(pick_port 42430)"
+done
+
+mkdir -p "${TMPC}/.web4mvp"
+if [[ ! -f "${TMPC}/.web4mvp/pub.hex" ]]; then
+	env HOME="${TMPC}" "${WEB4_BIN}" keygen >/dev/null
+fi
+PUBC="$(cat "${TMPC}/.web4mvp/pub.hex")"
+NODEIDC="$(run_c node id | awk '/node_id:/ {print $2}')"
+PEER_ADDR="127.0.0.1:${PORTC}"
+printf '{"node_id":"%s","pubkey":"%s","addr":"%s"}\n' "${NODEIDC}" "${PUBC}" "${PEER_ADDR}" >> "${TMPA}/.web4mvp/peers.jsonl"
+
+PORTB_HELLO="$(pick_unique_port 12334)"
+
+server_log_b_hello="${TMPWORK}/quic_b_hello.log"
+echo "Starting QUIC server B (hello): env HOME=${TMPB} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORTB_HELLO}"
+env HOME="${TMPB}" "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORTB_HELLO}" >"${server_log_b_hello}" 2>&1 &
+SERVER_PID_B=$!
+
+ready=0
+for _ in $(seq 1 50); do
+	if grep -qE 'quic listen ready|QUIC LISTEN' "${server_log_b_hello}"; then
+		ready=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${ready}" -ne 1 ]]; then
+	quic_fail "check 5 (QUIC peer exchange): B hello server did not start"
+fi
+
+for _ in $(seq 1 20); do
+	if [[ -f "${TMPB}/.web4mvp/devtls_ca.pem" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+if [[ ! -f "${TMPB}/.web4mvp/devtls_ca.pem" ]]; then
+	quic_fail "check 5 (QUIC peer exchange): missing devtls CA"
+fi
+
+run_checked "check 5 (QUIC peer exchange): node add" --log "${server_log_b_hello}" --quiet run_b node add --addr "127.0.0.1:${PORT}"
+run_checked "check 5 (QUIC peer exchange): node hello (A->B)" --log "${server_log_b_hello}" --quiet run_a node hello --devtls --addr "127.0.0.1:${PORTB_HELLO}" --devtls-ca "${TMPB}/.web4mvp/devtls_ca.pem"
+
+kill "${SERVER_PID_B}" 2>/dev/null || true
+wait "${SERVER_PID_B}" 2>/dev/null || true
+SERVER_PID_B=""
+
+server_log="${TMPWORK}/quic_exchange_server.log"
+echo "Starting QUIC server: env HOME=${TMPA} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORT}"
+env HOME="${TMPA}" "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORT}" >"${server_log}" 2>&1 &
+SERVER_PID=$!
+
+ready=0
+for _ in $(seq 1 50); do
+	if grep -qE 'quic listen ready|QUIC LISTEN' "${server_log}"; then
+		ready=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${ready}" -ne 1 ]]; then
+	quic_fail "check 5 (QUIC peer exchange): server did not start"
+fi
+
+for _ in $(seq 1 20); do
+	if [[ -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+if [[ ! -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
+	quic_fail "check 5 (QUIC peer exchange): missing devtls CA"
+fi
+
+before_count="$(run_b node list | wc -l | tr -d ' ')"
+run_checked "check 5 (QUIC peer exchange): node hello (B->A)" --log "${server_log}" --quiet run_b node hello --devtls --addr "127.0.0.1:${PORT}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem"
+NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
+found=0
+for _ in $(seq 1 60); do
+	if run_a node list | grep -q "${NODEIDB}"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -ne 1 ]]; then
+	quic_fail "check 5 (QUIC peer exchange): peer hello not recorded"
+fi
+run_checked "check 5 (QUIC peer exchange): node exchange (B->A)" --log "${server_log}" --quiet run_b node exchange --devtls --addr "127.0.0.1:${PORT}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --k 16
+
+found=0
+for _ in $(seq 1 40); do
+	if run_b node list | grep -q "${NODEIDC}"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -ne 1 ]]; then
+	quic_fail "check 5 (QUIC peer exchange): peer not recorded"
+fi
+after_count="$(run_b node list | wc -l | tr -d ' ')"
+if [[ "${after_count}" -le "${before_count}" ]]; then
+	quic_fail "check 5 (QUIC peer exchange): peer count did not increase"
+fi
+
+kill "${SERVER_PID}" 2>/dev/null || true
+wait "${SERVER_PID}" 2>/dev/null || true
+SERVER_PID=""
+pass "check 5 (QUIC peer exchange)"
+
+server_log_a="${TMPWORK}/quic_gossip_a.log"
+server_log_b="${TMPWORK}/quic_gossip_b.log"
+server_log_c="${TMPWORK}/quic_gossip_c.log"
+server_log="${server_log_b}"
+echo "Starting QUIC server A (hello): env HOME=${TMPA} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORTA_HELLO}"
+env HOME="${TMPA}" "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORTA_HELLO}" >"${server_log_a}" 2>&1 &
+SERVER_PID_A=$!
+echo "Starting QUIC server B: env HOME=${TMPB} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORTB}"
+env HOME="${TMPB}" WEB4_GOSSIP_FANOUT=2 WEB4_GOSSIP_TTL_HOPS=3 "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORTB}" >"${server_log_b}" 2>&1 &
+SERVER_PID_B=$!
+echo "Starting QUIC server C: env HOME=${TMPC} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORTC}"
+env HOME="${TMPC}" "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORTC}" >"${server_log_c}" 2>&1 &
+SERVER_PID_C=$!
+
+ready=0
+for _ in $(seq 1 50); do
+	if grep -qE 'quic listen ready|QUIC LISTEN' "${server_log_a}" && grep -qE 'quic listen ready|QUIC LISTEN' "${server_log_b}" && grep -qE 'quic listen ready|QUIC LISTEN' "${server_log_c}"; then
+		ready=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${ready}" -ne 1 ]]; then
+	quic_fail "check 6 (gossip forward): server did not start"
+fi
+
+for _ in $(seq 1 20); do
+	if [[ -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+for _ in $(seq 1 20); do
+	if [[ -f "${TMPB}/.web4mvp/devtls_ca.pem" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+for _ in $(seq 1 20); do
+	if [[ -f "${TMPC}/.web4mvp/devtls_ca.pem" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+if [[ ! -f "${TMPA}/.web4mvp/devtls_ca.pem" || ! -f "${TMPB}/.web4mvp/devtls_ca.pem" || ! -f "${TMPC}/.web4mvp/devtls_ca.pem" ]]; then
+	quic_fail "check 6 (gossip forward): missing devtls CA"
+fi
+
+PUBC="$(cat "${TMPC}/.web4mvp/pub.hex")"
+NODEIDC="$(run_c node id | awk '/node_id:/ {print $2}')"
+NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
+NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
+
+# Seed A's peer store so gossip push can resolve B's pubkey+addr
+PUBB="$(cat "${TMPB}/.web4mvp/pub.hex")"
+printf '{"node_id":"%s","pubkey":"%s","addr":"%s"}\n' "${NODEIDB}" "${PUBB}" "127.0.0.1:${PORTB}" >> "${TMPA}/.web4mvp/peers.jsonl"
+found=0
+for _ in $(seq 1 20); do
+	if grep -q "${NODEIDB}" "${TMPA}/.web4mvp/peers.jsonl" && grep -q "${PORTB}" "${TMPA}/.web4mvp/peers.jsonl"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -ne 1 ]]; then
+	quic_fail "check 6 (gossip forward): peer seed missing on A"
+fi
+
+# Build peer mappings first so B learns C's pubkey+addr and vice versa
+run_checked "check 6 (gossip forward): node hello (A->B)" --log "${server_log_b}" --quiet run_a node hello --devtls --addr "127.0.0.1:${PORTB}" --devtls-ca "${TMPB}/.web4mvp/devtls_ca.pem" --advertise-addr "127.0.0.1:${PORTA_HELLO}"
+run_checked "check 6 (gossip forward): node hello (C->B)" --log "${server_log_b}" --quiet run_c node hello --devtls --addr "127.0.0.1:${PORTB}" --devtls-ca "${TMPB}/.web4mvp/devtls_ca.pem" --advertise-addr "127.0.0.1:${PORTC}"
+run_checked "check 6 (gossip forward): node hello (B->C)" --log "${server_log_c}" --quiet run_b node hello --devtls --addr "127.0.0.1:${PORTC}" --devtls-ca "${TMPC}/.web4mvp/devtls_ca.pem"
+
+# Wait until B knows A and C identities
+found=0
+for _ in $(seq 1 60); do
+	if run_b node list | grep -q "${NODEIDA}" && run_b node list | grep -q "${NODEIDC}"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -ne 1 ]]; then
+	quic_fail "check 6 (gossip forward): peer hello missing on B"
+fi
+# Wait until C knows B identity (needed for membership gate on receive)
+found=0
+for _ in $(seq 1 60); do
+	if run_c node list | grep -q "${NODEIDB}"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -ne 1 ]]; then
+	quic_fail "check 6 (gossip forward): peer hello missing on C"
+fi
+# Ensure B has C addr+pubkey so forward target resolves (membership alone is not enough)
+found=0
+for _ in $(seq 1 60); do
+	if run_b node list | grep -q "${NODEIDC}" && grep -q "${PORTC}" "${TMPB}/.web4mvp/peers.jsonl"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -ne 1 ]]; then
+	quic_fail "check 6 (gossip forward): B missing C addr/pubkey"
+fi
+# Ensure addr->node_id mapping points to C's identity based on latest JSONL entry
+if ! tac "${TMPB}/.web4mvp/peers.jsonl" | awk -v addr="127.0.0.1:${PORTC}" -v id="${NODEIDC}" '
+	$0 ~ addr {found=1; if ($0 ~ id) ok=1; exit}
+	END {exit !(found && ok)}
+'; then
+	quic_fail "check 6 (gossip forward): B addr mapping mismatch for C"
+	quic_fail "grep "127.0.0.1:${PORTC}" -n "${TMPB}/.web4mvp/peers.jsonl" | tail -n 20"
+fi
+
+# Club gate: membership must be set before gossip is accepted/forwarded
+run_checked "check 6 (gossip forward): node join (B<-A)" --quiet run_b node join --node-id "${NODEIDA}"
+run_checked "check 6 (gossip forward): node join (B<-C)" --quiet run_b node join --node-id "${NODEIDC}"
+run_checked "check 6 (gossip forward): node join (B<-B)" --quiet run_b node join --node-id "${NODEIDB}"
+run_checked "check 6 (gossip forward): node join (C<-B)" --quiet run_c node join --node-id "${NODEIDB}"
+run_checked "check 6 (gossip forward): node join (C<-C)" --quiet run_c node join --node-id "${NODEIDC}"
+
+run_b node members
+run_c node members
+run_b node list
+gossip_hello="${TMPWORK}/gossip_hello.json"
+run_checked "check 6 (gossip forward): node hello (D)" --quiet run_d node hello --out "${gossip_hello}" --advertise-addr "127.0.0.1:${PORTD}"
+NODEIDD="$(run_d node id | awk '/node_id:/ {print $2}')"
+run_checked "check 6 (gossip forward): node join (B<-D)" --quiet run_b node join --node-id "${NODEIDD}"
+joined=0
+for _ in $(seq 1 60); do
+	if run_b node members | grep -q "${NODEIDD}"; then
+		joined=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${joined}" -ne 1 ]]; then
+	quic_fail "check 6 (gossip forward): B missing D membership"
+fi
+
+if ! ( export WEB4_GOSSIP_TTL_HOPS=3; run_a gossip push --devtls --addr "127.0.0.1:${PORTB}" --devtls-ca "${TMPB}/.web4mvp/devtls_ca.pem" --in "${gossip_hello}" ); then
+	# club model: print full command and state for easier diagnostics
+	echo "Command failed (check 6 (gossip forward): gossip push (A->B)): ( export WEB4_GOSSIP_TTL_HOPS=3; run_a gossip push --devtls --addr 127.0.0.1:${PORTB} --devtls-ca ${TMPB}/.web4mvp/devtls_ca.pem --in ${gossip_hello} )"
+	for log in "${server_log_a}" "${server_log_b}" "${server_log_c}"; do
+		if [[ -n "${log}" && -f "${log}" ]]; then
+			echo "Log tail (${log}):"
+			tail -n 80 "${log}" || true
+			echo "Membership gate hints (${log}):"
+			grep -E "unaccepted|unknown sender|unverified|member" "${log}" || true
+		fi
+	done
+	echo "A members:"
+	run_a node members || true
+	echo "A peers file tail:"
+	tail -n 5 "${TMPA}/.web4mvp/peers.jsonl" || true
+	echo "B members:"
+	run_b node members || true
+	echo "B peers (list):"
+	run_b node list || true
+	echo "B peers file tail:"
+	tail -n 5 "${TMPB}/.web4mvp/peers.jsonl" || true
+	echo "gossip payload head:"
+	head -n 30 "${gossip_hello}" || true
+	quic_fail "check 6 (gossip forward): gossip push (A->B)"
+fi
+
+found=0
+server_log="${server_log_c}"
+for _ in $(seq 1 120); do
+	if run_c node list | grep -q "${NODEIDD}"; then
+		found=1
+		break
+	fi
+	sleep 0.1
+done
+if [[ "${found}" -ne 1 ]]; then
+	echo "Log tail (${server_log_a}):"
+	tail -n 80 "${server_log_a}" || true
+	echo "Log tail (${server_log_b}):"
+	tail -n 80 "${server_log_b}" || true
+	echo "Log tail (${server_log_c}):"
+	tail -n 80 "${server_log_c}" || true
+	quic_fail "check 6 (gossip forward): peer not forwarded"
+fi
+
+if grep -n "\\.\\.\\." scripts/smoke.sh >/dev/null 2>&1; then
+	echo "ERROR: ellipsis present in scripts/smoke.sh"
+	exit 1
+fi
+
+kill "${SERVER_PID_B}" 2>/dev/null || true
+wait "${SERVER_PID_B}" 2>/dev/null || true
+SERVER_PID_B=""
+kill "${SERVER_PID_C}" 2>/dev/null || true
+wait "${SERVER_PID_C}" 2>/dev/null || true
+SERVER_PID_C=""
+pass "check 6 (gossip forward)"
 
 echo "ALL SMOKE CHECKS PASSED"

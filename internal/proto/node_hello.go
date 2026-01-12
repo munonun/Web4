@@ -16,6 +16,7 @@ type NodeHelloMsg struct {
 	Type   string `json:"type"`
 	NodeID string `json:"node_id"`
 	PubKey string `json:"pubkey"`
+	Addr   string `json:"addr,omitempty"`
 	Nonce  uint64 `json:"nonce"`
 	Sig    string `json:"sig"`
 }
@@ -38,10 +39,11 @@ func DecodeNodeHelloMsg(data []byte) (NodeHelloMsg, error) {
 	return m, nil
 }
 
-func NodeHelloHash(nodeID [32]byte, pub []byte, nonce uint64) [32]byte {
-	buf := make([]byte, 0, 32+len(pub)+8)
+func NodeHelloHash(nodeID [32]byte, pub []byte, addr string, nonce uint64) [32]byte {
+	buf := make([]byte, 0, 32+len(pub)+len(addr)+8)
 	buf = append(buf, nodeID[:]...)
 	buf = append(buf, pub...)
+	buf = append(buf, addr...)
 	var tmp [8]byte
 	binary.BigEndian.PutUint64(tmp[:], nonce)
 	buf = append(buf, tmp[:]...)

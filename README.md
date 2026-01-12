@@ -43,6 +43,14 @@ Connections and streams are limited on a per-IP basis, oversized frames are
 rejected early based on message type, and deterministic development TLS is gated
 explicitly behind a dev flag. The system is designed to fail closed under abuse.
 
+P2P access is deliberately split from participation. Any node may connect, but
+an unknown sender is treated as an "orphan node" and can only attempt
+`node_hello`. Once a `node_hello` verifies, the sender's pubkey is bound to the
+observed host/IP and persisted as a verified peer. Only verified peers may
+exchange gossip, peer discovery, or contract/state messages. Addr-only peers are
+kept as in-memory candidates and are only used to initiate outbound
+`node_hello`.
+
 Local storage is append-only and intentionally limited in scope. Records are
 stored only to support local validation and replay protection. To prevent
 disk-fill attacks, storage rotates automatically under size and line caps while

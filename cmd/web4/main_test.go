@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -661,24 +663,33 @@ func TestQuicRecvOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load node failed: %v", err)
 	}
+	peerB := peer.Peer{
+		NodeID: node.DeriveNodeID(pubB),
+		PubKey: pubB,
+		Addr:   "127.0.0.1:1",
+	}
+	if err := self.Peers.Upsert(peerB, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
 	checker := math4.NewLocalChecker(math4.Options{})
 	ready := make(chan struct{})
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		_ = network.ListenAndServeWithReady(addr, ready, false, func(data []byte) {
-			if err := recvData(data, st, self, checker); err != nil {
+		_ = network.ListenAndServeWithResponderFrom(addr, ready, false, func(senderAddr string, data []byte) ([]byte, error) {
+			if _, _, err := recvDataWithResponse(data, st, self, checker, senderAddr); err != nil {
 				select {
 				case errCh <- err:
 				default:
 				}
-				return
+				return nil, err
 			}
 			select {
 			case <-done:
 			default:
 				close(done)
 			}
+			return nil, nil
 		})
 	}()
 	select {
@@ -687,11 +698,16 @@ func TestQuicRecvOpen(t *testing.T) {
 		t.Fatalf("timeout waiting for quic server ready")
 	}
 
+	_, privB := loadKeypair(t, homeB)
+	if err := sendNodeHello(t, addr, pubB, privB, "", false); err != nil {
+		t.Fatalf("node hello failed: %v", err)
+	}
+
 	msgData, err := os.ReadFile(openMsgPath)
 	if err != nil {
 		t.Fatalf("read open msg failed: %v", err)
 	}
-	if err := network.Send(addr, msgData, true, false); err != nil {
+	if err := network.Send(addr, msgData, true, false, ""); err != nil {
 		t.Fatalf("quic send failed: %v", err)
 	}
 
@@ -737,6 +753,24 @@ func runWithHome(home string, args ...string) error {
 	return nil
 }
 
+func sendNodeHello(t *testing.T, addr string, pub, priv []byte, caPath string, devTLS bool) error {
+	t.Helper()
+	n := &node.Node{
+		ID:      node.DeriveNodeID(pub),
+		PubKey:  pub,
+		PrivKey: priv,
+	}
+	msg, err := n.Hello(1, "")
+	if err != nil {
+		return err
+	}
+	data, err := proto.EncodeNodeHelloMsg(msg)
+	if err != nil {
+		return err
+	}
+	return network.Send(addr, data, !devTLS, devTLS, caPath)
+}
+
 func loadPub(t *testing.T, home string) []byte {
 	t.Helper()
 	root := filepath.Join(home, ".web4mvp")
@@ -757,9 +791,16 @@ func loadKeypair(t *testing.T, home string) ([]byte, []byte) {
 	return pub, priv
 }
 
+func loadPriv(t *testing.T, home string) []byte {
+	t.Helper()
+	_, priv := loadKeypair(t, home)
+	return priv
+}
+
 func TestQuicNodeHello(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()
+	t.Setenv("HOME", homeB)
 
 	runOK(t, homeA, "keygen")
 	runOK(t, homeB, "keygen")
@@ -781,19 +822,20 @@ func TestQuicNodeHello(t *testing.T) {
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		_ = network.ListenAndServeWithReady(addr, ready, true, func(data []byte) {
-			if err := recvData(data, st, self, checker); err != nil {
+		_ = network.ListenAndServeWithResponderFrom(addr, ready, true, func(senderAddr string, data []byte) ([]byte, error) {
+			if _, _, err := recvDataWithResponse(data, st, self, checker, senderAddr); err != nil {
 				select {
 				case errCh <- err:
 				default:
 				}
-				return
+				return nil, err
 			}
 			select {
 			case <-done:
 			default:
 				close(done)
 			}
+			return nil, nil
 		})
 	}()
 	select {
@@ -802,7 +844,8 @@ func TestQuicNodeHello(t *testing.T) {
 		t.Fatalf("timeout waiting for quic server ready")
 	}
 
-	if err := runWithHome(homeA, "node", "hello", "--devtls", "--addr", addr); err != nil {
+	devTLSCAPath := filepath.Join(homeB, ".web4mvp", "devtls_ca.pem")
+	if err := runWithHome(homeA, "node", "hello", "--devtls", "--addr", addr, "--devtls-ca", devTLSCAPath); err != nil {
 		t.Fatalf("node hello failed: %v", err)
 	}
 
@@ -824,6 +867,415 @@ func TestQuicNodeHello(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("expected sender in peer store")
+}
+
+func TestNodeExchange(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+	runOK(t, homeC, "keygen")
+
+	addr := freeUDPAddr(t)
+	t.Setenv("HOME", homeA)
+	root := filepath.Join(homeA, ".web4mvp")
+	_ = os.MkdirAll(root, 0700)
+	st := store.New(
+		filepath.Join(root, "contracts.jsonl"),
+		filepath.Join(root, "acks.jsonl"),
+		filepath.Join(root, "repayreqs.jsonl"),
+	)
+	self, err := node.NewNode(root, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+
+	pubC := loadPub(t, homeC)
+	peerC := peer.Peer{
+		NodeID: node.DeriveNodeID(pubC),
+		PubKey: pubC,
+		Addr:   "127.0.0.1:42430",
+	}
+	if err := self.Peers.Upsert(peerC, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
+
+	checker := math4.NewLocalChecker(math4.Options{})
+	ready := make(chan struct{})
+	go func() {
+		_ = network.ListenAndServeWithResponderFrom(addr, ready, true, func(senderAddr string, data []byte) ([]byte, error) {
+			resp, _, err := recvDataWithResponse(data, st, self, checker, senderAddr)
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		})
+	}()
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for quic server ready")
+	}
+
+	devTLSCAPath := filepath.Join(homeA, ".web4mvp", "devtls_ca.pem")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(devTLSCAPath); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(devTLSCAPath); err != nil {
+		t.Fatalf("missing devtls CA: %v", err)
+	}
+	pubB, privB := loadKeypair(t, homeB)
+	if err := sendNodeHello(t, addr, pubB, privB, devTLSCAPath, true); err != nil {
+		t.Fatalf("node hello failed: %v", err)
+	}
+	rootB := filepath.Join(homeB, ".web4mvp")
+	stB := store.New(
+		filepath.Join(rootB, "contracts.jsonl"),
+		filepath.Join(rootB, "acks.jsonl"),
+		filepath.Join(rootB, "repayreqs.jsonl"),
+	)
+	selfB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+	msg, err := self.Hello(1, "")
+	if err != nil {
+		t.Fatalf("node hello failed: %v", err)
+	}
+	msgData, err := proto.EncodeNodeHelloMsg(msg)
+	if err != nil {
+		t.Fatalf("encode node hello failed: %v", err)
+	}
+	if _, _, err := recvDataWithResponse(msgData, stB, selfB, checker, addr); err != nil {
+		t.Fatalf("accept node hello failed: %v", err)
+	}
+	reloadBeforeExchange, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("reload node failed: %v", err)
+	}
+	if !hasPeerID(reloadBeforeExchange.Peers.List(), self.ID) {
+		t.Fatalf("expected sender identity before exchange")
+	}
+	if err := runWithHome(homeB, "node", "exchange", "--devtls", "--addr", addr, "--devtls-ca", devTLSCAPath, "--k", "16"); err != nil {
+		t.Fatalf("node exchange failed: %v", err)
+	}
+
+	reloadB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("reload node failed: %v", err)
+	}
+	pC, ok := findPeerByNodeID(reloadB.Peers.List(), peerC.NodeID)
+	if !ok {
+		t.Fatalf("expected identity from exchange")
+	}
+	if len(pC.PubKey) == 0 || !bytes.Equal(pC.PubKey, pubC) {
+		t.Fatalf("expected matching pubkey from exchange")
+	}
+	if reloadB.Members.Has(peerC.NodeID) {
+		t.Fatalf("did not expect member from exchange")
+	}
+}
+
+func TestGossipForwarding(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+	runOK(t, homeC, "keygen")
+
+	t.Setenv("WEB4_GOSSIP_FANOUT", "1")
+	t.Setenv("WEB4_GOSSIP_TTL_HOPS", "3")
+
+	addrB := freeUDPAddr(t)
+	addrC := freeUDPAddr(t)
+
+	rootB := filepath.Join(homeB, ".web4mvp")
+	_ = os.MkdirAll(rootB, 0700)
+	stB := store.New(
+		filepath.Join(rootB, "contracts.jsonl"),
+		filepath.Join(rootB, "acks.jsonl"),
+		filepath.Join(rootB, "repayreqs.jsonl"),
+	)
+	selfB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+	pubC := loadPub(t, homeC)
+	peerC := peer.Peer{
+		NodeID: node.DeriveNodeID(pubC),
+		PubKey: pubC,
+		Addr:   addrC,
+	}
+
+	rootC := filepath.Join(homeC, ".web4mvp")
+	_ = os.MkdirAll(rootC, 0700)
+	stC := store.New(
+		filepath.Join(rootC, "contracts.jsonl"),
+		filepath.Join(rootC, "acks.jsonl"),
+		filepath.Join(rootC, "repayreqs.jsonl"),
+	)
+	selfC, err := node.NewNode(rootC, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+
+	checker := math4.NewLocalChecker(math4.Options{})
+	readyB := make(chan struct{})
+	readyC := make(chan struct{})
+
+	t.Setenv("HOME", homeC)
+	go func() {
+		_ = network.ListenAndServeWithResponderFrom(addrC, readyC, true, func(senderAddr string, data []byte) ([]byte, error) {
+			resp, _, err := recvDataWithResponse(data, stC, selfC, checker, senderAddr)
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		})
+	}()
+	select {
+	case <-readyC:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for quic server ready")
+	}
+	devTLSCAPathC := filepath.Join(homeC, ".web4mvp", "devtls_ca.pem")
+	waitForFile := func(path string) error {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(path); err == nil {
+				return nil
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return fmt.Errorf("missing devtls CA: %s", path)
+	}
+	if err := waitForFile(devTLSCAPathC); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	t.Setenv("HOME", homeB)
+	go func() {
+		_ = network.ListenAndServeWithResponderFrom(addrB, readyB, true, func(senderAddr string, data []byte) ([]byte, error) {
+			resp, _, err := recvDataWithResponse(data, stB, selfB, checker, senderAddr)
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		})
+	}()
+	select {
+	case <-readyB:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for quic server ready")
+	}
+	devTLSCAPath := filepath.Join(homeB, ".web4mvp", "devtls_ca.pem")
+	if err := waitForFile(devTLSCAPath); err != nil {
+		t.Fatalf("%v", err)
+	}
+
+	pubA, privA := loadKeypair(t, homeA)
+	if err := sendNodeHello(t, addrB, pubA, privA, devTLSCAPath, true); err != nil {
+		t.Fatalf("node hello failed: %v", err)
+	}
+	peerAID := node.DeriveNodeID(pubA)
+	waitForPeer := func(id [32]byte, requireAddr bool, requirePub bool, list func() []peer.Peer) bool {
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			p, ok := findPeerByNodeID(list(), id)
+			if ok {
+				if requireAddr && p.Addr == "" {
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+				if requirePub && len(p.PubKey) == 0 {
+					time.Sleep(20 * time.Millisecond)
+					continue
+				}
+				return true
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return false
+	}
+
+	peerDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(peerDeadline) {
+		if hasPeerID(selfB.Peers.List(), peerAID) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !hasPeerID(selfB.Peers.List(), peerAID) {
+		t.Fatalf("expected identity from node hello")
+	}
+	pubB := loadPub(t, homeB)
+	peerBID := node.DeriveNodeID(pubB)
+	if err := sendNodeHello(t, addrC, selfB.PubKey, selfB.PrivKey, devTLSCAPathC, true); err != nil {
+		t.Fatalf("node hello failed: %v", err)
+	}
+	if !waitForPeer(peerBID, true, true, selfC.Peers.List) {
+		t.Fatalf("expected identity from node hello")
+	}
+	selfB.Candidates.Add(addrC)
+	if err := sendNodeHello(t, addrB, selfC.PubKey, selfC.PrivKey, devTLSCAPath, true); err != nil {
+		t.Fatalf("node hello failed: %v", err)
+	}
+	if !waitForPeer(peerC.NodeID, true, true, selfB.Peers.List) {
+		t.Fatalf("expected identity from node hello")
+	}
+	pubD, privD, err := crypto.GenKeypair()
+	if err != nil {
+		t.Fatalf("gen keypair failed: %v", err)
+	}
+	selfA, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+	hello := node.Node{
+		ID:      node.DeriveNodeID(pubD),
+		PubKey:  pubD,
+		PrivKey: privD,
+	}
+	msg, err := hello.Hello(1, "")
+	if err != nil {
+		t.Fatalf("node hello failed: %v", err)
+	}
+	envelope, err := proto.EncodeNodeHelloMsg(msg)
+	if err != nil {
+		t.Fatalf("encode node hello failed: %v", err)
+	}
+	gossipData, err := buildGossipPushForPeer(peer.Peer{PubKey: pubB}, envelope, 3, selfA)
+	if err != nil {
+		t.Fatalf("encode gossip push failed: %v", err)
+	}
+	if err := network.Send(addrB, gossipData, false, true, ""); err != nil {
+		t.Fatalf("gossip push send failed: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if hasPeerID(selfC.Peers.List(), hello.ID) {
+		t.Fatalf("expected rejection before membership")
+	}
+	peerCHex := hex.EncodeToString(peerC.NodeID[:])
+	if err := runWithHome(homeB, "node", "join", "--node-id", peerCHex); err != nil {
+		t.Fatalf("add member failed: %v", err)
+	}
+	if err := selfB.Members.Add(peerC.NodeID, false); err != nil {
+		t.Fatalf("add member failed: %v", err)
+	}
+	if err := selfB.Members.Add(selfB.ID, false); err != nil {
+		t.Fatalf("add member failed: %v", err)
+	}
+	if !selfB.Members.Has(selfB.ID) {
+		t.Fatalf("expected self member for forward")
+	}
+	if err := selfC.Members.Add(peerBID, false); err != nil {
+		t.Fatalf("add member failed: %v", err)
+	}
+	if err := selfC.Members.Add(selfC.ID, false); err != nil {
+		t.Fatalf("add member failed: %v", err)
+	}
+	if !selfC.Members.Has(selfC.ID) {
+		t.Fatalf("expected self member for receive")
+	}
+	if !waitForPeer(peerC.NodeID, true, true, selfB.Peers.List) {
+		t.Fatalf("expected forward target ready")
+	}
+	if err := network.Send(addrB, gossipData, false, true, ""); err != nil {
+		t.Fatalf("gossip push send failed: %v", err)
+	}
+	if !waitForPeer(hello.ID, false, true, selfC.Peers.List) {
+		t.Fatalf("timeout waiting for gossip forward")
+	}
+	if !hasPeerID(selfC.Peers.List(), hello.ID) {
+		t.Fatalf("expected identity from gossip")
+	}
+}
+
+func TestGossipRejectsUnknownSender(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	t.Setenv("WEB4_GOSSIP_FANOUT", "1")
+	t.Setenv("WEB4_GOSSIP_TTL_HOPS", "2")
+	t.Setenv("HOME", homeB)
+
+	addrB := freeUDPAddr(t)
+	rootB := filepath.Join(homeB, ".web4mvp")
+	_ = os.MkdirAll(rootB, 0700)
+	stB := store.New(
+		filepath.Join(rootB, "contracts.jsonl"),
+		filepath.Join(rootB, "acks.jsonl"),
+		filepath.Join(rootB, "repayreqs.jsonl"),
+	)
+	selfB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+	checker := math4.NewLocalChecker(math4.Options{})
+	ready := make(chan struct{})
+	go func() {
+		_ = network.ListenAndServeWithResponderFrom(addrB, ready, true, func(senderAddr string, data []byte) ([]byte, error) {
+			resp, _, err := recvDataWithResponse(data, stB, selfB, checker, senderAddr)
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		})
+	}()
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for quic server ready")
+	}
+
+	devTLSCAPath := filepath.Join(homeB, ".web4mvp", "devtls_ca.pem")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(devTLSCAPath); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(devTLSCAPath); err != nil {
+		t.Fatalf("missing devtls CA: %v", err)
+	}
+	pubB := loadPub(t, homeB)
+	openMsg := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeA, "open", "--to", hex.EncodeToString(pubB), "--amount", "4", "--nonce", "2", "--out", openMsg)
+	envelope, err := os.ReadFile(openMsg)
+	if err != nil {
+		t.Fatalf("read open message failed: %v", err)
+	}
+	selfA, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+	gossipData, err := buildGossipPushForPeer(peer.Peer{PubKey: pubB}, envelope, 2, selfA)
+	if err != nil {
+		t.Fatalf("encode gossip push failed: %v", err)
+	}
+	if err := network.Send(addrB, gossipData, false, true, devTLSCAPath); err != nil {
+		t.Fatalf("gossip push send failed: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	cs, err := stB.ListContracts()
+	if err != nil {
+		t.Fatalf("list contracts failed: %v", err)
+	}
+	if len(cs) != 0 {
+		t.Fatalf("expected gossip drop for unknown sender")
+	}
 }
 
 func waitForContract(t *testing.T, home, cidHex string, timeout time.Duration) {
@@ -849,15 +1301,6 @@ func waitForContract(t *testing.T, home, cidHex string, timeout time.Duration) {
 	t.Fatalf("timeout waiting for contract %s", cidHex)
 }
 
-func hasPeerID(peers []peer.Peer, id [32]byte) bool {
-	for _, p := range peers {
-		if p.NodeID == id {
-			return true
-		}
-	}
-	return false
-}
-
 func oversizedPayload(t *testing.T, msgType string, maxSize int) []byte {
 	t.Helper()
 	pad := strings.Repeat("a", maxSize)
@@ -872,10 +1315,20 @@ func freeUDPAddr(t *testing.T) string {
 	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
+		if isPermissionErr(err) {
+			t.Skipf("udp listen not permitted: %v", err)
+		}
 		t.Fatalf("listen udp failed: %v", err)
 	}
 	defer pc.Close()
 	return pc.LocalAddr().String()
+}
+
+func isPermissionErr(err error) bool {
+	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+		return true
+	}
+	return strings.Contains(err.Error(), "operation not permitted")
 }
 
 var (
