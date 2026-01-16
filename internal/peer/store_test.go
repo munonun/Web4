@@ -1,4 +1,4 @@
-package peer
+package peer_test
 
 import (
 	"path/filepath"
@@ -6,21 +6,27 @@ import (
 	"time"
 
 	"web4mvp/internal/crypto"
+	"web4mvp/internal/node"
+	"web4mvp/internal/peer"
 )
 
 func TestStoreCapEviction(t *testing.T) {
 	dir := t.TempDir()
-	st, err := NewStore(filepath.Join(dir, "peers.jsonl"), Options{
-		Cap:       2,
-		TTL:       time.Hour,
-		LoadLimit: 0,
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		Cap:          2,
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
 	})
 	if err != nil {
 		t.Fatalf("new store failed: %v", err)
 	}
-	p1 := Peer{NodeID: idWithByte(1), PubKey: pubWithByte(1)}
-	p2 := Peer{NodeID: idWithByte(2), PubKey: pubWithByte(2)}
-	p3 := Peer{NodeID: idWithByte(3), PubKey: pubWithByte(3)}
+	pub1 := pubWithByte(1)
+	pub2 := pubWithByte(2)
+	pub3 := pubWithByte(3)
+	p1 := peer.Peer{NodeID: node.DeriveNodeID(pub1), PubKey: pub1}
+	p2 := peer.Peer{NodeID: node.DeriveNodeID(pub2), PubKey: pub2}
+	p3 := peer.Peer{NodeID: node.DeriveNodeID(pub3), PubKey: pub3}
 
 	if err := st.Upsert(p1, false); err != nil {
 		t.Fatalf("upsert p1 failed: %v", err)
@@ -47,18 +53,15 @@ func TestStoreCapEviction(t *testing.T) {
 }
 
 func pubWithByte(b byte) []byte {
-	pub := make([]byte, crypto.PubLen)
-	pub[0] = b
+	_ = b
+	pub, _, err := crypto.GenKeypair()
+	if err != nil {
+		return nil
+	}
 	return pub
 }
 
-func idWithByte(b byte) [32]byte {
-	var id [32]byte
-	id[0] = b
-	return id
-}
-
-func hasPeer(peers []Peer, id [32]byte) bool {
+func hasPeer(peers []peer.Peer, id [32]byte) bool {
 	for _, p := range peers {
 		if p.NodeID == id {
 			return true

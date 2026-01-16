@@ -30,18 +30,20 @@ type Peer struct {
 }
 
 type Options struct {
-	Cap       int
-	TTL       time.Duration
-	LoadLimit int
+	Cap          int
+	TTL          time.Duration
+	LoadLimit    int
+	DeriveNodeID func(pub []byte) [32]byte
 }
 
 type Store struct {
-	mu    sync.Mutex
-	path  string
-	cap   int
-	ttl   time.Duration
-	hot   map[string]*list.Element
-	order *list.List
+	mu           sync.Mutex
+	path         string
+	cap          int
+	ttl          time.Duration
+	deriveNodeID func(pub []byte) [32]byte
+	hot          map[string]*list.Element
+	order        *list.List
 }
 
 type entry struct {
@@ -69,15 +71,19 @@ func NewStore(path string, opts Options) (*Store, error) {
 	if loadLimit <= 0 {
 		loadLimit = capacity
 	}
+	if opts.DeriveNodeID == nil {
+		return nil, fmt.Errorf("missing derive_node_id")
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
 	s := &Store{
-		path:  path,
-		cap:   capacity,
-		ttl:   ttl,
-		hot:   make(map[string]*list.Element),
-		order: list.New(),
+		path:         path,
+		cap:          capacity,
+		ttl:          ttl,
+		deriveNodeID: opts.DeriveNodeID,
+		hot:          make(map[string]*list.Element),
+		order:        list.New(),
 	}
 	if loadLimit > 0 {
 		if err := s.loadLast(loadLimit); err != nil {
@@ -95,10 +101,9 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 		if os.Getenv("WEB4_DEBUG") != "1" {
 			return
 		}
-		pubNodeID := deriveNodeIDFromPub(peer.PubKey)
-		xpub, _ := crypto.Ed25519PubToX25519(peer.PubKey)
-		xhash := crypto.SHA3_256(xpub)
-		fmt.Fprintf(os.Stderr, "peer upsert: node_id=%x addr=%s pub_node_id=%x x25519_pub_hash=%x\n", peer.NodeID[:], peer.Addr, pubNodeID[:], xhash[:])
+		pubNodeID := s.deriveNodeID(peer.PubKey)
+		pubHash := crypto.SHA3_256(peer.PubKey)
+		fmt.Fprintf(os.Stderr, "peer upsert: node_id=%x addr=%s pub_node_id=%x pub_hash=%x\n", peer.NodeID[:], peer.Addr, pubNodeID[:], pubHash[:])
 	}
 	key := keyForPeer(p)
 
@@ -141,7 +146,7 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 		s.mu.Unlock()
 		return fmt.Errorf("missing pubkey")
 	}
-	derived := deriveNodeIDFromPub(p.PubKey)
+	derived := s.deriveNodeID(p.PubKey)
 	if derived != p.NodeID {
 		s.mu.Unlock()
 		fmt.Fprintf(os.Stderr, "peer upsert rejected: node_id/pubkey mismatch node_id=%x pub_node_id=%x addr=%s\n", p.NodeID[:], derived[:], p.Addr)
@@ -258,7 +263,7 @@ func (s *Store) loadLast(limit int) error {
 	}
 	for _, rec := range records {
 		pub, err := hex.DecodeString(rec.PubKey)
-		if err != nil || len(pub) != crypto.PubLen {
+		if err != nil || !crypto.IsRSAPublicKey(pub) {
 			continue
 		}
 		idBytes, err := hex.DecodeString(rec.NodeID)
@@ -319,13 +324,6 @@ func peerScanPaths(path string) []string {
 
 func keyForPeer(p Peer) string {
 	return hex.EncodeToString(p.NodeID[:])
-}
-
-func deriveNodeIDFromPub(pub []byte) [32]byte {
-	sum := crypto.SHA3_256(pub)
-	var id [32]byte
-	copy(id[:], sum)
-	return id
 }
 
 func isZeroNodeID(id [32]byte) bool {

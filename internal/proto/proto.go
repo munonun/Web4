@@ -49,7 +49,7 @@ const (
 
 const (
 	ProtoVersion = "0.0.2"
-	Suite        = "ed25519+x25519+xchacha20poly1305+sha3+hmacsha3hkdf"
+	Suite        = "rsa-pss+x25519+xchacha20poly1305+sha3"
 )
 
 const (
@@ -66,14 +66,18 @@ func MaxSizeForType(t string) int {
 		return MaxRepayReqSize
 	case MsgTypeAck:
 		return MaxAckSize
-	case MsgTypeNodeHello:
-		return MaxNodeHelloSize
+	case MsgTypeHello1:
+		return MaxHello1Size
+	case MsgTypeHello2:
+		return MaxHello2Size
 	case MsgTypePeerExchangeReq:
 		return MaxPeerExchangeReqSize
 	case MsgTypePeerExchangeResp:
 		return MaxPeerExchangeRespSize
 	case MsgTypeGossipPush:
 		return MaxGossipPushSize
+	case MsgTypeSecureEnvelope:
+		return MaxSecureEnvelopeSize
 	default:
 		return MaxFrameSize
 	}

@@ -2,67 +2,58 @@ package crypto
 
 import (
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 )
 
-func TestKDFDeterminismAndContext(t *testing.T) {
-	ikm := []byte("ikm")
-	ctxA := "web4:v0:quic:tx"
-	ctxB := "web4:v0:quic:rx"
-
-	prk1, err := Extract(nil, ikm)
-	if err != nil {
-		t.Fatalf("Extract failed: %v", err)
+func TestSessionKDFVectors(t *testing.T) {
+	ss := make([]byte, 32)
+	for i := range ss {
+		ss[i] = byte(i)
 	}
-	prk2, err := Extract(nil, ikm)
-	if err != nil {
-		t.Fatalf("Extract failed: %v", err)
-	}
-	if !bytes.Equal(prk1, prk2) {
-		t.Fatalf("Extract not deterministic")
+	transcript := make([]byte, 32)
+	for i := range transcript {
+		transcript[i] = byte(i + 32)
 	}
 
-	okm1, err := Expand(prk1, []byte(ctxA), 32)
+	keys, err := DeriveSessionKeys(ss, transcript)
 	if err != nil {
-		t.Fatalf("Expand failed: %v", err)
-	}
-	okm2, err := Expand(prk2, []byte(ctxA), 32)
-	if err != nil {
-		t.Fatalf("Expand failed: %v", err)
-	}
-	if !bytes.Equal(okm1, okm2) {
-		t.Fatalf("Expand not deterministic")
+		t.Fatalf("DeriveSessionKeys failed: %v", err)
 	}
 
-	keyA1, err := DeriveKeyE(ikm, ctxA, 32)
-	if err != nil {
-		t.Fatalf("DeriveKeyE failed: %v", err)
-	}
-	keyA2, err := DeriveKeyE(ikm, ctxA, 32)
-	if err != nil {
-		t.Fatalf("DeriveKeyE failed: %v", err)
-	}
-	if !bytes.Equal(keyA1, keyA2) {
-		t.Fatalf("DeriveKeyE not deterministic")
+	expect := map[string]string{
+		"K_master":   "5d208bbfef5bc355c2ac109fbfa1efd6d1b236469031340eca485980d26bb238",
+		"K_send":     "eedd4363c81cb77db1737b70c06eeb27aef18d1f09e36c14a8a6c6693b5b0fdf",
+		"K_recv":     "28ca5e6b92fcb0491aedac5775ec87843ee1b946c859e8efe88cb9be00fe2b9a",
+		"nonce_send": "c5337caae56ded3ef6e66fe540b4615106358d72978b3a26",
+		"nonce_recv": "58651b961c3c0d57604bfd1acd659b0e125e03bee312bfac",
 	}
 
-	keyB, err := DeriveKeyE(ikm, ctxB, 32)
-	if err != nil {
-		t.Fatalf("DeriveKeyE failed: %v", err)
+	if got := hex.EncodeToString(keys.Master); got != expect["K_master"] {
+		t.Fatalf("K_master mismatch: got %s", got)
 	}
-	if bytes.Equal(keyA1, keyB) {
-		t.Fatalf("expected different keys for different contexts")
+	if got := hex.EncodeToString(keys.SendKey); got != expect["K_send"] {
+		t.Fatalf("K_send mismatch: got %s", got)
 	}
-}
+	if got := hex.EncodeToString(keys.RecvKey); got != expect["K_recv"] {
+		t.Fatalf("K_recv mismatch: got %s", got)
+	}
+	if got := hex.EncodeToString(keys.NonceBaseSend); got != expect["nonce_send"] {
+		t.Fatalf("nonce_base_send mismatch: got %s", got)
+	}
+	if got := hex.EncodeToString(keys.NonceBaseRecv); got != expect["nonce_recv"] {
+		t.Fatalf("nonce_base_recv mismatch: got %s", got)
+	}
 
-func TestDeriveKeyDomainSeparation(t *testing.T) {
-	ikm := []byte("ikm")
-	_, err := DeriveKeyE(ikm, "bad:context", 32)
-	if err == nil {
-		t.Fatalf("expected domain separation error")
+	keys2, err := DeriveSessionKeys(ss, transcript)
+	if err != nil {
+		t.Fatalf("DeriveSessionKeys failed: %v", err)
+	}
+	if !bytes.Equal(keys.SendKey, keys2.SendKey) || !bytes.Equal(keys.RecvKey, keys2.RecvKey) {
+		t.Fatalf("DeriveSessionKeys not deterministic")
 	}
 }
 

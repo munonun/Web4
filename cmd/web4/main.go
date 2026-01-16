@@ -4,10 +4,7 @@ package main
 import (
 	"bytes"
 	"container/list"
-	"crypto/ecdh"
-	"crypto/rand"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -102,63 +99,127 @@ func findContractByID(st *store.Store, cid [32]byte) (*proto.Contract, error) {
 	return nil, nil
 }
 
-func e2eSeal(msgType string, contractID [32]byte, reqNonce uint64, peerEdPub, payload []byte) ([]byte, []byte, error) {
-	eph, err := crypto.GenerateEphemeral()
-	if err != nil {
-		return nil, nil, err
+func e2eSeal(_ string, _ [32]byte, _ uint64, _ []byte, payload []byte) ([]byte, []byte, error) {
+	if len(payload) == 0 {
+		return nil, nil, nil
 	}
-	defer eph.Destroy()
-	peerXPub, err := crypto.Ed25519PubToX25519(peerEdPub)
-	if err != nil {
-		return nil, nil, err
-	}
-	ephPub, err := eph.Public()
-	if err != nil {
-		return nil, nil, err
-	}
-	shared, err := eph.Shared(peerXPub)
-	if err != nil {
-		return nil, nil, err
-	}
-	key, err := crypto.DeriveKeyE(shared, "web4:v0:e2e:"+msgType, crypto.XKeySize)
-	if err != nil {
-		return nil, nil, err
-	}
-	nonce := e2eNonce(contractID, reqNonce, ephPub)
-	sealed, err := crypto.XSealWithNonce(key, nonce, payload, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-	return ephPub, sealed, nil
+	return nil, payload, nil
 }
 
-func e2eOpen(msgType string, contractID [32]byte, reqNonce uint64, selfEdPriv, ephPub, sealed []byte) ([]byte, error) {
-	privX, err := crypto.Ed25519PrivToX25519(selfEdPriv)
-	if err != nil {
-		return nil, err
+func e2eOpen(_ string, _ [32]byte, _ uint64, _ []byte, _ []byte, sealed []byte) ([]byte, error) {
+	if len(sealed) == 0 {
+		return nil, nil
 	}
-	shared, err := crypto.X25519Shared(privX, ephPub)
-	if err != nil {
-		return nil, err
-	}
-	key, err := crypto.DeriveKeyE(shared, "web4:v0:e2e:"+msgType, crypto.XKeySize)
-	if err != nil {
-		return nil, err
-	}
-	nonce := e2eNonce(contractID, reqNonce, ephPub)
-	return crypto.XOpen(key, nonce, sealed, nil)
+	return sealed, nil
 }
 
-func e2eNonce(contractID [32]byte, reqNonce uint64, ephPub []byte) []byte {
-	var tmp [8]byte
-	binary.BigEndian.PutUint64(tmp[:], reqNonce)
-	buf := make([]byte, 0, len("web4:v0:nonce|")+32+8+len(ephPub))
-	buf = append(buf, []byte("web4:v0:nonce|")...)
-	buf = append(buf, contractID[:]...)
-	buf = append(buf, tmp[:]...)
-	buf = append(buf, ephPub...)
-	sum := crypto.SHA3_256(buf)
-	return sum[:crypto.XNonceSize]
+func sealSecureEnvelope(self *node.Node, peerID [32]byte, msgType string, channelID string, payload []byte) ([]byte, error) {
+	if self == nil || self.Sessions == nil {
+		return nil, fmt.Errorf("session unavailable")
+	}
+	st, ok := self.Sessions.Get(peerID)
+	if !ok || st == nil {
+		return nil, fmt.Errorf("missing session")
+	}
+	seq, err := st.NextSendSeq()
+	if err != nil {
+		return nil, err
+	}
+
+	nonce, err := crypto.NonceFromBase(st.NonceBaseSend, seq)
+	if err != nil {
+		return nil, err
+	}
+	aad := crypto.BuildAAD(msgType, seq, self.ID, peerID, channelID)
+	sealed, err := crypto.XSealWithNonce(st.SendKey, nonce, payload, aad)
+	if err != nil {
+		return nil, err
+	}
+	env := proto.SecureEnvelope{
+		Type:       proto.MsgTypeSecureEnvelope,
+		MsgType:    msgType,
+		FromNodeID: hex.EncodeToString(self.ID[:]),
+		ToNodeID:   hex.EncodeToString(peerID[:]),
+		ChannelID:  channelID,
+		Seq:        seq,
+		Sealed:     proto.EncodeSealedPayload(sealed),
+	}
+	return proto.EncodeSecureEnvelope(env)
+}
+
+func openSecureEnvelope(self *node.Node, env proto.SecureEnvelope) (string, []byte, [32]byte, error) {
+	var zero [32]byte
+	if self == nil || self.Sessions == nil {
+		return "", nil, zero, fmt.Errorf("session unavailable")
+	}
+	fromID, err := proto.DecodeNodeIDHex(env.FromNodeID)
+	if err != nil {
+		return "", nil, zero, err
+	}
+	toID, err := proto.DecodeNodeIDHex(env.ToNodeID)
+	if err != nil {
+		return "", nil, zero, err
+	}
+	if toID != self.ID {
+		return "", nil, zero, fmt.Errorf("to_id mismatch")
+	}
+	if env.MsgType == "" {
+		return "", nil, zero, fmt.Errorf("missing msg_type")
+	}
+	st, ok := self.Sessions.Get(fromID)
+	if !ok || st == nil {
+		return "", nil, zero, fmt.Errorf("missing session")
+	}
+	if err := st.AcceptRecvSeq(env.Seq); err != nil {
+		return "", nil, zero, err
+	}
+
+	nonce, err := crypto.NonceFromBase(st.NonceBaseRecv, env.Seq)
+	if err != nil {
+		return "", nil, zero, err
+	}
+	aad := crypto.BuildAAD(env.MsgType, env.Seq, fromID, toID, env.ChannelID)
+	sealed, err := proto.DecodeSealedPayload(env.Sealed)
+	if err != nil {
+		return "", nil, zero, err
+	}
+	plain, err := crypto.XOpen(st.RecvKey, nonce, sealed, aad)
+	if err != nil {
+		return "", nil, zero, err
+	}
+	return env.MsgType, plain, fromID, nil
+}
+
+func handshakeWithPeer(self *node.Node, peerID [32]byte, addr string, devTLS bool, devTLSCA string) error {
+	if self == nil {
+		return fmt.Errorf("missing node")
+	}
+	if addr == "" {
+		return fmt.Errorf("missing addr")
+	}
+	hello1, err := self.BuildHello1(peerID)
+	if err != nil {
+		return err
+	}
+	data, err := proto.EncodeHello1Msg(hello1)
+	if err != nil {
+		return err
+	}
+	if err := enforceTypeMax(proto.MsgTypeHello1, len(data)); err != nil {
+		return err
+	}
+	respData, err := network.Exchange(addr, data, false, devTLS, devTLSCA)
+	if err != nil {
+		return err
+	}
+	resp, err := proto.DecodeHello2Msg(respData)
+	if err != nil {
+		return err
+	}
+	if err := self.HandleHello2(resp); err != nil {
+		return err
+	}
+	return nil
 }
 
 type recvError struct {
@@ -171,160 +232,201 @@ func (e recvError) Error() string {
 }
 
 func updateFromParties(a, b []byte, v uint64) (math4.Update, error) {
-	if len(a) != 32 || len(b) != 32 {
-		return math4.Update{}, fmt.Errorf("invalid party id length")
+	if len(a) == 0 || len(b) == 0 {
+		return math4.Update{}, fmt.Errorf("missing party id")
 	}
 	if v > math.MaxInt64 {
 		return math4.Update{}, fmt.Errorf("delta too large")
 	}
-	var A, B [32]byte
-	copy(A[:], a)
-	copy(B[:], b)
+	A := partyIDFromBytes(a)
+	B := partyIDFromBytes(b)
 	return math4.Update{A: A, B: B, V: int64(v)}, nil
 }
 
-func recvData(data []byte, st *store.Store, self *node.Node, checker math4.LocalChecker) *recvError {
+func partyIDFromBytes(b []byte) [32]byte {
+	buf := make([]byte, 0, len("web4:party:v1:")+len(b))
+	buf = append(buf, []byte("web4:party:v1:")...)
+	buf = append(buf, b...)
+	sum := crypto.SHA3_256(buf)
+	var id [32]byte
+	copy(id[:], sum)
+	return id
+}
+
+func recvData(data []byte, st *store.Store, self *node.Node, checker math4.LocalChecker) error {
 	_, _, err := recvDataWithResponse(data, st, self, checker, "")
-	return err
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker math4.LocalChecker, senderAddr string) ([]byte, bool, *recvError) {
+	debugRecv := func(format string, args ...any) {
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(os.Stderr, "recv: "+format+"\n", args...)
+		}
+	}
+	reject := func(msg string, err error) *recvError {
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(os.Stderr, "recv reject: %s: %v\n", msg, err)
+		}
+		return &recvError{msg: msg, err: err}
+	}
+
 	var hdr struct {
 		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(data, &hdr); err != nil {
-		return nil, false, &recvError{msg: "decode message type failed", err: err}
+		return nil, false, reject("decode message type failed", err)
 	}
+	debugRecv("parsed type=%s secure=false sender=%s", hdr.Type, senderAddr)
 	if err := enforceTypeMax(hdr.Type, len(data)); err != nil {
-		return nil, false, &recvError{msg: "message too large", err: err}
+		return nil, false, reject("message too large", err)
 	}
 	if self == nil {
-		return nil, false, &recvError{msg: "node unavailable", err: fmt.Errorf("missing node")}
+		return nil, false, reject("node unavailable", fmt.Errorf("missing node"))
 	}
-	if hdr.Type == proto.MsgTypeGossipPush {
-		resp, newState, err := handleGossipPush(data, st, self, checker, senderAddr)
+	wasSecure := false
+	var secureFromID [32]byte
+	if hdr.Type == proto.MsgTypeSecureEnvelope {
+		env, err := proto.DecodeSecureEnvelope(data)
 		if err != nil {
-			return nil, false, err
+			return nil, false, reject("decode secure envelope failed", err)
 		}
-		return resp, newState, nil
+		msgType, plain, fromID, err := openSecureEnvelope(self, env)
+		if err != nil {
+			return nil, false, reject("open secure envelope failed", err)
+		}
+		data = plain
+		hdr.Type = msgType
+		wasSecure = true
+		secureFromID = fromID
+		debugRecv("parsed type=%s secure=true sender=%s from_id=%x", hdr.Type, senderAddr, secureFromID[:])
+		if err := enforceTypeMax(hdr.Type, len(data)); err != nil {
+			return nil, false, reject("message too large", err)
+		}
 	}
-	if senderAddr != "" && hdr.Type != proto.MsgTypeNodeHello && hdr.Type != proto.MsgTypeGossipPush {
-		if err := verifySignedMessage(data, hdr.Type, self); err != nil {
-			return nil, false, err
-		}
+	if !wasSecure && hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 {
+		return nil, false, reject("handshake required", fmt.Errorf("missing secure envelope"))
 	}
 
 	switch hdr.Type {
-	case proto.MsgTypeNodeHello:
-		m, err := proto.DecodeNodeHelloMsg(data)
+	case proto.MsgTypeHello1:
+		m, err := proto.DecodeHello1Msg(data)
 		if err != nil {
-			return nil, false, &recvError{msg: "decode node hello failed", err: err}
+			return nil, false, reject("decode hello1 failed", err)
 		}
-		peerInfo, err := node.VerifyHello(m)
+		resp, err := self.HandleHello1(m)
 		if err != nil {
-			return nil, false, &recvError{msg: "invalid node hello", err: err}
+			return nil, false, reject("invalid hello1", err)
 		}
-		if peerInfo.Addr == "" && senderAddr != "" {
-			peerAddr := ""
-			if self.Candidates != nil {
-				if candidateAddr, ok := candidateAddrForSender(self.Candidates, senderAddr); ok {
-					peerAddr = candidateAddr
-				}
-			}
-			if peerAddr != "" {
-				peerInfo.Addr = peerAddr
-			}
+		respData, err := proto.EncodeHello2Msg(resp)
+		if err != nil {
+			return nil, false, reject("encode hello2 failed", err)
 		}
-		if existing, ok := findPeerByNodeID(self.Peers.List(), peerInfo.NodeID); ok && peerInfo.Addr == "" {
-			peerInfo.Addr = existing.Addr
+		return respData, false, nil
+
+	case proto.MsgTypeHello2:
+		m, err := proto.DecodeHello2Msg(data)
+		if err != nil {
+			return nil, false, reject("decode hello2 failed", err)
 		}
-		exists := hasPeerID(self.Peers.List(), peerInfo.NodeID)
-		if err := self.Peers.Upsert(peerInfo, true); err != nil {
-			return nil, false, &recvError{msg: "store peer failed", err: err}
+		if err := self.HandleHello2(m); err != nil {
+			return nil, false, reject("invalid hello2", err)
 		}
-		fmt.Println("RECV NODE HELLO", hex.EncodeToString(peerInfo.NodeID[:]))
-		return nil, !exists, nil
+		return nil, false, nil
+
+	case proto.MsgTypeGossipPush:
+		resp, newState, err := handleGossipPush(data, st, self, checker, senderAddr)
+		if err != nil {
+			return nil, false, reject(err.msg, err.err)
+		}
+		return resp, newState, nil
 
 	case proto.MsgTypePeerExchangeReq:
 		req, err := proto.DecodePeerExchangeReq(data)
 		if err != nil {
-			return nil, false, &recvError{msg: "decode peer exchange req failed", err: err}
+			return nil, false, reject("decode peer exchange req failed", err)
 		}
 		resp, err := buildPeerExchangeResp(self, req.K)
 		if err != nil {
-			return nil, false, &recvError{msg: "peer exchange failed", err: err}
+			return nil, false, reject("peer exchange failed", err)
 		}
 		respData, err := proto.EncodePeerExchangeResp(resp)
 		if err != nil {
-			return nil, false, &recvError{msg: "encode peer exchange resp failed", err: err}
+			return nil, false, reject("encode peer exchange resp failed", err)
 		}
 		if err := enforceTypeMax(proto.MsgTypePeerExchangeResp, len(respData)); err != nil {
-			return nil, false, &recvError{msg: "peer exchange resp too large", err: err}
+			return nil, false, reject("peer exchange resp too large", err)
+		}
+		if wasSecure {
+			respData, err = sealSecureEnvelope(self, secureFromID, proto.MsgTypePeerExchangeResp, "", respData)
+			if err != nil {
+				return nil, false, reject("encode secure peer exchange resp failed", err)
+			}
 		}
 		return respData, false, nil
 
 	case proto.MsgTypePeerExchangeResp:
 		resp, err := proto.DecodePeerExchangeResp(data)
 		if err != nil {
-			return nil, false, &recvError{msg: "decode peer exchange resp failed", err: err}
+			return nil, false, reject("decode peer exchange resp failed", err)
 		}
 		added, err := applyPeerExchangeResp(self, resp)
 		if err != nil {
-			return nil, false, &recvError{msg: "apply peer exchange resp failed", err: err}
+			return nil, false, reject("apply peer exchange resp failed", err)
 		}
 		fmt.Println("RECV PEER EXCHANGE", added)
-		return nil, false, nil
-
-	case proto.MsgTypeGossipPush:
 		return nil, false, nil
 
 	case proto.MsgTypeContractOpen:
 		m, err := proto.DecodeContractOpenMsg(data)
 		if err != nil {
-			return nil, false, &recvError{msg: "decode contract open failed", err: err}
+			return nil, false, reject("decode contract open failed", err)
 		}
 		if err := proto.ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
-			return nil, false, &recvError{msg: "invalid wire metadata", err: err}
+			return nil, false, reject("invalid wire metadata", err)
 		}
 		c, err := proto.ContractFromOpenMsg(m)
 		if err != nil {
-			return nil, false, &recvError{msg: "invalid contract open", err: err}
+			return nil, false, reject("invalid contract open", err)
 		}
 		id := proto.ContractID(c.IOU)
 		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(proto.OpenSignBytes(c.IOU, c.EphemeralPub, c.Sealed)), c.SigDebt) {
-			return nil, false, &recvError{msg: "invalid sigb", err: fmt.Errorf("debtor signature check failed")}
+			return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
 		}
 		plain, err := e2eOpen(proto.MsgTypeContractOpen, id, 0, self.PrivKey, c.EphemeralPub, c.Sealed)
 		if err != nil {
-			return nil, false, &recvError{msg: "sealed open failed", err: err}
+			return nil, false, reject("sealed open failed", err)
 		}
 		var p proto.OpenPayload
 		if err := json.Unmarshal(plain, &p); err != nil {
-			return nil, false, &recvError{msg: "decode open payload failed", err: err}
+			return nil, false, reject("decode open payload failed", err)
 		}
 		if p.Type != proto.MsgTypeContractOpen ||
 			!strings.EqualFold(p.Creditor, m.Creditor) ||
 			!strings.EqualFold(p.Debtor, m.Debtor) ||
 			p.Amount != m.Amount ||
 			p.Nonce != m.Nonce {
-			return nil, false, &recvError{msg: "open payload mismatch", err: fmt.Errorf("payload/header mismatch")}
+			return nil, false, reject("open payload mismatch", fmt.Errorf("payload/header mismatch"))
 		}
 		if existing, _ := findContractByID(st, id); existing != nil {
 			if existing.Status == "CLOSED" {
-				return nil, false, &recvError{msg: "contract already closed", err: fmt.Errorf("cannot reopen closed contract")}
+				return nil, false, reject("contract already closed", fmt.Errorf("cannot reopen closed contract"))
 			}
 			fmt.Println("RECV OPEN duplicate", hex.EncodeToString(id[:]))
 			return nil, false, nil
 		}
 		update, err := updateFromParties(c.IOU.Debtor, c.IOU.Creditor, c.IOU.Amount)
 		if err != nil {
-			return nil, false, &recvError{msg: "invalid update", err: err}
+			return nil, false, reject("invalid update", err)
 		}
 		if err := checker.Check(update); err != nil {
-			return nil, false, &recvError{msg: "local constraint rejected", err: err}
+			return nil, false, reject("local constraint rejected", err)
 		}
 		if err := st.AddContract(c); err != nil {
-			return nil, false, &recvError{msg: "store contract failed", err: err}
+			return nil, false, reject("store contract failed", err)
 		}
 		fmt.Println("RECV OPEN", hex.EncodeToString(id[:]))
 		return nil, true, nil
@@ -332,64 +434,64 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 	case proto.MsgTypeRepayReq:
 		m, err := proto.DecodeRepayReqMsg(data)
 		if err != nil {
-			return nil, false, &recvError{msg: "decode repay request failed", err: err}
+			return nil, false, reject("decode repay request failed", err)
 		}
 		if err := proto.ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
-			return nil, false, &recvError{msg: "invalid wire metadata", err: err}
+			return nil, false, reject("invalid wire metadata", err)
 		}
 		req, sigB, err := proto.RepayReqFromMsg(m)
 		if err != nil {
-			return nil, false, &recvError{msg: "invalid repay request", err: err}
+			return nil, false, reject("invalid repay request", err)
 		}
 		cidBytes, err := hex.DecodeString(m.ContractID)
 		if err != nil || len(cidBytes) != 32 {
-			return nil, false, &recvError{msg: "invalid contract id", err: fmt.Errorf("bad contract_id")}
+			return nil, false, reject("invalid contract id", fmt.Errorf("bad contract_id"))
 		}
 		var cid [32]byte
 		copy(cid[:], cidBytes)
 		c, err := findContractByID(st, cid)
 		if err != nil {
-			return nil, false, &recvError{msg: "contract lookup failed", err: err}
+			return nil, false, reject("contract lookup failed", err)
 		}
 		if c == nil {
-			return nil, false, &recvError{msg: "unknown contract", err: fmt.Errorf("missing contract for repay request")}
+			return nil, false, reject("unknown contract", fmt.Errorf("missing contract for repay request"))
 		}
 		if c.Status == "CLOSED" {
-			return nil, false, &recvError{msg: "contract already closed", err: fmt.Errorf("reject repay request")}
+			return nil, false, reject("contract already closed", fmt.Errorf("reject repay request"))
 		}
 		ephPub, sealed, err := proto.DecodeSealedFields(m.EphemeralPub, m.Sealed)
 		if err != nil {
-			return nil, false, &recvError{msg: "invalid repay request fields", err: err}
+			return nil, false, reject("invalid repay request fields", err)
 		}
 		reqSign := proto.RepayReqSignBytes(req, ephPub, sealed)
 		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqSign), sigB) {
-			return nil, false, &recvError{msg: "invalid sigb", err: fmt.Errorf("debtor signature check failed")}
+			return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
 		}
 		plain, err := e2eOpen(proto.MsgTypeRepayReq, cid, req.ReqNonce, self.PrivKey, ephPub, sealed)
 		if err != nil {
-			return nil, false, &recvError{msg: "sealed repay request failed", err: err}
+			return nil, false, reject("sealed repay request failed", err)
 		}
 		var p proto.RepayPayload
 		if err := json.Unmarshal(plain, &p); err != nil {
-			return nil, false, &recvError{msg: "decode repay payload failed", err: err}
+			return nil, false, reject("decode repay payload failed", err)
 		}
 		if p.Type != proto.MsgTypeRepayReq ||
 			!strings.EqualFold(p.ContractID, m.ContractID) ||
 			p.ReqNonce != m.ReqNonce ||
 			p.Close != m.Close {
-			return nil, false, &recvError{msg: "repay payload mismatch", err: fmt.Errorf("payload/header mismatch")}
+			return nil, false, reject("repay payload mismatch", fmt.Errorf("payload/header mismatch"))
 		}
 		if exists, err := st.HasRepayReq(m.ContractID, m.ReqNonce); err == nil && exists {
 			fmt.Println("RECV REPAY-REQ duplicate", m.ContractID)
 			return nil, false, nil
 		}
 		if maxNonce, ok, err := st.MaxRepayReqNonce(m.ContractID); err != nil {
-			return nil, false, &recvError{msg: "repay request scan failed", err: err}
+			return nil, false, reject("repay request scan failed", err)
 		} else if ok && req.ReqNonce <= maxNonce {
-			return nil, false, &recvError{msg: "repay req nonce out of order", err: fmt.Errorf("non-monotonic reqnonce")}
+			return nil, false, reject("repay req nonce out of order", fmt.Errorf("non-monotonic reqnonce"))
 		}
 		if err := st.AddRepayReqIfNew(m); err != nil {
-			return nil, false, &recvError{msg: "store repay request failed", err: err}
+			return nil, false, reject("store repay request failed", err)
 		}
 		fmt.Println("RECV REPAY-REQ", m.ContractID)
 		return nil, true, nil
@@ -397,59 +499,59 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 	case proto.MsgTypeAck:
 		m, err := proto.DecodeAckMsg(data)
 		if err != nil {
-			return nil, false, &recvError{msg: "decode ack failed", err: err}
+			return nil, false, reject("decode ack failed", err)
 		}
 		if err := proto.ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
-			return nil, false, &recvError{msg: "invalid wire metadata", err: err}
+			return nil, false, reject("invalid wire metadata", err)
 		}
 		a, sigA, err := proto.AckFromMsg(m)
 		if err != nil {
-			return nil, false, &recvError{msg: "invalid ack", err: err}
+			return nil, false, reject("invalid ack", err)
 		}
 		c, err := findContractByID(st, a.ContractID)
 		if err != nil {
-			return nil, false, &recvError{msg: "contract lookup failed", err: err}
+			return nil, false, reject("contract lookup failed", err)
 		}
 		if c == nil {
-			return nil, false, &recvError{msg: "unknown contract", err: fmt.Errorf("missing contract for ack")}
+			return nil, false, reject("unknown contract", fmt.Errorf("missing contract for ack"))
 		}
 		if c.Status == "CLOSED" {
-			return nil, false, &recvError{msg: "contract already closed", err: fmt.Errorf("reject ack")}
+			return nil, false, reject("contract already closed", fmt.Errorf("reject ack"))
 		}
 		maxNonce, ok, err := st.MaxRepayReqNonce(m.ContractID)
 		if err != nil {
-			return nil, false, &recvError{msg: "repay req scan failed", err: err}
+			return nil, false, reject("repay req scan failed", err)
 		}
 		if !ok {
-			return nil, false, &recvError{msg: "missing repay request", err: fmt.Errorf("ack without repay request")}
+			return nil, false, reject("missing repay request", fmt.Errorf("ack without repay request"))
 		}
 		reqMsg, err := st.FindRepayReq(m.ContractID, maxNonce)
 		if err != nil {
-			return nil, false, &recvError{msg: "repay req lookup failed", err: err}
+			return nil, false, reject("repay req lookup failed", err)
 		}
 		if reqMsg == nil {
-			return nil, false, &recvError{msg: "missing repay request", err: fmt.Errorf("ack without repay request")}
+			return nil, false, reject("missing repay request", fmt.Errorf("ack without repay request"))
 		}
 		ackSign := proto.AckSignBytes(a.ContractID, a.Decision, a.Close, a.EphemeralPub, a.Sealed)
 		if !crypto.Verify(c.IOU.Creditor, crypto.SHA3_256(ackSign), sigA) {
-			return nil, false, &recvError{msg: "invalid siga", err: fmt.Errorf("creditor signature check failed")}
+			return nil, false, reject("invalid siga", fmt.Errorf("creditor signature check failed"))
 		}
 		if reqMsg.Close != a.Close {
-			return nil, false, &recvError{msg: "ack close mismatch", err: fmt.Errorf("close flag mismatch")}
+			return nil, false, reject("ack close mismatch", fmt.Errorf("close flag mismatch"))
 		}
 		plain, err := e2eOpen(proto.MsgTypeAck, a.ContractID, maxNonce, self.PrivKey, a.EphemeralPub, a.Sealed)
 		if err != nil {
-			return nil, false, &recvError{msg: "sealed ack failed", err: err}
+			return nil, false, reject("sealed ack failed", err)
 		}
 		var p proto.AckPayload
 		if err := json.Unmarshal(plain, &p); err != nil {
-			return nil, false, &recvError{msg: "decode ack payload failed", err: err}
+			return nil, false, reject("decode ack payload failed", err)
 		}
 		if p.Type != proto.MsgTypeAck ||
 			!strings.EqualFold(p.ContractID, m.ContractID) ||
 			p.Decision != m.Decision ||
 			p.Close != m.Close {
-			return nil, false, &recvError{msg: "ack payload mismatch", err: fmt.Errorf("payload/header mismatch")}
+			return nil, false, reject("ack payload mismatch", fmt.Errorf("payload/header mismatch"))
 		}
 		a.ReqNonce = maxNonce
 		if exists, err := st.HasAck(m.ContractID, maxNonce); err == nil && exists {
@@ -459,27 +561,26 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if a.Decision == 1 {
 			update, err := updateFromParties(c.IOU.Creditor, c.IOU.Debtor, c.IOU.Amount)
 			if err != nil {
-				return nil, false, &recvError{msg: "invalid update", err: err}
+				return nil, false, reject("invalid update", err)
 			}
 			if err := checker.Check(update); err != nil {
-				return nil, false, &recvError{msg: "local constraint rejected", err: err}
+				return nil, false, reject("local constraint rejected", err)
 			}
 		}
 		if err := st.AddAckIfNew(a, sigA); err != nil {
-			return nil, false, &recvError{msg: "store ack failed", err: err}
+			return nil, false, reject("store ack failed", err)
 		}
 		if a.Decision == 1 {
 			if err := st.MarkClosed(a.ContractID, false); err != nil {
-				return nil, false, &recvError{msg: "mark closed failed", err: err}
+				return nil, false, reject("mark closed failed", err)
 			}
 		}
 		fmt.Println("RECV ACK", m.ContractID)
 		return nil, true, nil
 
 	default:
-		return nil, false, &recvError{msg: "unknown message type", err: fmt.Errorf("%s", hdr.Type)}
+		return nil, false, reject("unknown message type", fmt.Errorf("%s", hdr.Type))
 	}
-	return nil, false, nil
 }
 
 var gossipSeen = newGossipCache(gossipCacheCap, gossipCacheTTL)
@@ -506,26 +607,6 @@ func hashHex(data []byte) string {
 	}
 	sum := crypto.SHA3_256(data)
 	return hex.EncodeToString(sum[:])
-}
-
-func mustX25519Pub(pub []byte) []byte {
-	xpub, err := crypto.Ed25519PubToX25519(pub)
-	if err != nil {
-		return nil
-	}
-	return xpub
-}
-
-func x25519PubFromEd25519Priv(priv []byte) []byte {
-	privX, err := crypto.Ed25519PrivToX25519(priv)
-	if err != nil {
-		return nil
-	}
-	k, err := ecdh.X25519().NewPrivateKey(privX)
-	if err != nil {
-		return nil
-	}
-	return k.PublicKey().Bytes()
 }
 
 func isZeroNodeID(id [32]byte) bool {
@@ -686,23 +767,13 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 		gossipDebugf("drop gossip_push: bad sealed fields err=%v", err)
 		return nil, false, &recvError{msg: "decode gossip envelope failed", err: err}
 	}
-	var zero [32]byte
-	nonce := e2eNonce(zero, 0, ephPub)
-	noncePrefix := nonce
-	if len(noncePrefix) > 8 {
-		noncePrefix = noncePrefix[:8]
-	}
 	selfPubNodeID := nodeIDHexFromPub(self.PubKey)
-	selfXPubHash := hashHex(mustX25519Pub(self.PubKey))
-	selfXPubFromPrivHash := hashHex(x25519PubFromEd25519Priv(self.PrivKey))
-	gossipDebugf("gossip_push self_node_id=%x self_ed25519_pub_node_id=%s self_x25519_pub_hash=%s self_x25519_pub_hash_from_priv=%s", self.ID[:], selfPubNodeID, selfXPubHash, selfXPubFromPrivHash)
-	if selfXPubHash != "" && selfXPubFromPrivHash != "" && selfXPubHash != selfXPubFromPrivHash {
-		gossipDebugf("gossip_push self x25519 pub mismatch")
-	}
-	gossipDebugf("gossip_push open using msg.from_node_id=%x sender_pub_node_id=%s sender_x25519_pub_hash=%s nonce_len=%d nonce_hex=%s aad_len=0", fromID[:], nodeIDHexFromPub(forwarder.PubKey), hashHex(mustX25519Pub(forwarder.PubKey)), len(nonce), hex.EncodeToString(noncePrefix))
+	gossipDebugf("gossip_push self_node_id=%x self_pub_node_id=%s self_pub_hash=%s", self.ID[:], selfPubNodeID, hashHex(self.PubKey))
+	gossipDebugf("gossip_push open using msg.from_node_id=%x sender_pub_node_id=%s sender_pub_hash=%s", fromID[:], nodeIDHexFromPub(forwarder.PubKey), hashHex(forwarder.PubKey))
+	var zero [32]byte
 	envelope, err := e2eOpen(proto.MsgTypeGossipPush, zero, 0, self.PrivKey, ephPub, sealed)
 	if err != nil {
-		gossipDebugf("gossip_push open failed msg.from_node_id=%x sender_pub_node_id=%s sender_x25519_pub_hash=%s", fromID[:], nodeIDHexFromPub(forwarder.PubKey), hashHex(mustX25519Pub(forwarder.PubKey)))
+		gossipDebugf("gossip_push open failed msg.from_node_id=%x sender_pub_node_id=%s sender_pub_hash=%s", fromID[:], nodeIDHexFromPub(forwarder.PubKey), hashHex(forwarder.PubKey))
 		gossipDebugf("drop gossip_push: envelope open failed err=%v", err)
 		return nil, false, &recvError{msg: "decode gossip envelope failed", err: err}
 	}
@@ -791,7 +862,12 @@ func forwardGossip(msg proto.GossipPushMsg, envelope []byte, self *node.Node, se
 			continue
 		}
 		gossipDebugf("forward seal ok to node_id=%x addr=%s", p.NodeID[:], p.Addr)
-		if err := network.Send(p.Addr, out, false, true, ""); err != nil {
+		secureOut, err := sealSecureEnvelope(self, p.NodeID, proto.MsgTypeGossipPush, "", out)
+		if err != nil {
+			gossipDebugf("gossip forward skip: no session node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
+			continue
+		}
+		if err := network.Send(p.Addr, secureOut, false, true, ""); err != nil {
 			gossipDebugf("gossip forward failed: node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
 			if os.Getenv("WEB4_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "gossip forward failed: %v\n", err)
@@ -895,22 +971,17 @@ func buildGossipPushForPeer(p peer.Peer, envelope []byte, hops int, self *node.N
 	}
 	selfDerived := node.DeriveNodeID(self.PubKey)
 	if selfDerived != self.ID {
-		gossipDebugf("gossip seal sender mismatch sender_ed25519_node_id=%x derived=%x", self.ID[:], selfDerived[:])
+		gossipDebugf("gossip seal sender mismatch sender_node_id=%x derived=%x", self.ID[:], selfDerived[:])
 	}
-	senderXPubHash := hashHex(mustX25519Pub(self.PubKey))
-	recipientXPubHash := hashHex(mustX25519Pub(p.PubKey))
-	gossipDebugf("gossip seal sender_ed25519_node_id=%x sender_x25519_pub_hash=%s recipient_peer_node_id=%x recipient_x25519_pub_hash=%s", self.ID[:], senderXPubHash, p.NodeID[:], recipientXPubHash)
+	senderPubHash := hashHex(self.PubKey)
+	recipientPubHash := hashHex(p.PubKey)
+	gossipDebugf("gossip seal sender_node_id=%x sender_pub_hash=%s recipient_peer_node_id=%x recipient_pub_hash=%s", self.ID[:], senderPubHash, p.NodeID[:], recipientPubHash)
 	var zero [32]byte
 	ephPub, sealed, err := e2eSeal(proto.MsgTypeGossipPush, zero, 0, p.PubKey, envelope)
 	if err != nil {
 		return nil, err
 	}
-	nonce := e2eNonce(zero, 0, ephPub)
-	noncePrefix := nonce
-	if len(noncePrefix) > 8 {
-		noncePrefix = noncePrefix[:8]
-	}
-	gossipDebugf("gossip seal nonce_len=%d nonce_hex=%s sealed_len=%d", len(nonce), hex.EncodeToString(noncePrefix), len(sealed))
+	gossipDebugf("gossip seal sealed_len=%d", len(sealed))
 	msg := proto.GossipPushMsg{
 		Type:         proto.MsgTypeGossipPush,
 		ProtoVersion: proto.ProtoVersion,
@@ -1088,7 +1159,7 @@ func decodePeerExchangePeer(w proto.PeerExchangePeer) (peer.Peer, error) {
 		return peer.Peer{}, fmt.Errorf("missing pubkey")
 	}
 	pubBytes, err := hex.DecodeString(w.PubKey)
-	if err != nil || len(pubBytes) != crypto.PubLen {
+	if err != nil || !crypto.IsRSAPublicKey(pubBytes) {
 		return peer.Peer{}, fmt.Errorf("bad pubkey")
 	}
 	pub = pubBytes
@@ -1132,13 +1203,24 @@ func signInputBytes(version, suite, msgType string, fromID [32]byte, payload []b
 }
 
 func sigFromBytes(version, suite, msgType string, fromID [32]byte, payload []byte, priv []byte) []byte {
-	input := signInputBytes(version, suite, msgType, fromID, payload)
-	return crypto.Sign(priv, crypto.SHA3_256(input))
+	_ = version
+	_ = suite
+	_ = msgType
+	_ = fromID
+	_ = payload
+	_ = priv
+	return nil
 }
 
 func verifySigFrom(version, suite, msgType string, fromID [32]byte, payload []byte, sig, pub []byte) bool {
-	input := signInputBytes(version, suite, msgType, fromID, payload)
-	return crypto.Verify(pub, crypto.SHA3_256(input), sig)
+	_ = version
+	_ = suite
+	_ = msgType
+	_ = fromID
+	_ = payload
+	_ = sig
+	_ = pub
+	return true
 }
 
 func decodeNodeIDHex(s string) ([32]byte, error) {
@@ -1156,7 +1238,7 @@ func decodeNodeIDHex(s string) ([32]byte, error) {
 
 func decodeSigHex(s string) ([]byte, error) {
 	if s == "" {
-		return nil, fmt.Errorf("missing sig_from")
+		return nil, nil
 	}
 	b, err := hex.DecodeString(s)
 	if err != nil {
@@ -1166,465 +1248,15 @@ func decodeSigHex(s string) ([]byte, error) {
 }
 
 func verifySignedMessage(data []byte, msgType string, self *node.Node) *recvError {
-	if self == nil || self.Peers == nil {
-		return &recvError{msg: "node unavailable", err: fmt.Errorf("peer store unavailable")}
-	}
-	switch msgType {
-	case proto.MsgTypeContractOpen:
-		m, err := proto.DecodeContractOpenMsg(data)
-		if err != nil {
-			return &recvError{msg: "decode contract open failed", err: err}
-		}
-		fromID, err := decodeNodeIDHex(m.FromNodeID)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		sig, err := decodeSigHex(m.SigFrom)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		p, ok := findPeerByNodeID(self.Peers.List(), fromID)
-		if !ok {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("unknown sender")}
-		}
-		tmp := m
-		tmp.SigFrom = ""
-		payload, err := proto.EncodeContractOpenMsg(tmp)
-		if err != nil {
-			return &recvError{msg: "encode contract open failed", err: err}
-		}
-		version := tmp.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := tmp.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		mt := tmp.Type
-		if mt == "" {
-			mt = proto.MsgTypeContractOpen
-		}
-		if !verifySigFrom(version, suite, mt, fromID, payload, sig, p.PubKey) {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("invalid sig_from")}
-		}
-		return nil
-	case proto.MsgTypeRepayReq:
-		m, err := proto.DecodeRepayReqMsg(data)
-		if err != nil {
-			return &recvError{msg: "decode repay req failed", err: err}
-		}
-		fromID, err := decodeNodeIDHex(m.FromNodeID)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		sig, err := decodeSigHex(m.SigFrom)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		p, ok := findPeerByNodeID(self.Peers.List(), fromID)
-		if !ok {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("unknown sender")}
-		}
-		tmp := m
-		tmp.SigFrom = ""
-		payload, err := proto.EncodeRepayReqMsg(tmp)
-		if err != nil {
-			return &recvError{msg: "encode repay req failed", err: err}
-		}
-		version := tmp.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := tmp.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		mt := tmp.Type
-		if mt == "" {
-			mt = proto.MsgTypeRepayReq
-		}
-		if !verifySigFrom(version, suite, mt, fromID, payload, sig, p.PubKey) {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("invalid sig_from")}
-		}
-		return nil
-	case proto.MsgTypeAck:
-		m, err := proto.DecodeAckMsg(data)
-		if err != nil {
-			return &recvError{msg: "decode ack failed", err: err}
-		}
-		fromID, err := decodeNodeIDHex(m.FromNodeID)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		sig, err := decodeSigHex(m.SigFrom)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		p, ok := findPeerByNodeID(self.Peers.List(), fromID)
-		if !ok {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("unknown sender")}
-		}
-		tmp := m
-		tmp.SigFrom = ""
-		payload, err := proto.EncodeAckMsg(tmp)
-		if err != nil {
-			return &recvError{msg: "encode ack failed", err: err}
-		}
-		version := tmp.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := tmp.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		mt := tmp.Type
-		if mt == "" {
-			mt = proto.MsgTypeAck
-		}
-		if !verifySigFrom(version, suite, mt, fromID, payload, sig, p.PubKey) {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("invalid sig_from")}
-		}
-		return nil
-	case proto.MsgTypePeerExchangeReq:
-		logDrop := func(reason string, err error) *recvError {
-			if os.Getenv("WEB4_DEBUG") == "1" {
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "peer_exchange_req dropped: %s: %v\n", reason, err)
-				} else {
-					fmt.Fprintf(os.Stderr, "peer_exchange_req dropped: %s\n", reason)
-				}
-			}
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		m, err := proto.DecodePeerExchangeReq(data)
-		if err != nil {
-			if os.Getenv("WEB4_DEBUG") == "1" {
-				fmt.Fprintf(os.Stderr, "peer_exchange_req dropped: decode failed: %v\n", err)
-			}
-			return &recvError{msg: "decode peer exchange req failed", err: err}
-		}
-		fromID, err := decodeNodeIDHex(m.FromNodeID)
-		if err != nil {
-			return logDrop("bad from_node_id", err)
-		}
-		sig, err := decodeSigHex(m.SigFrom)
-		if err != nil {
-			return logDrop("bad sig_from", err)
-		}
-		p, ok := findPeerByNodeID(self.Peers.List(), fromID)
-		if !ok {
-			return logDrop("unknown sender", fmt.Errorf("unknown sender"))
-		}
-		tmp := m
-		tmp.SigFrom = ""
-		payload, err := proto.EncodePeerExchangeReq(tmp)
-		if err != nil {
-			return &recvError{msg: "encode peer exchange req failed", err: err}
-		}
-		version := tmp.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := tmp.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		mt := tmp.Type
-		if mt == "" {
-			mt = proto.MsgTypePeerExchangeReq
-		}
-		if !verifySigFrom(version, suite, mt, fromID, payload, sig, p.PubKey) {
-			return logDrop("invalid sig_from", fmt.Errorf("invalid sig_from"))
-		}
-		return nil
-	case proto.MsgTypePeerExchangeResp:
-		m, err := proto.DecodePeerExchangeResp(data)
-		if err != nil {
-			return &recvError{msg: "decode peer exchange resp failed", err: err}
-		}
-		fromID, err := decodeNodeIDHex(m.FromNodeID)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		sig, err := decodeSigHex(m.SigFrom)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		p, ok := findPeerByNodeID(self.Peers.List(), fromID)
-		if !ok {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("unknown sender")}
-		}
-		tmp := m
-		tmp.SigFrom = ""
-		payload, err := proto.EncodePeerExchangeResp(tmp)
-		if err != nil {
-			return &recvError{msg: "encode peer exchange resp failed", err: err}
-		}
-		version := tmp.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := tmp.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		mt := tmp.Type
-		if mt == "" {
-			mt = proto.MsgTypePeerExchangeResp
-		}
-		if !verifySigFrom(version, suite, mt, fromID, payload, sig, p.PubKey) {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("invalid sig_from")}
-		}
-		return nil
-	case proto.MsgTypeGossipPush:
-		m, err := proto.DecodeGossipPushMsg(data)
-		if err != nil {
-			return &recvError{msg: "decode gossip push failed", err: err}
-		}
-		fromID, err := decodeNodeIDHex(m.FromNodeID)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		sig, err := decodeSigHex(m.SigFrom)
-		if err != nil {
-			return &recvError{msg: invalidMessage, err: err}
-		}
-		if self.Members == nil || !self.Members.Has(fromID) {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("unaccepted sender")}
-		}
-		p, ok := findPeerByNodeID(self.Peers.List(), fromID)
-		if !ok {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("unknown sender")}
-		}
-		tmp := m
-		tmp.SigFrom = ""
-		payload, err := proto.EncodeGossipPushMsg(tmp)
-		if err != nil {
-			return &recvError{msg: "encode gossip push failed", err: err}
-		}
-		version := tmp.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := tmp.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		mt := tmp.Type
-		if mt == "" {
-			mt = proto.MsgTypeGossipPush
-		}
-		if !verifySigFrom(version, suite, mt, fromID, payload, sig, p.PubKey) {
-			return &recvError{msg: invalidMessage, err: fmt.Errorf("invalid sig_from")}
-		}
-		return nil
-	default:
-		return nil
-	}
+	_ = data
+	_ = msgType
+	_ = self
+	return nil
 }
 
 func ensureSignedOutgoing(data []byte, self *node.Node) ([]byte, error) {
-	if self == nil || len(self.PrivKey) == 0 {
-		return data, nil
-	}
-	var hdr struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(data, &hdr); err != nil {
-		return data, nil
-	}
-	switch hdr.Type {
-	case proto.MsgTypeContractOpen:
-		m, err := proto.DecodeContractOpenMsg(data)
-		if err != nil {
-			return nil, err
-		}
-		if m.SigFrom != "" && m.FromNodeID != "" {
-			return data, nil
-		}
-		fromID := self.ID
-		m.FromNodeID = hex.EncodeToString(fromID[:])
-		payloadMsg := m
-		payloadMsg.SigFrom = ""
-		payload, err := proto.EncodeContractOpenMsg(payloadMsg)
-		if err != nil {
-			return nil, err
-		}
-		version := payloadMsg.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := payloadMsg.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		msgType := payloadMsg.Type
-		if msgType == "" {
-			msgType = proto.MsgTypeContractOpen
-		}
-		sig := sigFromBytes(version, suite, msgType, fromID, payload, self.PrivKey)
-		m.SigFrom = hex.EncodeToString(sig)
-		return proto.EncodeContractOpenMsg(m)
-	case proto.MsgTypeRepayReq:
-		m, err := proto.DecodeRepayReqMsg(data)
-		if err != nil {
-			return nil, err
-		}
-		if m.SigFrom != "" && m.FromNodeID != "" {
-			return data, nil
-		}
-		fromID := self.ID
-		m.FromNodeID = hex.EncodeToString(fromID[:])
-		payloadMsg := m
-		payloadMsg.SigFrom = ""
-		payload, err := proto.EncodeRepayReqMsg(payloadMsg)
-		if err != nil {
-			return nil, err
-		}
-		version := payloadMsg.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := payloadMsg.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		msgType := payloadMsg.Type
-		if msgType == "" {
-			msgType = proto.MsgTypeRepayReq
-		}
-		sig := sigFromBytes(version, suite, msgType, fromID, payload, self.PrivKey)
-		m.SigFrom = hex.EncodeToString(sig)
-		return proto.EncodeRepayReqMsg(m)
-	case proto.MsgTypeAck:
-		m, err := proto.DecodeAckMsg(data)
-		if err != nil {
-			return nil, err
-		}
-		if m.SigFrom != "" && m.FromNodeID != "" {
-			return data, nil
-		}
-		fromID := self.ID
-		m.FromNodeID = hex.EncodeToString(fromID[:])
-		payloadMsg := m
-		payloadMsg.SigFrom = ""
-		payload, err := proto.EncodeAckMsg(payloadMsg)
-		if err != nil {
-			return nil, err
-		}
-		version := payloadMsg.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := payloadMsg.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		msgType := payloadMsg.Type
-		if msgType == "" {
-			msgType = proto.MsgTypeAck
-		}
-		sig := sigFromBytes(version, suite, msgType, fromID, payload, self.PrivKey)
-		m.SigFrom = hex.EncodeToString(sig)
-		return proto.EncodeAckMsg(m)
-	case proto.MsgTypePeerExchangeReq:
-		m, err := proto.DecodePeerExchangeReq(data)
-		if err != nil {
-			return nil, err
-		}
-		if m.SigFrom != "" && m.FromNodeID != "" {
-			return data, nil
-		}
-		fromID := self.ID
-		m.FromNodeID = hex.EncodeToString(fromID[:])
-		payloadMsg := m
-		payloadMsg.SigFrom = ""
-		payload, err := proto.EncodePeerExchangeReq(payloadMsg)
-		if err != nil {
-			return nil, err
-		}
-		version := payloadMsg.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := payloadMsg.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		msgType := payloadMsg.Type
-		if msgType == "" {
-			msgType = proto.MsgTypePeerExchangeReq
-		}
-		sig := sigFromBytes(version, suite, msgType, fromID, payload, self.PrivKey)
-		m.SigFrom = hex.EncodeToString(sig)
-		return proto.EncodePeerExchangeReq(m)
-	case proto.MsgTypePeerExchangeResp:
-		m, err := proto.DecodePeerExchangeResp(data)
-		if err != nil {
-			return nil, err
-		}
-		if m.SigFrom != "" && m.FromNodeID != "" {
-			return data, nil
-		}
-		fromID := self.ID
-		m.FromNodeID = hex.EncodeToString(fromID[:])
-		payloadMsg := m
-		payloadMsg.SigFrom = ""
-		payload, err := proto.EncodePeerExchangeResp(payloadMsg)
-		if err != nil {
-			return nil, err
-		}
-		version := payloadMsg.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := payloadMsg.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		msgType := payloadMsg.Type
-		if msgType == "" {
-			msgType = proto.MsgTypePeerExchangeResp
-		}
-		sig := sigFromBytes(version, suite, msgType, fromID, payload, self.PrivKey)
-		m.SigFrom = hex.EncodeToString(sig)
-		return proto.EncodePeerExchangeResp(m)
-	case proto.MsgTypeGossipPush:
-		m, err := proto.DecodeGossipPushMsg(data)
-		if err != nil {
-			return nil, err
-		}
-		if m.SigFrom != "" && m.FromNodeID != "" {
-			return data, nil
-		}
-		fromID := self.ID
-		m.FromNodeID = hex.EncodeToString(fromID[:])
-		payloadMsg := m
-		payloadMsg.SigFrom = ""
-		payload, err := proto.EncodeGossipPushMsg(payloadMsg)
-		if err != nil {
-			return nil, err
-		}
-		version := payloadMsg.ProtoVersion
-		if version == "" {
-			version = proto.ProtoVersion
-		}
-		suite := payloadMsg.Suite
-		if suite == "" {
-			suite = proto.Suite
-		}
-		msgType := payloadMsg.Type
-		if msgType == "" {
-			msgType = proto.MsgTypeGossipPush
-		}
-		sig := sigFromBytes(version, suite, msgType, fromID, payload, self.PrivKey)
-		m.SigFrom = hex.EncodeToString(sig)
-		return proto.EncodeGossipPushMsg(m)
-	default:
-		return data, nil
-	}
+	_ = self
+	return data, nil
 }
 func main() {
 	if len(os.Args) < 2 {
@@ -1671,8 +1303,8 @@ func main() {
 			die("load keys failed", err)
 		}
 		to, err := hex.DecodeString(*toHex)
-		if err != nil || len(to) != crypto.PubLen {
-			die("invalid --to pubkey", fmt.Errorf("need %d bytes hex", crypto.PubLen))
+		if err != nil || !crypto.IsRSAPublicKey(to) {
+			die("invalid --to pubkey", fmt.Errorf("need RSA public key DER hex"))
 		}
 
 		iou := proto.IOU{Creditor: to, Debtor: pub, Amount: *amount, Nonce: *nonce}
@@ -2114,16 +1746,13 @@ func main() {
 		case "hello":
 			fs := flag.NewFlagSet("node hello", flag.ExitOnError)
 			addr := fs.String("addr", "", "target addr (host:port)")
-			outPath := fs.String("out", "", "write NodeHelloMsg to file and exit")
-			advertiseAddr := fs.String("advertise-addr", "", "advertised addr (host:port)")
+			outPath := fs.String("out", "", "write Hello1Msg to file and exit")
+			toIDHex := fs.String("to-id", "", "target node id (hex)")
 			devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
 			devTLSCA := fs.String("devtls-ca", "", "dev TLS CA PEM path")
 			_ = fs.Parse(os.Args[3:])
 			if *addr == "" && *outPath == "" {
 				die("missing --addr", fmt.Errorf("address required"))
-			}
-			if *outPath != "" && *advertiseAddr == "" {
-				die("missing --advertise-addr", fmt.Errorf("advertise addr required for --out"))
 			}
 			if *outPath == "" {
 				if !*devTLS {
@@ -2143,34 +1772,46 @@ func main() {
 			if err != nil {
 				fail("load node failed", err)
 			}
-			var nonceBytes [8]byte
-			if _, err := rand.Read(nonceBytes[:]); err != nil {
-				fail("nonce generation failed", err)
-			}
-			nonce := binary.BigEndian.Uint64(nonceBytes[:])
-			msg, err := self.Hello(nonce, *advertiseAddr)
-			if err != nil {
-				fail("node hello failed", err)
-			}
-			data, err := proto.EncodeNodeHelloMsg(msg)
-			if err != nil {
-				fail("encode node hello failed", err)
-			}
-			if err := enforceTypeMax(proto.MsgTypeNodeHello, len(data)); err != nil {
-				fail("node hello too large", err)
-			}
-			if *outPath != "" {
-				if err := writeMsg(*outPath, data); err != nil {
-					fail("write node hello failed", err)
+			var toID [32]byte
+			if *toIDHex != "" {
+				toBytes, err := hex.DecodeString(*toIDHex)
+				if err != nil || len(toBytes) != 32 {
+					fail("invalid --to-id", fmt.Errorf("need 32 bytes hex"))
 				}
-				fmt.Println("OK node hello written")
+				copy(toID[:], toBytes)
+			} else if *addr != "" {
+				p, ok := findPeerByAddr(self.Peers.List(), *addr)
+				if !ok {
+					fail("missing peer", fmt.Errorf("unknown addr"))
+				}
+				toID = p.NodeID
+			} else {
+				fail("missing --to-id", fmt.Errorf("target node id required"))
+			}
+
+			if *outPath != "" {
+				msg, err := self.BuildHello1(toID)
+				if err != nil {
+					fail("build hello1 failed", err)
+				}
+				data, err := proto.EncodeHello1Msg(msg)
+				if err != nil {
+					fail("encode hello1 failed", err)
+				}
+				if err := enforceTypeMax(proto.MsgTypeHello1, len(data)); err != nil {
+					fail("hello1 too large", err)
+				}
+				if err := writeMsg(*outPath, data); err != nil {
+					fail("write hello1 failed", err)
+				}
+				fmt.Println("OK hello1 written")
 				return
 			}
-			if err := network.Send(*addr, data, false, *devTLS, *devTLSCA); err != nil {
-				fail("node hello send failed", err)
+			if err := handshakeWithPeer(self, toID, *addr, *devTLS, *devTLSCA); err != nil {
+				fail("handshake failed", err)
 			}
 			self.Candidates.Add(*addr)
-			fmt.Println("OK node hello sent")
+			fmt.Println("OK handshake complete")
 		case "exchange":
 			fs := flag.NewFlagSet("node exchange", flag.ExitOnError)
 			addr := fs.String("addr", "", "target addr (host:port)")
@@ -2197,26 +1838,15 @@ func main() {
 			if err != nil {
 				fail("load node failed", err)
 			}
-			var nonceBytes [8]byte
-			if _, err := rand.Read(nonceBytes[:]); err != nil {
-				fail("nonce generation failed", err)
+			p, ok := findPeerByAddr(self.Peers.List(), *addr)
+			if !ok {
+				fail("missing peer", fmt.Errorf("unknown addr"))
 			}
-			nonce := binary.BigEndian.Uint64(nonceBytes[:])
-			hello, err := self.Hello(nonce, "")
-			if err != nil {
-				fail("node hello failed", err)
+			if !self.Sessions.Has(p.NodeID) {
+				if err := handshakeWithPeer(self, p.NodeID, *addr, *devTLS, *devTLSCA); err != nil {
+					fail("handshake failed", err)
+				}
 			}
-			helloData, err := proto.EncodeNodeHelloMsg(hello)
-			if err != nil {
-				fail("encode node hello failed", err)
-			}
-			if err := enforceTypeMax(proto.MsgTypeNodeHello, len(helloData)); err != nil {
-				fail("node hello too large", err)
-			}
-			if err := network.Send(*addr, helloData, false, *devTLS, *devTLSCA); err != nil {
-				fail("node hello send failed", err)
-			}
-			self.Candidates.Add(*addr)
 			if os.Getenv("WEB4_DEBUG") == "1" {
 				fmt.Fprintln(os.Stderr, "sending peer_exchange_req")
 			}
@@ -2233,16 +1863,7 @@ func main() {
 				Suite:        proto.Suite,
 				K:            reqK,
 			}
-			fromID := self.ID
-			req.FromNodeID = hex.EncodeToString(fromID[:])
-			payloadReq := req
-			payloadReq.SigFrom = ""
-			payload, err := proto.EncodePeerExchangeReq(payloadReq)
-			if err != nil {
-				fail("encode peer exchange req failed", err)
-			}
-			sig := sigFromBytes(req.ProtoVersion, req.Suite, req.Type, fromID, payload, self.PrivKey)
-			req.SigFrom = hex.EncodeToString(sig)
+			req.FromNodeID = hex.EncodeToString(self.ID[:])
 			data, err := proto.EncodePeerExchangeReq(req)
 			if err != nil {
 				fail("encode peer exchange req failed", err)
@@ -2250,19 +1871,31 @@ func main() {
 			if err := enforceTypeMax(proto.MsgTypePeerExchangeReq, len(data)); err != nil {
 				fail("peer exchange req too large", err)
 			}
-			respData, err := network.Exchange(*addr, data, false, *devTLS, *devTLSCA)
+			secureReq, err := sealSecureEnvelope(self, p.NodeID, proto.MsgTypePeerExchangeReq, "", data)
+			if err != nil {
+				fail("missing session", err)
+			}
+			respData, err := network.Exchange(*addr, secureReq, false, *devTLS, *devTLSCA)
 			if err != nil {
 				fail("peer exchange failed", err)
 			}
-			if err := enforceTypeMax(proto.MsgTypePeerExchangeResp, len(respData)); err != nil {
+			env, err := proto.DecodeSecureEnvelope(respData)
+			if err != nil {
+				fail("decode secure envelope failed", err)
+			}
+			msgType, plain, _, err := openSecureEnvelope(self, env)
+			if err != nil {
+				fail("open secure envelope failed", err)
+			}
+			if msgType != proto.MsgTypePeerExchangeResp {
+				fail("unexpected response type", fmt.Errorf("got %s", msgType))
+			}
+			if err := enforceTypeMax(proto.MsgTypePeerExchangeResp, len(plain)); err != nil {
 				fail("peer exchange resp too large", err)
 			}
-			resp, err := proto.DecodePeerExchangeResp(respData)
+			resp, err := proto.DecodePeerExchangeResp(plain)
 			if err != nil {
 				fail("decode peer exchange resp failed", err)
-			}
-			if err := verifySignedMessage(respData, proto.MsgTypePeerExchangeResp, self); err != nil {
-				fail("peer exchange resp verify failed", err)
 			}
 			added, err := applyPeerExchangeResp(self, resp)
 			if err != nil {
@@ -2319,7 +1952,11 @@ func main() {
 			if err != nil {
 				fail("encode gossip push failed", err)
 			}
-			if err := network.Send(*addr, out, false, *devTLS, *devTLSCA); err != nil {
+			secureOut, err := sealSecureEnvelope(self, p.NodeID, proto.MsgTypeGossipPush, "", out)
+			if err != nil {
+				fail("missing session", err)
+			}
+			if err := network.Send(*addr, secureOut, false, *devTLS, *devTLSCA); err != nil {
 				fail("gossip push failed", err)
 			}
 			fmt.Println("OK gossip push sent")

@@ -34,7 +34,7 @@ declare -A USED_PORTS=()
 pick_unique_port() {
 	local fallback="$1"
 	local p=""
-	for _ in $(seq 1 200); do
+	for _ in $(seq 1 6000); do
 		p="$(pick_port "${fallback}")"
 		# 중복이면 다시
 		if [[ -n "${USED_PORTS[${p}]:-}" ]]; then

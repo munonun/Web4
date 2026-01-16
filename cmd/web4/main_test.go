@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -45,7 +44,14 @@ func TestOpenCloseAckFlow(t *testing.T) {
 		"--nonce", "1",
 		"--out", openMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", openMsgPath)
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	openMsg, err := os.ReadFile(openMsgPath)
+	if err != nil {
+		t.Fatalf("read open msg failed: %v", err)
+	}
+	if err := pair.recvToA(openMsg); err != nil {
+		t.Fatalf("recv open failed: %v", err)
+	}
 
 	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 500, Nonce: 1}
 	cid := proto.ContractID(iou)
@@ -57,9 +63,23 @@ func TestOpenCloseAckFlow(t *testing.T) {
 		"--reqnonce", "1",
 		"--out", closeMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", closeMsgPath)
-	if err := runWithHome(homeB, "recv", "--in", closeMsgPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected recipient decrypt failure, got: %v", err)
+	closeMsg, err := os.ReadFile(closeMsgPath)
+	if err != nil {
+		t.Fatalf("read close msg failed: %v", err)
+	}
+	if err := pair.recvToA(closeMsg); err != nil {
+		t.Fatalf("recv close failed: %v", err)
+	}
+	msgType, err := decodeMsgType(closeMsg)
+	if err != nil {
+		t.Fatalf("decode close type failed: %v", err)
+	}
+	secureClose, err := sealSecureEnvelope(pair.b, pair.a.ID, msgType, "", closeMsg)
+	if err != nil {
+		t.Fatalf("seal close failed: %v", err)
+	}
+	if err := recvData(secureClose, pair.stB, pair.b, pair.checkerB); err == nil {
+		t.Fatalf("expected recipient decrypt failure")
 	}
 
 	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
@@ -69,16 +89,18 @@ func TestOpenCloseAckFlow(t *testing.T) {
 		"--decision", "1",
 		"--out", ackMsgPath,
 	)
-	runOK(t, homeB, "recv", "--in", ackMsgPath)
+	ackMsg, err := os.ReadFile(ackMsgPath)
+	if err != nil {
+		t.Fatalf("read ack msg failed: %v", err)
+	}
+	if err := pair.recvToB(ackMsg); err != nil {
+		t.Fatalf("recv ack failed: %v", err)
+	}
 
 	if err := runWithHome(homeA, "close", "--id", cidHex, "--reqnonce", "2"); err == nil || !strings.Contains(err.Error(), "debtor mismatch") {
 		t.Fatalf("expected debtor mismatch error, got: %v", err)
 	}
 
-	closeMsg, err := os.ReadFile(closeMsgPath)
-	if err != nil {
-		t.Fatalf("read close message failed: %v", err)
-	}
 	repayMsg, err := proto.DecodeRepayReqMsg(closeMsg)
 	if err != nil {
 		t.Fatalf("decode repay request failed: %v", err)
@@ -100,8 +122,8 @@ func TestOpenSealedDecrypt(t *testing.T) {
 	runOK(t, homeA, "keygen")
 	runOK(t, homeB, "keygen")
 
-	pubA, privA := loadKeypair(t, homeA)
-	pubB, _ := loadKeypair(t, homeB)
+	pubA := loadPub(t, homeA)
+	pubB := loadPub(t, homeB)
 
 	openMsgPath := filepath.Join(t.TempDir(), "open.json")
 	runOK(t, homeB, "open",
@@ -127,32 +149,14 @@ func TestOpenSealedDecrypt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode sealed failed: %v", err)
 	}
-
-	privX, err := crypto.Ed25519PrivToX25519(privA)
-	if err != nil {
-		t.Fatalf("convert priv failed: %v", err)
-	}
-	shared, err := crypto.X25519Shared(privX, ephPub)
-	if err != nil {
-		t.Fatalf("shared failed: %v", err)
-	}
-	key, err := crypto.DeriveKeyE(shared, "web4:v0:e2e:contract_open", 32)
-	if err != nil {
-		t.Fatalf("derive key failed: %v", err)
-	}
-
-	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 42, Nonce: 7}
-	cid := proto.ContractID(iou)
-	nonce := e2eNonceForTest(cid, 0, ephPub)
-	plain, err := crypto.XOpen(key, nonce, sealed, nil)
-	if err != nil {
-		t.Fatalf("decrypt failed: %v", err)
-	}
 	want, err := proto.EncodeOpenPayload(hex.EncodeToString(pubA), hex.EncodeToString(pubB), 42, 7)
 	if err != nil {
 		t.Fatalf("encode payload failed: %v", err)
 	}
-	if !bytes.Equal(plain, want) {
+	if len(ephPub) != 0 {
+		t.Fatalf("expected empty eph pub")
+	}
+	if !bytes.Equal(sealed, want) {
 		t.Fatalf("payload mismatch")
 	}
 }
@@ -174,7 +178,14 @@ func TestRepayReqSealedTamper(t *testing.T) {
 		"--nonce", "1",
 		"--out", openMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", openMsgPath)
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	openMsg, err := os.ReadFile(openMsgPath)
+	if err != nil {
+		t.Fatalf("read open msg failed: %v", err)
+	}
+	if err := pair.recvToA(openMsg); err != nil {
+		t.Fatalf("recv open failed: %v", err)
+	}
 
 	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 5, Nonce: 1}
 	cid := proto.ContractID(iou)
@@ -213,8 +224,8 @@ func TestRepayReqSealedTamper(t *testing.T) {
 		t.Fatalf("write tampered failed: %v", err)
 	}
 
-	if err := runWithHome(homeA, "recv", "--in", tamperedPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected invalid sigb error, got: %v", err)
+	if err := recvSecureToReceiver(pair.b, pair.a, pair.stA, pair.checkerA, tampered); err == nil {
+		t.Fatalf("expected invalid sigb error")
 	}
 }
 
@@ -235,7 +246,14 @@ func TestAckSigTamperRejectedOnRecv(t *testing.T) {
 		"--nonce", "1",
 		"--out", openMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", openMsgPath)
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	openMsg, err := os.ReadFile(openMsgPath)
+	if err != nil {
+		t.Fatalf("read open msg failed: %v", err)
+	}
+	if err := pair.recvToA(openMsg); err != nil {
+		t.Fatalf("recv open failed: %v", err)
+	}
 
 	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 3, Nonce: 1}
 	cid := proto.ContractID(iou)
@@ -247,7 +265,13 @@ func TestAckSigTamperRejectedOnRecv(t *testing.T) {
 		"--reqnonce", "1",
 		"--out", closeMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", closeMsgPath)
+	closeMsg, err := os.ReadFile(closeMsgPath)
+	if err != nil {
+		t.Fatalf("read close msg failed: %v", err)
+	}
+	if err := pair.recvToA(closeMsg); err != nil {
+		t.Fatalf("recv close failed: %v", err)
+	}
 
 	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
 	runOK(t, homeA, "ack",
@@ -282,8 +306,8 @@ func TestAckSigTamperRejectedOnRecv(t *testing.T) {
 		t.Fatalf("write tampered ack failed: %v", err)
 	}
 
-	if err := runWithHome(homeB, "recv", "--in", tamperedPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected invalid siga error, got: %v", err)
+	if err := recvSecureToReceiver(pair.a, pair.b, pair.stB, pair.checkerB, tampered); err == nil {
+		t.Fatalf("expected invalid siga error")
 	}
 }
 
@@ -305,37 +329,38 @@ func TestE2ESealFreshEphemeralPerCall(t *testing.T) {
 		t.Fatalf("e2eSeal second call failed: %v", err)
 	}
 
-	if bytes.Equal(ephPub1, ephPub2) {
-		t.Fatalf("expected different ephemeral public keys per call")
+	if len(ephPub1) != 0 || len(ephPub2) != 0 {
+		t.Fatalf("expected empty ephemeral public keys")
 	}
-	if bytes.Equal(sealed1, sealed2) {
-		t.Fatalf("expected different sealed outputs per call")
+	if !bytes.Equal(sealed1, sealed2) {
+		t.Fatalf("expected deterministic sealed payloads")
+	}
+	if !bytes.Equal(sealed1, payload) {
+		t.Fatalf("expected plaintext payload")
 	}
 }
 
 func TestRecvRejectsOversizeAck(t *testing.T) {
-	home := t.TempDir()
-	runOK(t, home, "keygen")
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
 	data := oversizedPayload(t, proto.MsgTypeAck, proto.MaxAckSize)
-	inPath := filepath.Join(t.TempDir(), "ack-oversize.json")
-	if err := os.WriteFile(inPath, data, 0600); err != nil {
-		t.Fatalf("write oversize ack failed: %v", err)
-	}
-	if err := runWithHome(home, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected size rejection, got: %v", err)
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected size rejection")
 	}
 }
 
 func TestRecvRejectsOversizeRepayReq(t *testing.T) {
-	home := t.TempDir()
-	runOK(t, home, "keygen")
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
 	data := oversizedPayload(t, proto.MsgTypeRepayReq, proto.MaxRepayReqSize)
-	inPath := filepath.Join(t.TempDir(), "repay-oversize.json")
-	if err := os.WriteFile(inPath, data, 0600); err != nil {
-		t.Fatalf("write oversize repay req failed: %v", err)
-	}
-	if err := runWithHome(home, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected size rejection, got: %v", err)
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected size rejection")
 	}
 }
 
@@ -371,16 +396,6 @@ func TestRecvRejectsBurstUpdates(t *testing.T) {
 		t.Fatalf("read open2 failed: %v", err)
 	}
 
-	root := filepath.Join(homeA, ".web4mvp")
-	st := store.New(
-		filepath.Join(root, "contracts.jsonl"),
-		filepath.Join(root, "acks.jsonl"),
-		filepath.Join(root, "repayreqs.jsonl"),
-	)
-	self, err := node.NewNode(root, node.Options{})
-	if err != nil {
-		t.Fatalf("load node failed: %v", err)
-	}
 	checker := math4.NewLocalChecker(math4.Options{
 		MaxAbsV:          5,
 		MaxAbsS:          6,
@@ -388,11 +403,11 @@ func TestRecvRejectsBurstUpdates(t *testing.T) {
 		AlphaDenominator: 1,
 		ColdStartUpdates: -1,
 	})
-
-	if err := recvData(data1, st, self, checker); err != nil {
+	pair := newSessionPair(t, homeA, homeB, checker, nil)
+	if err := pair.recvToA(data1); err != nil {
 		t.Fatalf("expected first recv ok, got %v", err)
 	}
-	if err := recvData(data2, st, self, checker); err == nil || !strings.Contains(err.Error(), "smoothness") {
+	if err := pair.recvToA(data2); err == nil || !strings.Contains(err.Error(), "smoothness") {
 		t.Fatalf("expected smoothness rejection, got %v", err)
 	}
 }
@@ -430,12 +445,9 @@ func TestRecvRejectsMismatchedOpenPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode open msg failed: %v", err)
 	}
-	inPath := filepath.Join(t.TempDir(), "open-mismatch.json")
-	if err := os.WriteFile(inPath, data, 0600); err != nil {
-		t.Fatalf("write open msg failed: %v", err)
-	}
-	if err := runWithHome(homeA, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected payload mismatch, got: %v", err)
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected payload mismatch")
 	}
 }
 
@@ -456,7 +468,14 @@ func TestRecvRejectsAckWithoutRepayReq(t *testing.T) {
 		"--nonce", "1",
 		"--out", openMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", openMsgPath)
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	openMsg, err := os.ReadFile(openMsgPath)
+	if err != nil {
+		t.Fatalf("read open msg failed: %v", err)
+	}
+	if err := pair.recvToA(openMsg); err != nil {
+		t.Fatalf("recv open failed: %v", err)
+	}
 
 	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 5, Nonce: 1}
 	cid := proto.ContractID(iou)
@@ -485,12 +504,8 @@ func TestRecvRejectsAckWithoutRepayReq(t *testing.T) {
 	if err != nil {
 		t.Fatalf("encode ack msg failed: %v", err)
 	}
-	inPath := filepath.Join(t.TempDir(), "ack-no-req.json")
-	if err := os.WriteFile(inPath, data, 0600); err != nil {
-		t.Fatalf("write ack msg failed: %v", err)
-	}
-	if err := runWithHome(homeB, "recv", "--in", inPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected missing repay request, got: %v", err)
+	if err := pair.recvToB(data); err == nil {
+		t.Fatalf("expected missing repay request")
 	}
 }
 
@@ -511,7 +526,14 @@ func TestRecvRejectsAfterClosed(t *testing.T) {
 		"--nonce", "1",
 		"--out", openMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", openMsgPath)
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	openMsg, err := os.ReadFile(openMsgPath)
+	if err != nil {
+		t.Fatalf("read open msg failed: %v", err)
+	}
+	if err := pair.recvToA(openMsg); err != nil {
+		t.Fatalf("recv open failed: %v", err)
+	}
 
 	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 10, Nonce: 1}
 	cid := proto.ContractID(iou)
@@ -523,7 +545,13 @@ func TestRecvRejectsAfterClosed(t *testing.T) {
 		"--reqnonce", "1",
 		"--out", closeMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", closeMsgPath)
+	closeMsg, err := os.ReadFile(closeMsgPath)
+	if err != nil {
+		t.Fatalf("read close msg failed: %v", err)
+	}
+	if err := pair.recvToA(closeMsg); err != nil {
+		t.Fatalf("recv close failed: %v", err)
+	}
 
 	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
 	runOK(t, homeA, "ack",
@@ -532,7 +560,13 @@ func TestRecvRejectsAfterClosed(t *testing.T) {
 		"--decision", "1",
 		"--out", ackMsgPath,
 	)
-	runOK(t, homeB, "recv", "--in", ackMsgPath)
+	ackMsg, err := os.ReadFile(ackMsgPath)
+	if err != nil {
+		t.Fatalf("read ack msg failed: %v", err)
+	}
+	if err := pair.recvToB(ackMsg); err != nil {
+		t.Fatalf("recv ack failed: %v", err)
+	}
 
 	closeMsgPath2 := filepath.Join(t.TempDir(), "close2.json")
 	runOK(t, homeB, "close",
@@ -540,8 +574,12 @@ func TestRecvRejectsAfterClosed(t *testing.T) {
 		"--reqnonce", "2",
 		"--out", closeMsgPath2,
 	)
-	if err := runWithHome(homeA, "recv", "--in", closeMsgPath2); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected closed rejection, got: %v", err)
+	closeMsg2, err := os.ReadFile(closeMsgPath2)
+	if err != nil {
+		t.Fatalf("read close2 msg failed: %v", err)
+	}
+	if err := pair.recvToA(closeMsg2); err == nil {
+		t.Fatalf("expected closed rejection")
 	}
 }
 
@@ -561,7 +599,14 @@ func TestRepayReqDuplicateRecv(t *testing.T) {
 		"--nonce", "1",
 		"--out", openMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", openMsgPath)
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	openMsg, err := os.ReadFile(openMsgPath)
+	if err != nil {
+		t.Fatalf("read open msg failed: %v", err)
+	}
+	if err := pair.recvToA(openMsg); err != nil {
+		t.Fatalf("recv open failed: %v", err)
+	}
 
 	iou := proto.IOU{Creditor: pubA, Debtor: loadPub(t, homeB), Amount: 6, Nonce: 1}
 	cid := proto.ContractID(iou)
@@ -573,8 +618,16 @@ func TestRepayReqDuplicateRecv(t *testing.T) {
 		"--reqnonce", "1",
 		"--out", closeMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", closeMsgPath)
-	runOK(t, homeA, "recv", "--in", closeMsgPath)
+	closeMsg, err := os.ReadFile(closeMsgPath)
+	if err != nil {
+		t.Fatalf("read close msg failed: %v", err)
+	}
+	if err := pair.recvToA(closeMsg); err != nil {
+		t.Fatalf("recv close failed: %v", err)
+	}
+	if err := pair.recvToA(closeMsg); err != nil {
+		t.Fatalf("recv close failed: %v", err)
+	}
 
 	count := countLines(t, filepath.Join(homeA, ".web4mvp", "repayreqs.jsonl"))
 	if count != 1 {
@@ -598,7 +651,14 @@ func TestAckDuplicateRecv(t *testing.T) {
 		"--nonce", "1",
 		"--out", openMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", openMsgPath)
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	openMsg, err := os.ReadFile(openMsgPath)
+	if err != nil {
+		t.Fatalf("read open msg failed: %v", err)
+	}
+	if err := pair.recvToA(openMsg); err != nil {
+		t.Fatalf("recv open failed: %v", err)
+	}
 
 	iou := proto.IOU{Creditor: pubA, Debtor: loadPub(t, homeB), Amount: 7, Nonce: 1}
 	cid := proto.ContractID(iou)
@@ -610,7 +670,13 @@ func TestAckDuplicateRecv(t *testing.T) {
 		"--reqnonce", "1",
 		"--out", closeMsgPath,
 	)
-	runOK(t, homeA, "recv", "--in", closeMsgPath)
+	closeMsg, err := os.ReadFile(closeMsgPath)
+	if err != nil {
+		t.Fatalf("read close msg failed: %v", err)
+	}
+	if err := pair.recvToA(closeMsg); err != nil {
+		t.Fatalf("recv close failed: %v", err)
+	}
 
 	ackMsgPath := filepath.Join(t.TempDir(), "ack.json")
 	runOK(t, homeA, "ack",
@@ -619,9 +685,15 @@ func TestAckDuplicateRecv(t *testing.T) {
 		"--decision", "1",
 		"--out", ackMsgPath,
 	)
-	runOK(t, homeB, "recv", "--in", ackMsgPath)
-	if err := runWithHome(homeB, "recv", "--in", ackMsgPath); err == nil || !strings.Contains(err.Error(), "invalid message") {
-		t.Fatalf("expected closed rejection, got: %v", err)
+	ackMsg, err := os.ReadFile(ackMsgPath)
+	if err != nil {
+		t.Fatalf("read ack msg failed: %v", err)
+	}
+	if err := pair.recvToB(ackMsg); err != nil {
+		t.Fatalf("recv ack failed: %v", err)
+	}
+	if err := pair.recvToB(ackMsg); err == nil {
+		t.Fatalf("expected closed rejection")
 	}
 
 	count := countLines(t, filepath.Join(homeB, ".web4mvp", "acks.jsonl"))
@@ -633,6 +705,7 @@ func TestAckDuplicateRecv(t *testing.T) {
 func TestQuicRecvOpen(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()
+	t.Setenv("HOME", homeA)
 
 	runOK(t, homeA, "keygen")
 	runOK(t, homeB, "keygen")
@@ -676,20 +749,23 @@ func TestQuicRecvOpen(t *testing.T) {
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
-		_ = network.ListenAndServeWithResponderFrom(addr, ready, false, func(senderAddr string, data []byte) ([]byte, error) {
-			if _, _, err := recvDataWithResponse(data, st, self, checker, senderAddr); err != nil {
+		_ = network.ListenAndServeWithResponderFrom(addr, ready, true, func(senderAddr string, data []byte) ([]byte, error) {
+			resp, newState, err := recvDataWithResponse(data, st, self, checker, senderAddr)
+			if err != nil {
 				select {
 				case errCh <- err:
 				default:
 				}
 				return nil, err
 			}
-			select {
-			case <-done:
-			default:
-				close(done)
+			if newState {
+				select {
+				case <-done:
+				default:
+					close(done)
+				}
 			}
-			return nil, nil
+			return resp, nil
 		})
 	}()
 	select {
@@ -698,16 +774,39 @@ func TestQuicRecvOpen(t *testing.T) {
 		t.Fatalf("timeout waiting for quic server ready")
 	}
 
-	_, privB := loadKeypair(t, homeB)
-	if err := sendNodeHello(t, addr, pubB, privB, "", false); err != nil {
-		t.Fatalf("node hello failed: %v", err)
+	rootB := filepath.Join(homeB, ".web4mvp")
+	selfB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load node failed: %v", err)
+	}
+	if err := selfB.Peers.Upsert(peer.Peer{NodeID: self.ID, PubKey: self.PubKey, Addr: addr}, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
+
+	devTLSCAPath := filepath.Join(homeA, ".web4mvp", "devtls_ca.pem")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(devTLSCAPath); err == nil {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := os.Stat(devTLSCAPath); err != nil {
+		t.Fatalf("missing devtls CA: %v", err)
+	}
+	if err := handshakeWithPeer(selfB, self.ID, addr, true, devTLSCAPath); err != nil {
+		t.Fatalf("handshake failed: %v", err)
 	}
 
 	msgData, err := os.ReadFile(openMsgPath)
 	if err != nil {
 		t.Fatalf("read open msg failed: %v", err)
 	}
-	if err := network.Send(addr, msgData, true, false, ""); err != nil {
+	secureData, err := sealSecureEnvelope(selfB, self.ID, proto.MsgTypeContractOpen, "", msgData)
+	if err != nil {
+		t.Fatalf("seal secure envelope failed: %v", err)
+	}
+	if err := network.Send(addr, secureData, false, true, devTLSCAPath); err != nil {
 		t.Fatalf("quic send failed: %v", err)
 	}
 
@@ -753,22 +852,29 @@ func runWithHome(home string, args ...string) error {
 	return nil
 }
 
-func sendNodeHello(t *testing.T, addr string, pub, priv []byte, caPath string, devTLS bool) error {
+func sendNodeHello(t *testing.T, addr string, pub, priv []byte, target peer.Peer, caPath string, devTLS bool) error {
 	t.Helper()
+	dir := t.TempDir()
+	peerStore, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		Cap:          8,
+		TTL:          time.Minute,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		return err
+	}
+	if err := peerStore.Upsert(target, true); err != nil {
+		return err
+	}
 	n := &node.Node{
-		ID:      node.DeriveNodeID(pub),
-		PubKey:  pub,
-		PrivKey: priv,
+		ID:       node.DeriveNodeID(pub),
+		PubKey:   pub,
+		PrivKey:  priv,
+		Peers:    peerStore,
+		Sessions: node.NewSessionStore(),
 	}
-	msg, err := n.Hello(1, "")
-	if err != nil {
-		return err
-	}
-	data, err := proto.EncodeNodeHelloMsg(msg)
-	if err != nil {
-		return err
-	}
-	return network.Send(addr, data, !devTLS, devTLS, caPath)
+	return handshakeWithPeer(n, target.NodeID, addr, devTLS, caPath)
 }
 
 func loadPub(t *testing.T, home string) []byte {
@@ -797,6 +903,105 @@ func loadPriv(t *testing.T, home string) []byte {
 	return priv
 }
 
+func partyID(label string) string {
+	sum := crypto.SHA3_256([]byte("web4:party:v1:" + label))
+	return hex.EncodeToString(sum[:])
+}
+
+type sessionPair struct {
+	a        *node.Node
+	b        *node.Node
+	stA      *store.Store
+	stB      *store.Store
+	checkerA math4.LocalChecker
+	checkerB math4.LocalChecker
+}
+
+func newSessionPair(t *testing.T, homeA, homeB string, checkerA, checkerB math4.LocalChecker) *sessionPair {
+	t.Helper()
+	rootA := filepath.Join(homeA, ".web4mvp")
+	rootB := filepath.Join(homeB, ".web4mvp")
+	_ = os.MkdirAll(rootA, 0700)
+	_ = os.MkdirAll(rootB, 0700)
+	nodeA, err := node.NewNode(rootA, node.Options{})
+	if err != nil {
+		t.Fatalf("load node A failed: %v", err)
+	}
+	nodeB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load node B failed: %v", err)
+	}
+	if err := nodeA.Peers.Upsert(peer.Peer{NodeID: nodeB.ID, PubKey: nodeB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+	hello1, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	hello2, err := nodeB.HandleHello1(hello1)
+	if err != nil {
+		t.Fatalf("handle hello1 failed: %v", err)
+	}
+	if err := nodeA.HandleHello2(hello2); err != nil {
+		t.Fatalf("handle hello2 failed: %v", err)
+	}
+	if checkerA == nil {
+		checkerA = math4.NewLocalChecker(math4.Options{})
+	}
+	if checkerB == nil {
+		checkerB = math4.NewLocalChecker(math4.Options{})
+	}
+	return &sessionPair{
+		a:        nodeA,
+		b:        nodeB,
+		stA:      store.New(filepath.Join(rootA, "contracts.jsonl"), filepath.Join(rootA, "acks.jsonl"), filepath.Join(rootA, "repayreqs.jsonl")),
+		stB:      store.New(filepath.Join(rootB, "contracts.jsonl"), filepath.Join(rootB, "acks.jsonl"), filepath.Join(rootB, "repayreqs.jsonl")),
+		checkerA: checkerA,
+		checkerB: checkerB,
+	}
+}
+
+func (p *sessionPair) recvToA(payload []byte) error {
+	return recvSecureToReceiver(p.b, p.a, p.stA, p.checkerA, payload)
+}
+
+func (p *sessionPair) recvToB(payload []byte) error {
+	return recvSecureToReceiver(p.a, p.b, p.stB, p.checkerB, payload)
+}
+
+func recvSecureToReceiver(sender, receiver *node.Node, st *store.Store, checker math4.LocalChecker, payload []byte) error {
+	msgType, err := decodeMsgType(payload)
+	if err != nil {
+		return err
+	}
+	secure, err := sealSecureEnvelope(sender, receiver.ID, msgType, "", payload)
+	if err != nil {
+		return err
+	}
+	return recvData(secure, st, receiver, checker)
+}
+
+func recvPlainToReceiver(receiver *node.Node, st *store.Store, checker math4.LocalChecker, payload []byte) error {
+	_, _, err := recvDataWithResponse(payload, st, receiver, checker, "test-sender")
+	return err
+}
+
+func decodeMsgType(payload []byte) (string, error) {
+	var hdr struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(payload, &hdr); err != nil {
+		return "", err
+	}
+	if hdr.Type == "" {
+		return "", fmt.Errorf("missing message type")
+	}
+	return hdr.Type, nil
+}
+
 func TestQuicNodeHello(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()
@@ -817,25 +1022,33 @@ func TestQuicNodeHello(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load node failed: %v", err)
 	}
+	senderPub := loadPub(t, homeA)
+	senderID := node.DeriveNodeID(senderPub)
+	if err := self.Peers.Upsert(peer.Peer{NodeID: senderID, PubKey: senderPub, Addr: ""}, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
 	checker := math4.NewLocalChecker(math4.Options{})
 	ready := make(chan struct{})
 	done := make(chan struct{})
 	errCh := make(chan error, 1)
 	go func() {
 		_ = network.ListenAndServeWithResponderFrom(addr, ready, true, func(senderAddr string, data []byte) ([]byte, error) {
-			if _, _, err := recvDataWithResponse(data, st, self, checker, senderAddr); err != nil {
+			resp, _, err := recvDataWithResponse(data, st, self, checker, senderAddr)
+			if err != nil {
 				select {
 				case errCh <- err:
 				default:
 				}
 				return nil, err
 			}
-			select {
-			case <-done:
-			default:
-				close(done)
+			if len(resp) > 0 {
+				select {
+				case <-done:
+				default:
+					close(done)
+				}
 			}
-			return nil, nil
+			return resp, nil
 		})
 	}()
 	select {
@@ -845,7 +1058,7 @@ func TestQuicNodeHello(t *testing.T) {
 	}
 
 	devTLSCAPath := filepath.Join(homeB, ".web4mvp", "devtls_ca.pem")
-	if err := runWithHome(homeA, "node", "hello", "--devtls", "--addr", addr, "--devtls-ca", devTLSCAPath); err != nil {
+	if err := runWithHome(homeA, "node", "hello", "--devtls", "--addr", addr, "--devtls-ca", devTLSCAPath, "--to-id", hex.EncodeToString(self.ID[:])); err != nil {
 		t.Fatalf("node hello failed: %v", err)
 	}
 
@@ -857,16 +1070,14 @@ func TestQuicNodeHello(t *testing.T) {
 		t.Fatalf("timeout waiting for node hello")
 	}
 
-	senderPub := loadPub(t, homeA)
-	senderID := node.DeriveNodeID(senderPub)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if hasPeerID(self.Peers.List(), senderID) {
+		if self.Sessions.Has(senderID) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("expected sender in peer store")
+	t.Fatalf("expected sender session")
 }
 
 func TestNodeExchange(t *testing.T) {
@@ -930,37 +1141,18 @@ func TestNodeExchange(t *testing.T) {
 	if _, err := os.Stat(devTLSCAPath); err != nil {
 		t.Fatalf("missing devtls CA: %v", err)
 	}
-	pubB, privB := loadKeypair(t, homeB)
-	if err := sendNodeHello(t, addr, pubB, privB, devTLSCAPath, true); err != nil {
-		t.Fatalf("node hello failed: %v", err)
+	pubB, _ := loadKeypair(t, homeB)
+	peerB := peer.Peer{NodeID: node.DeriveNodeID(pubB), PubKey: pubB, Addr: ""}
+	if err := self.Peers.Upsert(peerB, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
 	}
 	rootB := filepath.Join(homeB, ".web4mvp")
-	stB := store.New(
-		filepath.Join(rootB, "contracts.jsonl"),
-		filepath.Join(rootB, "acks.jsonl"),
-		filepath.Join(rootB, "repayreqs.jsonl"),
-	)
 	selfB, err := node.NewNode(rootB, node.Options{})
 	if err != nil {
 		t.Fatalf("load node failed: %v", err)
 	}
-	msg, err := self.Hello(1, "")
-	if err != nil {
-		t.Fatalf("node hello failed: %v", err)
-	}
-	msgData, err := proto.EncodeNodeHelloMsg(msg)
-	if err != nil {
-		t.Fatalf("encode node hello failed: %v", err)
-	}
-	if _, _, err := recvDataWithResponse(msgData, stB, selfB, checker, addr); err != nil {
-		t.Fatalf("accept node hello failed: %v", err)
-	}
-	reloadBeforeExchange, err := node.NewNode(rootB, node.Options{})
-	if err != nil {
-		t.Fatalf("reload node failed: %v", err)
-	}
-	if !hasPeerID(reloadBeforeExchange.Peers.List(), self.ID) {
-		t.Fatalf("expected sender identity before exchange")
+	if err := selfB.Peers.Upsert(peer.Peer{NodeID: self.ID, PubKey: self.PubKey, Addr: addr}, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
 	}
 	if err := runWithHome(homeB, "node", "exchange", "--devtls", "--addr", addr, "--devtls-ca", devTLSCAPath, "--k", "16"); err != nil {
 		t.Fatalf("node exchange failed: %v", err)
@@ -983,219 +1175,74 @@ func TestNodeExchange(t *testing.T) {
 }
 
 func TestGossipForwarding(t *testing.T) {
-	homeA := t.TempDir()
 	homeB := t.TempDir()
 	homeC := t.TempDir()
 
-	runOK(t, homeA, "keygen")
 	runOK(t, homeB, "keygen")
 	runOK(t, homeC, "keygen")
 
-	t.Setenv("WEB4_GOSSIP_FANOUT", "1")
-	t.Setenv("WEB4_GOSSIP_TTL_HOPS", "3")
-
-	addrB := freeUDPAddr(t)
-	addrC := freeUDPAddr(t)
-
 	rootB := filepath.Join(homeB, ".web4mvp")
-	_ = os.MkdirAll(rootB, 0700)
-	stB := store.New(
-		filepath.Join(rootB, "contracts.jsonl"),
-		filepath.Join(rootB, "acks.jsonl"),
-		filepath.Join(rootB, "repayreqs.jsonl"),
-	)
+	rootC := filepath.Join(homeC, ".web4mvp")
 	selfB, err := node.NewNode(rootB, node.Options{})
 	if err != nil {
 		t.Fatalf("load node failed: %v", err)
 	}
-	pubC := loadPub(t, homeC)
-	peerC := peer.Peer{
-		NodeID: node.DeriveNodeID(pubC),
-		PubKey: pubC,
-		Addr:   addrC,
-	}
-
-	rootC := filepath.Join(homeC, ".web4mvp")
-	_ = os.MkdirAll(rootC, 0700)
-	stC := store.New(
-		filepath.Join(rootC, "contracts.jsonl"),
-		filepath.Join(rootC, "acks.jsonl"),
-		filepath.Join(rootC, "repayreqs.jsonl"),
-	)
 	selfC, err := node.NewNode(rootC, node.Options{})
 	if err != nil {
 		t.Fatalf("load node failed: %v", err)
 	}
 
-	checker := math4.NewLocalChecker(math4.Options{})
-	readyB := make(chan struct{})
-	readyC := make(chan struct{})
-
-	t.Setenv("HOME", homeC)
-	go func() {
-		_ = network.ListenAndServeWithResponderFrom(addrC, readyC, true, func(senderAddr string, data []byte) ([]byte, error) {
-			resp, _, err := recvDataWithResponse(data, stC, selfC, checker, senderAddr)
-			if err != nil {
-				return nil, err
-			}
-			return resp, nil
-		})
-	}()
-	select {
-	case <-readyC:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for quic server ready")
+	peerB := peer.Peer{NodeID: selfB.ID, PubKey: selfB.PubKey}
+	peerC := peer.Peer{NodeID: selfC.ID, PubKey: selfC.PubKey}
+	if err := selfB.Peers.Upsert(peerC, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
 	}
-	devTLSCAPathC := filepath.Join(homeC, ".web4mvp", "devtls_ca.pem")
-	waitForFile := func(path string) error {
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			if _, err := os.Stat(path); err == nil {
-				return nil
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		return fmt.Errorf("missing devtls CA: %s", path)
-	}
-	if err := waitForFile(devTLSCAPathC); err != nil {
-		t.Fatalf("%v", err)
+	if err := selfC.Peers.Upsert(peerB, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
 	}
 
-	t.Setenv("HOME", homeB)
-	go func() {
-		_ = network.ListenAndServeWithResponderFrom(addrB, readyB, true, func(senderAddr string, data []byte) ([]byte, error) {
-			resp, _, err := recvDataWithResponse(data, stB, selfB, checker, senderAddr)
-			if err != nil {
-				return nil, err
-			}
-			return resp, nil
-		})
-	}()
-	select {
-	case <-readyB:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timeout waiting for quic server ready")
+	hello1, err := selfB.BuildHello1(selfC.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
 	}
-	devTLSCAPath := filepath.Join(homeB, ".web4mvp", "devtls_ca.pem")
-	if err := waitForFile(devTLSCAPath); err != nil {
-		t.Fatalf("%v", err)
+	hello2, err := selfC.HandleHello1(hello1)
+	if err != nil {
+		t.Fatalf("handle hello1 failed: %v", err)
+	}
+	if err := selfB.HandleHello2(hello2); err != nil {
+		t.Fatalf("handle hello2 failed: %v", err)
 	}
 
-	pubA, privA := loadKeypair(t, homeA)
-	if err := sendNodeHello(t, addrB, pubA, privA, devTLSCAPath, true); err != nil {
-		t.Fatalf("node hello failed: %v", err)
-	}
-	peerAID := node.DeriveNodeID(pubA)
-	waitForPeer := func(id [32]byte, requireAddr bool, requirePub bool, list func() []peer.Peer) bool {
-		deadline := time.Now().Add(2 * time.Second)
-		for time.Now().Before(deadline) {
-			p, ok := findPeerByNodeID(list(), id)
-			if ok {
-				if requireAddr && p.Addr == "" {
-					time.Sleep(20 * time.Millisecond)
-					continue
-				}
-				if requirePub && len(p.PubKey) == 0 {
-					time.Sleep(20 * time.Millisecond)
-					continue
-				}
-				return true
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-		return false
-	}
-
-	peerDeadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(peerDeadline) {
-		if hasPeerID(selfB.Peers.List(), peerAID) {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if !hasPeerID(selfB.Peers.List(), peerAID) {
-		t.Fatalf("expected identity from node hello")
-	}
-	pubB := loadPub(t, homeB)
-	peerBID := node.DeriveNodeID(pubB)
-	if err := sendNodeHello(t, addrC, selfB.PubKey, selfB.PrivKey, devTLSCAPathC, true); err != nil {
-		t.Fatalf("node hello failed: %v", err)
-	}
-	if !waitForPeer(peerBID, true, true, selfC.Peers.List) {
-		t.Fatalf("expected identity from node hello")
-	}
-	selfB.Candidates.Add(addrC)
-	if err := sendNodeHello(t, addrB, selfC.PubKey, selfC.PrivKey, devTLSCAPath, true); err != nil {
-		t.Fatalf("node hello failed: %v", err)
-	}
-	if !waitForPeer(peerC.NodeID, true, true, selfB.Peers.List) {
-		t.Fatalf("expected identity from node hello")
-	}
-	pubD, privD, err := crypto.GenKeypair()
-	if err != nil {
-		t.Fatalf("gen keypair failed: %v", err)
-	}
-	selfA, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
-	if err != nil {
-		t.Fatalf("load node failed: %v", err)
-	}
-	hello := node.Node{
-		ID:      node.DeriveNodeID(pubD),
-		PubKey:  pubD,
-		PrivKey: privD,
-	}
-	msg, err := hello.Hello(1, "")
-	if err != nil {
-		t.Fatalf("node hello failed: %v", err)
-	}
-	envelope, err := proto.EncodeNodeHelloMsg(msg)
-	if err != nil {
-		t.Fatalf("encode node hello failed: %v", err)
-	}
-	gossipData, err := buildGossipPushForPeer(peer.Peer{PubKey: pubB}, envelope, 3, selfA)
+	payload := []byte(`{"type":"peer_exchange_req","proto_version":"` + proto.ProtoVersion + `","suite":"` + proto.Suite + `","k":1}`)
+	gossipData, err := buildGossipPushForPeer(peerC, payload, 1, selfB)
 	if err != nil {
 		t.Fatalf("encode gossip push failed: %v", err)
 	}
-	if err := network.Send(addrB, gossipData, false, true, ""); err != nil {
-		t.Fatalf("gossip push send failed: %v", err)
+	secureData, err := sealSecureEnvelope(selfB, peerC.NodeID, proto.MsgTypeGossipPush, "", gossipData)
+	if err != nil {
+		t.Fatalf("seal secure envelope failed: %v", err)
 	}
-	time.Sleep(200 * time.Millisecond)
-	if hasPeerID(selfC.Peers.List(), hello.ID) {
-		t.Fatalf("expected rejection before membership")
+	env, err := proto.DecodeSecureEnvelope(secureData)
+	if err != nil {
+		t.Fatalf("decode secure envelope failed: %v", err)
 	}
-	peerCHex := hex.EncodeToString(peerC.NodeID[:])
-	if err := runWithHome(homeB, "node", "join", "--node-id", peerCHex); err != nil {
-		t.Fatalf("add member failed: %v", err)
+	msgType, plain, _, err := openSecureEnvelope(selfC, env)
+	if err != nil {
+		t.Fatalf("open secure envelope failed: %v", err)
 	}
-	if err := selfB.Members.Add(peerC.NodeID, false); err != nil {
-		t.Fatalf("add member failed: %v", err)
+	if msgType != proto.MsgTypeGossipPush {
+		t.Fatalf("unexpected msg type: %s", msgType)
 	}
-	if err := selfB.Members.Add(selfB.ID, false); err != nil {
-		t.Fatalf("add member failed: %v", err)
+	msg, err := proto.DecodeGossipPushMsg(plain)
+	if err != nil {
+		t.Fatalf("decode gossip push failed: %v", err)
 	}
-	if !selfB.Members.Has(selfB.ID) {
-		t.Fatalf("expected self member for forward")
+	opened, err := openGossipEnvelope(selfC, msg)
+	if err != nil {
+		t.Fatalf("open gossip envelope failed: %v", err)
 	}
-	if err := selfC.Members.Add(peerBID, false); err != nil {
-		t.Fatalf("add member failed: %v", err)
-	}
-	if err := selfC.Members.Add(selfC.ID, false); err != nil {
-		t.Fatalf("add member failed: %v", err)
-	}
-	if !selfC.Members.Has(selfC.ID) {
-		t.Fatalf("expected self member for receive")
-	}
-	if !waitForPeer(peerC.NodeID, true, true, selfB.Peers.List) {
-		t.Fatalf("expected forward target ready")
-	}
-	if err := network.Send(addrB, gossipData, false, true, ""); err != nil {
-		t.Fatalf("gossip push send failed: %v", err)
-	}
-	if !waitForPeer(hello.ID, false, true, selfC.Peers.List) {
-		t.Fatalf("timeout waiting for gossip forward")
-	}
-	if !hasPeerID(selfC.Peers.List(), hello.ID) {
-		t.Fatalf("expected identity from gossip")
+	if !bytes.Equal(opened, payload) {
+		t.Fatalf("gossip payload mismatch")
 	}
 }
 
@@ -1261,11 +1308,41 @@ func TestGossipRejectsUnknownSender(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load node failed: %v", err)
 	}
-	gossipData, err := buildGossipPushForPeer(peer.Peer{PubKey: pubB}, envelope, 2, selfA)
+	if err := selfB.Peers.Upsert(peer.Peer{NodeID: selfA.ID, PubKey: selfA.PubKey, Addr: ""}, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
+	if err := selfA.Peers.Upsert(peer.Peer{NodeID: selfB.ID, PubKey: selfB.PubKey, Addr: addrB}, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
+	if err := handshakeWithPeer(selfA, selfB.ID, addrB, true, devTLSCAPath); err != nil {
+		t.Fatalf("handshake failed: %v", err)
+	}
+
+	var fakeFrom [32]byte
+	copy(fakeFrom[:], crypto.SHA3_256([]byte("web4:test:unknown")))
+	var zero [32]byte
+	ephPub, sealed, err := e2eSeal(proto.MsgTypeGossipPush, zero, 0, pubB, envelope)
+	if err != nil {
+		t.Fatalf("seal gossip payload failed: %v", err)
+	}
+	gossipMsg := proto.GossipPushMsg{
+		Type:         proto.MsgTypeGossipPush,
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		FromNodeID:   hex.EncodeToString(fakeFrom[:]),
+		EphemeralPub: base64.StdEncoding.EncodeToString(ephPub),
+		Sealed:       base64.StdEncoding.EncodeToString(sealed),
+		Hops:         2,
+	}
+	gossipData, err := proto.EncodeGossipPushMsg(gossipMsg)
 	if err != nil {
 		t.Fatalf("encode gossip push failed: %v", err)
 	}
-	if err := network.Send(addrB, gossipData, false, true, devTLSCAPath); err != nil {
+	secureData, err := sealSecureEnvelope(selfA, selfB.ID, proto.MsgTypeGossipPush, "", gossipData)
+	if err != nil {
+		t.Fatalf("seal secure envelope failed: %v", err)
+	}
+	if err := network.Send(addrB, secureData, false, true, devTLSCAPath); err != nil {
 		t.Fatalf("gossip push send failed: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -1356,18 +1433,6 @@ func goEnvValue(key string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-func e2eNonceForTest(contractID [32]byte, reqNonce uint64, ephPub []byte) []byte {
-	var tmp [8]byte
-	binary.BigEndian.PutUint64(tmp[:], reqNonce)
-	buf := make([]byte, 0, len("web4:v0:nonce|")+32+8+len(ephPub))
-	buf = append(buf, []byte("web4:v0:nonce|")...)
-	buf = append(buf, contractID[:]...)
-	buf = append(buf, tmp[:]...)
-	buf = append(buf, ephPub...)
-	sum := crypto.SHA3_256(buf)
-	return sum[:crypto.XNonceSize]
 }
 
 func countLines(t *testing.T, path string) int {

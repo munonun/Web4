@@ -2,35 +2,31 @@
 package crypto
 
 import (
+	"crypto"
 	"crypto/ecdh"
-	"crypto/ed25519"
-	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha512"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math/big"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/sha3"
 )
 
 // -----------------------------------------------------------------------------
-// Web4 Crypto Stack v0.0.2
+// Web4 Crypto Stack v0.0.3
 //
 // 목표:
-// - 기존 MVP(main.go) 변경 최소화: GenKeypair/Sign/Verify/SaveKeypair/LoadKeypair 유지
-// - Web4 문서 스택 반영: XChaCha20-Poly1305, SHA-3, HMAC-SHA3
-// - PQC(MV)는 인터페이스로 분리하고, 당장은 ed25519를 "임시 백엔드"로 사용
-//   (즉, MV가 들어갈 자리에 지금은 ed25519가 들어가 있음)
+// - 고정 스위트: RSA-PSS + X25519 + XChaCha20-Poly1305 + SHA3-256
+// - RSA는 서명 전용, X25519는 ephemeral only
+// - HMAC/HKDF 제거, SHA3-256 기반 KDF만 사용
 // -----------------------------------------------------------------------------
 
-// 기존 코드 호환용 (현재는 ed25519 pubkey size)
-const PubLen = ed25519.PublicKeySize
+const RSABits = 4096
 
 const (
 	// XChaCha20-Poly1305 sizes
@@ -38,13 +34,8 @@ const (
 	XNonceSize = chacha20poly1305.NonceSizeX // 24
 )
 
-const (
-	MaxHKDFOutLen = 1 << 20
-	hkdfLabel     = "web4:"
-)
-
 // -----------------------------------------------------------------------------
-// SHA-3 / HMAC-SHA3
+// SHA-3
 // -----------------------------------------------------------------------------
 
 func SHA3_256(msg []byte) []byte {
@@ -52,85 +43,13 @@ func SHA3_256(msg []byte) []byte {
 	return sum[:]
 }
 
-func SHA3_512(msg []byte) []byte {
-	sum := sha3.Sum512(msg)
-	return sum[:]
-}
-
-func HMAC_SHA3_256(key, msg []byte) []byte {
-	mac := hmac.New(sha3.New256, key)
-	_, _ = mac.Write(msg)
-	return mac.Sum(nil)
-}
-
-func HMAC_SHA3_512(key, msg []byte) []byte {
-	mac := hmac.New(sha3.New512, key)
-	_, _ = mac.Write(msg)
-	return mac.Sum(nil)
-}
-
-// -----------------------------------------------------------------------------
-// HKDF-like helpers (HMAC-SHA3-256)
-// -----------------------------------------------------------------------------
-
-func Extract(salt, ikm []byte) ([]byte, error) {
-	if len(ikm) == 0 {
-		return nil, errors.New("empty ikm")
+func KDF(label string, parts ...[]byte) []byte {
+	buf := make([]byte, 0, len(label))
+	buf = append(buf, []byte(label)...)
+	for _, p := range parts {
+		buf = append(buf, p...)
 	}
-	if len(salt) == 0 {
-		salt = make([]byte, 32)
-	}
-	return HMAC_SHA3_256(salt, ikm), nil
-}
-
-func Expand(prk, info []byte, outLen int) ([]byte, error) {
-	if len(prk) == 0 {
-		return nil, errors.New("empty prk")
-	}
-	if outLen <= 0 {
-		return nil, errors.New("invalid outLen")
-	}
-	if outLen > MaxHKDFOutLen {
-		return nil, errors.New("outLen too large")
-	}
-	if len(info) == 0 {
-		return nil, errors.New("empty info")
-	}
-	if !strings.HasPrefix(string(info), hkdfLabel) {
-		return nil, fmt.Errorf("missing domain separation label: %s", hkdfLabel)
-	}
-	hashLen := 32
-	n := (outLen + hashLen - 1) / hashLen
-	if n > 255 {
-		return nil, errors.New("outLen too large for HKDF")
-	}
-	okm := make([]byte, 0, n*hashLen)
-	var t []byte
-	for i := 1; i <= n; i++ {
-		buf := make([]byte, 0, len(t)+len(info)+1)
-		buf = append(buf, t...)
-		buf = append(buf, info...)
-		buf = append(buf, byte(i))
-		t = HMAC_SHA3_256(prk, buf)
-		okm = append(okm, t...)
-	}
-	return okm[:outLen], nil
-}
-
-func DeriveKeyE(ikm []byte, context string, outLen int) ([]byte, error) {
-	prk, err := Extract(nil, ikm)
-	if err != nil {
-		return nil, err
-	}
-	return Expand(prk, []byte(context), outLen)
-}
-
-func DeriveKey(ikm []byte, context string, outLen int) []byte {
-	okm, err := DeriveKeyE(ikm, context, outLen)
-	if err != nil {
-		return nil
-	}
-	return okm
+	return SHA3_256(buf)
 }
 
 // -----------------------------------------------------------------------------
@@ -286,75 +205,7 @@ func DeriveShared(privKey, peerPub []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	prk, err := Extract(nil, shared)
-	if err != nil {
-		return nil, err
-	}
-	okm, err := Expand(prk, []byte("web4:v0:x25519"), XKeySize)
-	if err != nil {
-		return nil, err
-	}
-	return okm, nil
-}
-
-func Ed25519PrivToX25519(privKey []byte) ([]byte, error) {
-	if len(privKey) != ed25519.PrivateKeySize {
-		return nil, errors.New("bad ed25519 private key size")
-	}
-	seed := ed25519.PrivateKey(privKey).Seed()
-	sum := sha512.Sum512(seed)
-	k := make([]byte, 32)
-	copy(k, sum[:32])
-	k[0] &= 248
-	k[31] &= 127
-	k[31] |= 64
-	return k, nil
-}
-
-func Ed25519PubToX25519(pubKey []byte) ([]byte, error) {
-	if len(pubKey) != ed25519.PublicKeySize {
-		return nil, errors.New("bad ed25519 public key size")
-	}
-	y := make([]byte, 32)
-	copy(y, pubKey)
-	y[31] &= 0x7f
-	yInt := leBytesToInt(y)
-	p := fieldP()
-	one := big.NewInt(1)
-	num := new(big.Int).Add(yInt, one)
-	num.Mod(num, p)
-	den := new(big.Int).Sub(one, yInt)
-	den.Mod(den, p)
-	inv := new(big.Int).ModInverse(den, p)
-	if inv == nil {
-		return nil, errors.New("invalid ed25519 public key")
-	}
-	u := new(big.Int).Mul(num, inv)
-	u.Mod(u, p)
-	return intToLEBytes(u, 32), nil
-}
-
-func fieldP() *big.Int {
-	one := big.NewInt(1)
-	p := new(big.Int).Lsh(one, 255)
-	return p.Sub(p, big.NewInt(19))
-}
-
-func leBytesToInt(b []byte) *big.Int {
-	rev := make([]byte, len(b))
-	for i := range b {
-		rev[i] = b[len(b)-1-i]
-	}
-	return new(big.Int).SetBytes(rev)
-}
-
-func intToLEBytes(v *big.Int, size int) []byte {
-	b := v.Bytes()
-	out := make([]byte, size)
-	for i := range b {
-		out[i] = b[len(b)-1-i]
-	}
-	return out
+	return shared, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -371,24 +222,91 @@ type MVVerifier interface {
 }
 
 // -----------------------------------------------------------------------------
-// MVP 호환 API (현재는 ed25519를 임시 "MV"로 사용)
+// MVP 호환 API (현재는 RSA-PSS를 서명 백엔드로 사용)
 // -----------------------------------------------------------------------------
 
 func GenKeypair() ([]byte, []byte, error) {
-	pub, priv, err := ed25519.GenerateKey(rand.Reader)
-	return pub, priv, err
+	priv, err := rsa.GenerateKey(rand.Reader, RSABits)
+	if err != nil {
+		return nil, nil, err
+	}
+	pubDER, err := x509.MarshalPKIXPublicKey(&priv.PublicKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pubDER, privDER, nil
 }
 
-// Sign: 현재는 ed25519 서명.
-// MVP 단계에서는 "msg를 그대로" 서명해도 되지만,
-// Web4 스택 느낌을 살리려면 보통 SHA3_256(msg) 같은 해시-선서명으로 바꾸는 게 좋음.
-// (단, 프로토콜 호환 깨지기 쉬우니 여기서는 그대로 둠)
-func Sign(priv []byte, msg []byte) []byte {
-	return ed25519.Sign(ed25519.PrivateKey(priv), msg)
+func Sign(priv []byte, digest []byte) []byte {
+	sig, err := SignDigest(priv, digest)
+	if err != nil {
+		return nil
+	}
+	return sig
 }
 
-func Verify(pub []byte, msg []byte, sig []byte) bool {
-	return ed25519.Verify(ed25519.PublicKey(pub), msg, sig)
+func SignDigest(priv []byte, digest []byte) ([]byte, error) {
+	if len(digest) != 32 {
+		return nil, errors.New("bad digest size")
+	}
+	key, err := ParseRSAPrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	return rsa.SignPSS(rand.Reader, key, crypto.SHA3_256, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+}
+
+func Verify(pub []byte, digest []byte, sig []byte) bool {
+	return VerifyDigest(pub, digest, sig)
+}
+
+func VerifyDigest(pub []byte, digest []byte, sig []byte) bool {
+	if len(digest) != 32 {
+		return false
+	}
+	key, err := ParseRSAPublicKey(pub)
+	if err != nil {
+		return false
+	}
+	return rsa.VerifyPSS(key, crypto.SHA3_256, digest, sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}) == nil
+}
+
+func ParseRSAPublicKey(pub []byte) (*rsa.PublicKey, error) {
+	key, err := x509.ParsePKIXPublicKey(pub)
+	if err != nil {
+		return nil, err
+	}
+	rsaKey, ok := key.(*rsa.PublicKey)
+	if !ok {
+		return nil, errors.New("not rsa public key")
+	}
+	return rsaKey, nil
+}
+
+func ParseRSAPrivateKey(priv []byte) (*rsa.PrivateKey, error) {
+	key, err := x509.ParsePKCS8PrivateKey(priv)
+	if err != nil {
+		return nil, err
+	}
+	rsaKey, ok := key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("not rsa private key")
+	}
+	return rsaKey, nil
+}
+
+func IsRSAPublicKey(pub []byte) bool {
+	_, err := ParseRSAPublicKey(pub)
+	return err == nil
+}
+
+func IsRSAPrivateKey(priv []byte) bool {
+	_, err := ParseRSAPrivateKey(priv)
+	return err == nil
 }
 
 // -----------------------------------------------------------------------------
