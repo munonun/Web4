@@ -22,9 +22,9 @@ Web4 explores the opposite direction.
 What if we **remove** the global structure entirely,
 and only keep what is mathematically unavoidable?
 
-No shared ledger.  
-No global history.  
-Only local imbalance updates that must cancel out.
+- No shared ledger.
+- No global history.
+- Only local imbalance updates that must cancel out.
 
 ---
 
