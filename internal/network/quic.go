@@ -269,10 +269,20 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 						logInfo("quic handler error: %v", err)
 						return
 					}
-					if len(resp) > 0 {
+					if resp != nil {
+						respType := ""
+						var respHdr struct {
+							Type string `json:"type"`
+						}
+						if err := json.Unmarshal(resp, &respHdr); err == nil && respHdr.Type != "" {
+							respType = respHdr.Type
+						}
 						if err := writeFrameWithTimeout(s, streamRWTimeout, resp); err != nil {
 							logInfo("quic write error: %v", err)
 							return
+						}
+						if respType == proto.MsgTypeHello2 {
+							logInfo("sent hello2")
 						}
 					}
 				}(stream, remoteAddr)

@@ -129,6 +129,7 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 	msg := proto.Hello1Msg{
 		Type:       proto.MsgTypeHello1,
 		FromNodeID: hex.EncodeToString(fromID[:]),
+		FromPub:    hex.EncodeToString(n.PubKey),
 		ToNodeID:   hex.EncodeToString(toID[:]),
 		EA:         hex.EncodeToString(ea),
 		Na:         hex.EncodeToString(na),
@@ -148,23 +149,23 @@ func (n *Node) HandleHello1(m proto.Hello1Msg) (proto.Hello2Msg, error) {
 	if n == nil || n.Sessions == nil || n.Peers == nil {
 		return proto.Hello2Msg{}, errors.New("node unavailable")
 	}
-	fromID, toID, ea, na, sig, err := proto.DecodeHello1Fields(m)
+	fromID, toID, fromPub, ea, na, sig, err := proto.DecodeHello1Fields(m)
 	if err != nil {
 		return proto.Hello2Msg{}, err
 	}
-	if n.Sessions.Has(fromID) {
-		return proto.Hello2Msg{}, errors.New("session already exists")
+	derived := DeriveNodeID(fromPub)
+	if derived != fromID {
+		return proto.Hello2Msg{}, errors.New("hello1 from_id mismatch")
 	}
 	if toID != n.ID {
 		return proto.Hello2Msg{}, errors.New("hello1 to_id mismatch")
 	}
-	peerInfo, ok := findPeerByNodeID(n.Peers.List(), fromID)
-	if !ok || len(peerInfo.PubKey) == 0 {
-		return proto.Hello2Msg{}, errors.New("unknown peer")
-	}
 	sigInput := hello1SigInput(fromID, toID, ea, na)
-	if !crypto.VerifyDigest(peerInfo.PubKey, crypto.SHA3_256(sigInput), sig) {
+	if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
 		return proto.Hello2Msg{}, errors.New("bad hello1 signature")
+	}
+	if err := n.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub, Addr: m.FromAddr}, true); err != nil {
+		return proto.Hello2Msg{}, err
 	}
 	eph, err := crypto.GenerateEphemeral()
 	if err != nil {
@@ -211,6 +212,7 @@ func (n *Node) HandleHello1(m proto.Hello1Msg) (proto.Hello2Msg, error) {
 	return proto.Hello2Msg{
 		Type:       proto.MsgTypeHello2,
 		FromNodeID: hex.EncodeToString(n.ID[:]),
+		FromPub:    hex.EncodeToString(n.PubKey),
 		ToNodeID:   hex.EncodeToString(fromID[:]),
 		EB:         hex.EncodeToString(eb),
 		Nb:         hex.EncodeToString(nb),
@@ -222,25 +224,29 @@ func (n *Node) HandleHello2(m proto.Hello2Msg) error {
 	if n == nil || n.Sessions == nil || n.Peers == nil {
 		return errors.New("node unavailable")
 	}
-	fromID, toID, eb, nb, sig, err := proto.DecodeHello2Fields(m)
+	fromID, toID, fromPub, eb, nb, sig, err := proto.DecodeHello2Fields(m)
 	if err != nil {
 		return err
 	}
+	derived := DeriveNodeID(fromPub)
+	if derived != fromID {
+		return errors.New("hello2 from_id mismatch")
+	}
 	if toID != n.ID {
 		return errors.New("hello2 to_id mismatch")
-	}
-	peerInfo, ok := findPeerByNodeID(n.Peers.List(), fromID)
-	if !ok || len(peerInfo.PubKey) == 0 {
-		return errors.New("unknown peer")
 	}
 	pending, ok := n.Sessions.PopPending(fromID)
 	if !ok || pending == nil || pending.Ephemeral == nil {
 		return errors.New("missing pending handshake")
 	}
 	sigInput := hello2SigInput(n.ID, fromID, pending.EA, eb, pending.Na, nb)
-	if !crypto.VerifyDigest(peerInfo.PubKey, crypto.SHA3_256(sigInput), sig) {
+	if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
 		pending.Ephemeral.Destroy()
 		return errors.New("bad hello2 signature")
+	}
+	if err := n.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub, Addr: m.FromAddr}, true); err != nil {
+		pending.Ephemeral.Destroy()
+		return err
 	}
 	h1Bytes := pending.Hello1Bytes
 	h2Bytes := proto.Hello2Bytes(fromID, toID, eb, nb)
@@ -293,13 +299,4 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
-}
-
-func findPeerByNodeID(peers []peer.Peer, id [32]byte) (peer.Peer, bool) {
-	for _, p := range peers {
-		if p.NodeID == id && len(p.PubKey) > 0 {
-			return p, true
-		}
-	}
-	return peer.Peer{}, false
 }

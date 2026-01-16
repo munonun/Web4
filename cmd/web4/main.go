@@ -2,11 +2,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"container/list"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -212,8 +214,23 @@ func handshakeWithPeer(self *node.Node, peerID [32]byte, addr string, devTLS boo
 	if err != nil {
 		return err
 	}
+	respType := ""
+	if len(respData) > 0 {
+		var respHdr struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(respData, &respHdr); err == nil {
+			respType = respHdr.Type
+		}
+	}
+	if os.Getenv("WEB4_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "handshakeWithPeer got resp type=%s len=%d\n", respType, len(respData))
+	}
 	resp, err := proto.DecodeHello2Msg(respData)
 	if err != nil {
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(os.Stderr, "handshakeWithPeer decode hello2 failed: %v\n", err)
+		}
 		return err
 	}
 	if err := self.HandleHello2(resp); err != nil {
@@ -229,6 +246,16 @@ type recvError struct {
 
 func (e recvError) Error() string {
 	return fmt.Sprintf("%s: %v", e.msg, e.err)
+}
+
+func hello1SigInput(fromID, toID [32]byte, ea, na []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v1")+32+32+len(ea)+len(na))
+	buf = append(buf, []byte("web4:h1:v1")...)
+	buf = append(buf, fromID[:]...)
+	buf = append(buf, toID[:]...)
+	buf = append(buf, ea...)
+	buf = append(buf, na...)
+	return buf
 }
 
 func updateFromParties(a, b []byte, v uint64) (math4.Update, error) {
@@ -307,7 +334,7 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			return nil, false, reject("message too large", err)
 		}
 	}
-	if !wasSecure && hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 {
+	if !wasSecure && hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 && hdr.Type != proto.MsgTypeGossipPush {
 		return nil, false, reject("handshake required", fmt.Errorf("missing secure envelope"))
 	}
 
@@ -316,6 +343,30 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		m, err := proto.DecodeHello1Msg(data)
 		if err != nil {
 			return nil, false, reject("decode hello1 failed", err)
+		}
+		fromID, toID, fromPub, ea, na, sig, err := proto.DecodeHello1Fields(m)
+		if err != nil {
+			return nil, false, reject("decode hello1 failed", err)
+		}
+		if toID != self.ID && senderAddr == "" {
+			derived := node.DeriveNodeID(fromPub)
+			if derived != fromID {
+				return nil, false, reject("invalid hello1", errors.New("hello1 from_id mismatch"))
+			}
+			sigInput := hello1SigInput(fromID, toID, ea, na)
+			if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
+				return nil, false, reject("invalid hello1", errors.New("bad hello1 signature"))
+			}
+			newState := true
+			if existing, ok := findPeerByNodeID(self.Peers.List(), fromID); ok {
+				if m.FromAddr == "" || existing.Addr == m.FromAddr {
+					newState = false
+				}
+			}
+			if err := self.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub, Addr: m.FromAddr}, true); err != nil {
+				return nil, false, reject("invalid hello1", err)
+			}
+			return nil, newState, nil
 		}
 		resp, err := self.HandleHello1(m)
 		if err != nil {
@@ -862,12 +913,7 @@ func forwardGossip(msg proto.GossipPushMsg, envelope []byte, self *node.Node, se
 			continue
 		}
 		gossipDebugf("forward seal ok to node_id=%x addr=%s", p.NodeID[:], p.Addr)
-		secureOut, err := sealSecureEnvelope(self, p.NodeID, proto.MsgTypeGossipPush, "", out)
-		if err != nil {
-			gossipDebugf("gossip forward skip: no session node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
-			continue
-		}
-		if err := network.Send(p.Addr, secureOut, false, true, ""); err != nil {
+		if err := network.Send(p.Addr, out, false, true, ""); err != nil {
 			gossipDebugf("gossip forward failed: node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
 			if os.Getenv("WEB4_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "gossip forward failed: %v\n", err)
@@ -1260,7 +1306,7 @@ func ensureSignedOutgoing(data []byte, self *node.Node) ([]byte, error) {
 }
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: web4 <keygen|open|list|close|ack|recv|quic-listen|quic-send|node|gossip>")
+		fmt.Println("usage: web4 <keygen|open|list|close|ack|recv|quic-listen|quic-send|quic-send-secure|node|gossip>")
 		os.Exit(1)
 	}
 
@@ -1668,6 +1714,95 @@ func main() {
 			die("quic send failed", err)
 		}
 
+	case "quic-send-secure":
+		fs := flag.NewFlagSet("quic-send-secure", flag.ExitOnError)
+		addr := fs.String("addr", "", "server addr (host:port)")
+		inPath := fs.String("in", "", "message file path")
+		toIDHex := fs.String("to-id", "", "recipient node id hex")
+		stdinPaths := fs.Bool("stdin", false, "read message paths from stdin")
+		devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
+		devTLSCA := fs.String("devtls-ca", "", "dev TLS CA PEM path")
+		_ = fs.Parse(os.Args[2:])
+		if *addr == "" {
+			die("missing --addr", fmt.Errorf("address required"))
+		}
+		if *toIDHex == "" {
+			die("missing --to-id", fmt.Errorf("recipient node id required"))
+		}
+		if !*stdinPaths && *inPath == "" {
+			die("missing --in", fmt.Errorf("path required"))
+		}
+		if !*devTLS {
+			dieMsg("dev TLS disabled by default; pass --devtls to enable")
+		}
+		fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
+		self, err := node.NewNode(root, node.Options{})
+		if err != nil {
+			die("load node failed", err)
+		}
+		toBytes, err := hex.DecodeString(*toIDHex)
+		if err != nil || len(toBytes) != 32 {
+			die("invalid --to-id", fmt.Errorf("need 32 bytes hex"))
+		}
+		var toID [32]byte
+		copy(toID[:], toBytes)
+		if err := handshakeWithPeer(self, toID, *addr, *devTLS, *devTLSCA); err != nil {
+			die("handshake failed", err)
+		}
+		sendPath := func(path string) error {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return fmt.Errorf("read message failed: %w", err)
+			}
+			payload := data
+			if framePayload, err := proto.ReadFrameWithTypeCap(bytes.NewReader(data), proto.SoftMaxFrameSize, proto.MaxSizeForType); err == nil {
+				payload = framePayload
+			}
+			payload, err = ensureSignedOutgoing(payload, self)
+			if err != nil {
+				return fmt.Errorf("sign message failed: %w", err)
+			}
+			var hdr struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(payload, &hdr); err != nil || hdr.Type == "" {
+				return fmt.Errorf("missing message type")
+			}
+			if hdr.Type == proto.MsgTypeSecureEnvelope {
+				return fmt.Errorf("unexpected secure envelope")
+			}
+			if err := enforceTypeMax(hdr.Type, len(payload)); err != nil {
+				return err
+			}
+			secureOut, err := sealSecureEnvelope(self, toID, hdr.Type, "", payload)
+			if err != nil {
+				return fmt.Errorf("seal secure envelope failed: %w", err)
+			}
+			if err := network.Send(*addr, secureOut, false, *devTLS, *devTLSCA); err != nil {
+				return fmt.Errorf("quic send failed: %w", err)
+			}
+			return nil
+		}
+		if *stdinPaths {
+			scanner := bufio.NewScanner(os.Stdin)
+			for scanner.Scan() {
+				path := strings.TrimSpace(scanner.Text())
+				if path == "" {
+					continue
+				}
+				if err := sendPath(path); err != nil {
+					die("quic send secure failed", err)
+				}
+			}
+			if err := scanner.Err(); err != nil {
+				die("read stdin failed", err)
+			}
+			return
+		}
+		if err := sendPath(*inPath); err != nil {
+			die("quic send secure failed", err)
+		}
+
 	case "node":
 		if len(os.Args) < 3 {
 			dieMsg("usage: web4 node <id|list|members|join|add|hello|exchange>")
@@ -1748,6 +1883,7 @@ func main() {
 			addr := fs.String("addr", "", "target addr (host:port)")
 			outPath := fs.String("out", "", "write Hello1Msg to file and exit")
 			toIDHex := fs.String("to-id", "", "target node id (hex)")
+			advertiseAddr := fs.String("advertise-addr", "", "advertise addr (host:port)")
 			devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
 			devTLSCA := fs.String("devtls-ca", "", "dev TLS CA PEM path")
 			_ = fs.Parse(os.Args[3:])
@@ -1764,6 +1900,9 @@ func main() {
 			fail := func(msg string, err error) {
 				if os.Getenv("WEB4_DEBUG") == "1" {
 					die(msg, err)
+				}
+				if err != nil {
+					die(invalidMessage, err)
 				}
 				dieMsg(invalidMessage)
 			}
@@ -1794,6 +1933,7 @@ func main() {
 				if err != nil {
 					fail("build hello1 failed", err)
 				}
+				msg.FromAddr = *advertiseAddr
 				data, err := proto.EncodeHello1Msg(msg)
 				if err != nil {
 					fail("encode hello1 failed", err)
@@ -1807,7 +1947,31 @@ func main() {
 				fmt.Println("OK hello1 written")
 				return
 			}
-			if err := handshakeWithPeer(self, toID, *addr, *devTLS, *devTLSCA); err != nil {
+			if *advertiseAddr != "" {
+				msg, err := self.BuildHello1(toID)
+				if err != nil {
+					fail("build hello1 failed", err)
+				}
+				msg.FromAddr = *advertiseAddr
+				data, err := proto.EncodeHello1Msg(msg)
+				if err != nil {
+					fail("encode hello1 failed", err)
+				}
+				if err := enforceTypeMax(proto.MsgTypeHello1, len(data)); err != nil {
+					fail("hello1 too large", err)
+				}
+				respData, err := network.Exchange(*addr, data, false, *devTLS, *devTLSCA)
+				if err != nil {
+					fail("handshake failed", err)
+				}
+				resp, err := proto.DecodeHello2Msg(respData)
+				if err != nil {
+					fail("decode hello2 failed", err)
+				}
+				if err := self.HandleHello2(resp); err != nil {
+					fail("handshake failed", err)
+				}
+			} else if err := handshakeWithPeer(self, toID, *addr, *devTLS, *devTLSCA); err != nil {
 				fail("handshake failed", err)
 			}
 			self.Candidates.Add(*addr)
@@ -1816,6 +1980,7 @@ func main() {
 			fs := flag.NewFlagSet("node exchange", flag.ExitOnError)
 			addr := fs.String("addr", "", "target addr (host:port)")
 			k := fs.Int("k", defaultPeerExchangeK, "max peers to request")
+			toIDHex := fs.String("to-id", "", "target node id (hex)")
 			devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
 			devTLSCA := fs.String("devtls-ca", "", "dev TLS CA PEM path")
 			_ = fs.Parse(os.Args[3:])
@@ -1838,9 +2003,20 @@ func main() {
 			if err != nil {
 				fail("load node failed", err)
 			}
-			p, ok := findPeerByAddr(self.Peers.List(), *addr)
-			if !ok {
-				fail("missing peer", fmt.Errorf("unknown addr"))
+			var p peer.Peer
+			if *toIDHex != "" {
+				toBytes, err := hex.DecodeString(*toIDHex)
+				if err != nil || len(toBytes) != 32 {
+					fail("invalid --to-id", fmt.Errorf("need 32 bytes hex"))
+				}
+				copy(p.NodeID[:], toBytes)
+				p.Addr = *addr
+			} else {
+				var ok bool
+				p, ok = findPeerByAddr(self.Peers.List(), *addr)
+				if !ok {
+					fail("missing peer", fmt.Errorf("unknown addr"))
+				}
 			}
 			if !self.Sessions.Has(p.NodeID) {
 				if err := handshakeWithPeer(self, p.NodeID, *addr, *devTLS, *devTLSCA); err != nil {
@@ -1952,11 +2128,7 @@ func main() {
 			if err != nil {
 				fail("encode gossip push failed", err)
 			}
-			secureOut, err := sealSecureEnvelope(self, p.NodeID, proto.MsgTypeGossipPush, "", out)
-			if err != nil {
-				fail("missing session", err)
-			}
-			if err := network.Send(*addr, secureOut, false, *devTLS, *devTLSCA); err != nil {
+			if err := network.Send(*addr, out, false, *devTLS, *devTLSCA); err != nil {
 				fail("gossip push failed", err)
 			}
 			fmt.Println("OK gossip push sent")
