@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -739,10 +740,12 @@ func TestQuicRecvOpen(t *testing.T) {
 	peerB := peer.Peer{
 		NodeID: node.DeriveNodeID(pubB),
 		PubKey: pubB,
-		Addr:   "127.0.0.1:1",
 	}
 	if err := self.Peers.Upsert(peerB, true); err != nil {
 		t.Fatalf("seed peer failed: %v", err)
+	}
+	if _, err := self.Peers.ObserveAddr(peerB, "127.0.0.1:1", "127.0.0.1:1", true, true); err != nil {
+		t.Fatalf("seed peer addr failed: %v", err)
 	}
 	checker := math4.NewLocalChecker(math4.Options{})
 	ready := make(chan struct{})
@@ -779,7 +782,11 @@ func TestQuicRecvOpen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load node failed: %v", err)
 	}
-	if err := selfB.Peers.Upsert(peer.Peer{NodeID: self.ID, PubKey: self.PubKey, Addr: addr}, true); err != nil {
+	selfPeer := peer.Peer{NodeID: self.ID, PubKey: self.PubKey}
+	if err := selfB.Peers.Upsert(selfPeer, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
+	if _, err := selfB.Peers.ObserveAddr(selfPeer, addr, addr, true, true); err != nil {
 		t.Fatalf("seed peer failed: %v", err)
 	}
 
@@ -1002,6 +1009,163 @@ func decodeMsgType(payload []byte) (string, error) {
 	return hdr.Type, nil
 }
 
+func TestHandshakeRetryRegeneratesHello1(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	rootA := filepath.Join(homeA, ".web4mvp")
+	rootB := filepath.Join(homeB, ".web4mvp")
+	_ = os.MkdirAll(rootA, 0700)
+	_ = os.MkdirAll(rootB, 0700)
+	nodeA, err := node.NewNode(rootA, node.Options{})
+	if err != nil {
+		t.Fatalf("load node A failed: %v", err)
+	}
+	nodeB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load node B failed: %v", err)
+	}
+	if err := nodeA.Peers.Upsert(peer.Peer{NodeID: nodeB.ID, PubKey: nodeB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+	call := 0
+	var firstHello1 string
+	exchange := func(_ context.Context, _ string, data []byte, _ bool, _ bool, _ string) ([]byte, error) {
+		call++
+		msg, err := proto.DecodeHello1Msg(data)
+		if err != nil {
+			return nil, err
+		}
+		if call == 1 {
+			firstHello1 = msg.Na
+			_, err := nodeB.HandleHello1(msg)
+			if err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("simulated drop")
+		}
+		if call == 2 {
+			if msg.Na == firstHello1 {
+				return nil, fmt.Errorf("reused hello1 nonce")
+			}
+			resp, err := nodeB.HandleHello1(msg)
+			if err != nil {
+				return nil, err
+			}
+			return proto.EncodeHello2Msg(resp)
+		}
+		return nil, fmt.Errorf("unexpected attempt")
+	}
+	if err := handshakeWithPeerWithExchange(nodeA, nodeB.ID, "127.0.0.1:1", true, "", exchange); err != nil {
+		t.Fatalf("handshake failed: %v", err)
+	}
+	if !nodeA.Sessions.Has(nodeB.ID) {
+		t.Fatalf("expected session on node A")
+	}
+}
+
+func TestRateLimitDropsBeforeVerify(t *testing.T) {
+	resetRecvLimiters(1, 0, time.Minute)
+	defer resetRecvLimiters(defaultHostRateLimit, defaultNodeRateLimit, defaultRateWindow)
+
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	rootA := filepath.Join(homeA, ".web4mvp")
+	rootB := filepath.Join(homeB, ".web4mvp")
+	_ = os.MkdirAll(rootA, 0700)
+	_ = os.MkdirAll(rootB, 0700)
+	sender, err := node.NewNode(rootA, node.Options{})
+	if err != nil {
+		t.Fatalf("load sender failed: %v", err)
+	}
+	receiver, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load receiver failed: %v", err)
+	}
+	st := store.New(
+		filepath.Join(rootB, "contracts.jsonl"),
+		filepath.Join(rootB, "acks.jsonl"),
+		filepath.Join(rootB, "repayreqs.jsonl"),
+	)
+	hello1, err := sender.BuildHello1(receiver.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	if len(hello1.Sig) == 0 {
+		t.Fatalf("missing hello1 sig")
+	}
+	last := hello1.Sig[len(hello1.Sig)-1]
+	if last == '0' {
+		last = '1'
+	} else {
+		last = '0'
+	}
+	hello1.Sig = hello1.Sig[:len(hello1.Sig)-1] + string(last)
+	data, err := proto.EncodeHello1Msg(hello1)
+	if err != nil {
+		t.Fatalf("encode hello1 failed: %v", err)
+	}
+	_, _, recvErr := recvDataWithResponse(data, st, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr == nil || recvErr.msg != "invalid hello1" {
+		t.Fatalf("expected invalid hello1, got %v", recvErr)
+	}
+	_, _, recvErr = recvDataWithResponse(data, st, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr == nil || recvErr.msg != "rate_limit_host" {
+		t.Fatalf("expected rate_limit_host, got %v", recvErr)
+	}
+}
+
+func TestRateLimitDropsBeforeDecrypt(t *testing.T) {
+	resetRecvLimiters(1, 1, time.Minute)
+	defer resetRecvLimiters(defaultHostRateLimit, defaultNodeRateLimit, defaultRateWindow)
+
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	req := proto.PeerExchangeReqMsg{
+		Type:         proto.MsgTypePeerExchangeReq,
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		K:            1,
+	}
+	payload, err := proto.EncodePeerExchangeReq(req)
+	if err != nil {
+		t.Fatalf("encode peer exchange req failed: %v", err)
+	}
+	secure, err := sealSecureEnvelope(pair.a, pair.b.ID, proto.MsgTypePeerExchangeReq, "", payload)
+	if err != nil {
+		t.Fatalf("seal secure envelope failed: %v", err)
+	}
+	env, err := proto.DecodeSecureEnvelope(secure)
+	if err != nil {
+		t.Fatalf("decode secure envelope failed: %v", err)
+	}
+	if len(env.Sealed) == 0 {
+		t.Fatalf("missing sealed payload")
+	}
+	sealed := []byte(env.Sealed)
+	if sealed[len(sealed)-1] == 'A' {
+		sealed[len(sealed)-1] = 'B'
+	} else {
+		sealed[len(sealed)-1] = 'A'
+	}
+	env.Sealed = string(sealed)
+	bad, err := proto.EncodeSecureEnvelope(env)
+	if err != nil {
+		t.Fatalf("encode secure envelope failed: %v", err)
+	}
+	_, _, recvErr := recvDataWithResponse(bad, pair.stB, pair.b, pair.checkerB, "10.0.0.2:2222")
+	if recvErr == nil || recvErr.msg != "open secure envelope failed" {
+		t.Fatalf("expected open secure envelope failed, got %v", recvErr)
+	}
+	_, _, recvErr = recvDataWithResponse(bad, pair.stB, pair.b, pair.checkerB, "10.0.0.2:2222")
+	if recvErr == nil || recvErr.msg != "rate_limit_host" {
+		t.Fatalf("expected rate_limit_host, got %v", recvErr)
+	}
+}
+
 func TestQuicNodeHello(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()
@@ -1107,10 +1271,12 @@ func TestNodeExchange(t *testing.T) {
 	peerC := peer.Peer{
 		NodeID: node.DeriveNodeID(pubC),
 		PubKey: pubC,
-		Addr:   "127.0.0.1:42430",
 	}
 	if err := self.Peers.Upsert(peerC, true); err != nil {
 		t.Fatalf("seed peer failed: %v", err)
+	}
+	if _, err := self.Peers.ObserveAddr(peerC, "127.0.0.1:42430", "127.0.0.1:42430", true, true); err != nil {
+		t.Fatalf("seed peer addr failed: %v", err)
 	}
 
 	checker := math4.NewLocalChecker(math4.Options{})
@@ -1151,7 +1317,11 @@ func TestNodeExchange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load node failed: %v", err)
 	}
-	if err := selfB.Peers.Upsert(peer.Peer{NodeID: self.ID, PubKey: self.PubKey, Addr: addr}, true); err != nil {
+	selfPeer := peer.Peer{NodeID: self.ID, PubKey: self.PubKey}
+	if err := selfB.Peers.Upsert(selfPeer, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
+	if _, err := selfB.Peers.ObserveAddr(selfPeer, addr, addr, true, true); err != nil {
 		t.Fatalf("seed peer failed: %v", err)
 	}
 	if err := runWithHome(homeB, "node", "exchange", "--devtls", "--addr", addr, "--devtls-ca", devTLSCAPath, "--k", "16"); err != nil {
@@ -1311,7 +1481,11 @@ func TestGossipRejectsUnknownSender(t *testing.T) {
 	if err := selfB.Peers.Upsert(peer.Peer{NodeID: selfA.ID, PubKey: selfA.PubKey, Addr: ""}, true); err != nil {
 		t.Fatalf("seed peer failed: %v", err)
 	}
-	if err := selfA.Peers.Upsert(peer.Peer{NodeID: selfB.ID, PubKey: selfB.PubKey, Addr: addrB}, true); err != nil {
+	peerB := peer.Peer{NodeID: selfB.ID, PubKey: selfB.PubKey}
+	if err := selfA.Peers.Upsert(peerB, true); err != nil {
+		t.Fatalf("seed peer failed: %v", err)
+	}
+	if _, err := selfA.Peers.ObserveAddr(peerB, addrB, addrB, true, true); err != nil {
 		t.Fatalf("seed peer failed: %v", err)
 	}
 	if err := handshakeWithPeer(selfA, selfB.ID, addrB, true, devTLSCAPath); err != nil {

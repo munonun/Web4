@@ -5,7 +5,9 @@ import (
 	"container/list"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sync"
@@ -17,10 +19,13 @@ import (
 )
 
 const (
-	DefaultCap       = 512
-	DefaultTTL       = 30 * time.Minute
-	DefaultLoadLimit = 512
-	maxPeerScanSize  = 2 * proto.MaxFrameSize
+	DefaultCap              = 512
+	DefaultTTL              = 30 * time.Minute
+	DefaultLoadLimit        = 512
+	maxPeerScanSize         = 2 * proto.MaxFrameSize
+	DefaultAddrCooldown     = 2 * time.Minute
+	DefaultAddrObservation  = 2
+	DefaultAddrMuteDuration = 2 * time.Minute
 )
 
 type Peer struct {
@@ -30,20 +35,33 @@ type Peer struct {
 }
 
 type Options struct {
-	Cap          int
-	TTL          time.Duration
-	LoadLimit    int
-	DeriveNodeID func(pub []byte) [32]byte
+	Cap                 int
+	TTL                 time.Duration
+	LoadLimit           int
+	AddrCooldown        time.Duration
+	AddrObservation     int
+	AllowAddrFromUpsert bool
+	DeriveNodeID        func(pub []byte) [32]byte
 }
 
 type Store struct {
-	mu           sync.Mutex
-	path         string
-	cap          int
-	ttl          time.Duration
-	deriveNodeID func(pub []byte) [32]byte
-	hot          map[string]*list.Element
-	order        *list.List
+	mu                  sync.Mutex
+	path                string
+	cap                 int
+	ttl                 time.Duration
+	deriveNodeID        func(pub []byte) [32]byte
+	addrCooldown        time.Duration
+	addrObservation     int
+	allowAddrFromUpsert bool
+	hot                 map[string]*list.Element
+	order               *list.List
+	addrIndex           map[string][32]byte
+	addrObs             map[[32]byte]map[string]*addrObservation
+	addrChange          map[[32]byte]time.Time
+	mutedAddrs          map[string]time.Time
+	addrHints           map[[32]byte]string
+	hintIndex           map[string][32]byte
+	addrVerified        map[[32]byte]bool
 }
 
 type entry struct {
@@ -52,11 +70,22 @@ type entry struct {
 	expiresAt time.Time
 }
 
+type addrObservation struct {
+	count    int
+	lastSeen time.Time
+}
+
 type diskPeer struct {
 	NodeID string `json:"node_id"`
 	PubKey string `json:"pubkey"`
 	Addr   string `json:"addr,omitempty"`
 }
+
+var (
+	ErrAddrConflict = errors.New("addr conflict")
+	ErrAddrMuted    = errors.New("addr muted")
+	ErrAddrCooldown = errors.New("addr cooldown")
+)
 
 func NewStore(path string, opts Options) (*Store, error) {
 	capacity := opts.Cap
@@ -74,16 +103,34 @@ func NewStore(path string, opts Options) (*Store, error) {
 	if opts.DeriveNodeID == nil {
 		return nil, fmt.Errorf("missing derive_node_id")
 	}
+	addrCooldown := opts.AddrCooldown
+	if addrCooldown <= 0 {
+		addrCooldown = DefaultAddrCooldown
+	}
+	addrObs := opts.AddrObservation
+	if addrObs <= 0 {
+		addrObs = DefaultAddrObservation
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
 	}
 	s := &Store{
-		path:         path,
-		cap:          capacity,
-		ttl:          ttl,
-		deriveNodeID: opts.DeriveNodeID,
-		hot:          make(map[string]*list.Element),
-		order:        list.New(),
+		path:                path,
+		cap:                 capacity,
+		ttl:                 ttl,
+		deriveNodeID:        opts.DeriveNodeID,
+		addrCooldown:        addrCooldown,
+		addrObservation:     addrObs,
+		allowAddrFromUpsert: opts.AllowAddrFromUpsert,
+		hot:                 make(map[string]*list.Element),
+		order:               list.New(),
+		addrIndex:           make(map[string][32]byte),
+		addrObs:             make(map[[32]byte]map[string]*addrObservation),
+		addrChange:          make(map[[32]byte]time.Time),
+		mutedAddrs:          make(map[string]time.Time),
+		addrHints:           make(map[[32]byte]string),
+		hintIndex:           make(map[string][32]byte),
+		addrVerified:        make(map[[32]byte]bool),
 	}
 	if loadLimit > 0 {
 		if err := s.loadLast(loadLimit); err != nil {
@@ -109,26 +156,9 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 
 	s.mu.Lock()
 	s.pruneLocked()
-	if p.Addr != "" {
-		for el := s.order.Front(); el != nil; el = el.Next() {
-			ent := el.Value.(*entry)
-			if ent.peer.NodeID == p.NodeID {
-				continue
-			}
-			if ent.peer.Addr == p.Addr {
-				fmt.Fprintf(os.Stderr, "peer addr conflict: addr=%s new_node_id=%x old_node_id=%x\n", p.Addr, p.NodeID[:], ent.peer.NodeID[:])
-				ent.peer.Addr = ""
-				ent.expiresAt = time.Now().Add(s.ttl)
-				s.order.MoveToFront(el)
-				rec := diskPeer{
-					NodeID: hex.EncodeToString(ent.peer.NodeID[:]),
-					PubKey: hex.EncodeToString(ent.peer.PubKey),
-					Addr:   "",
-				}
-				_ = store.AppendJSONL(s.path, rec)
-				break
-			}
-		}
+	now := time.Now()
+	if p.Addr != "" && !s.allowAddrFromUpsert {
+		p.Addr = ""
 	}
 	var existing *entry
 	var existingEl *list.Element
@@ -156,8 +186,17 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	copy(pub, p.PubKey)
 	p.PubKey = pub
 	if existing != nil {
+		if p.Addr == "" {
+			p.Addr = existing.peer.Addr
+		} else if p.Addr != existing.peer.Addr {
+			if err := s.setAddrLocked(existing, p.Addr, now, false, false); err != nil {
+				s.mu.Unlock()
+				return err
+			}
+			p.Addr = existing.peer.Addr
+		}
 		existing.peer = p
-		existing.expiresAt = time.Now().Add(s.ttl)
+		existing.expiresAt = now.Add(s.ttl)
 		s.order.MoveToFront(existingEl)
 		s.mu.Unlock()
 		logDebug(p)
@@ -174,7 +213,15 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	if s.cap > 0 && len(s.hot) >= s.cap {
 		s.evictLocked(len(s.hot) - s.cap + 1)
 	}
-	ent := &entry{key: key, peer: p, expiresAt: time.Now().Add(s.ttl)}
+	addr := p.Addr
+	p.Addr = ""
+	ent := &entry{key: key, peer: p, expiresAt: now.Add(s.ttl)}
+	if addr != "" {
+		if err := s.setAddrLocked(ent, addr, now, false, false); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
 	el := s.order.PushFront(ent)
 	s.hot[key] = el
 	s.mu.Unlock()
@@ -191,6 +238,91 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	return store.AppendJSONL(s.path, rec)
 }
 
+func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, verified bool, persist bool) (bool, error) {
+	if observedAddr == "" {
+		return false, nil
+	}
+	if isZeroNodeID(p.NodeID) {
+		return false, fmt.Errorf("missing node_id")
+	}
+	s.mu.Lock()
+	s.pruneLocked()
+	now := time.Now()
+	key := keyForPeer(p)
+	var ent *entry
+	var entEl *list.Element
+	if el, ok := s.hot[key]; ok {
+		entEl = el
+		ent = el.Value.(*entry)
+		if len(p.PubKey) == 0 {
+			p.PubKey = ent.peer.PubKey
+		}
+	}
+	if len(p.PubKey) == 0 {
+		s.mu.Unlock()
+		return false, fmt.Errorf("missing pubkey")
+	}
+	derived := s.deriveNodeID(p.PubKey)
+	if derived != p.NodeID {
+		s.mu.Unlock()
+		return false, fmt.Errorf("node_id/pubkey mismatch")
+	}
+	pub := make([]byte, len(p.PubKey))
+	copy(pub, p.PubKey)
+	p.PubKey = pub
+	if ent == nil {
+		if s.cap > 0 && len(s.hot) >= s.cap {
+			s.evictLocked(len(s.hot) - s.cap + 1)
+		}
+		ent = &entry{key: key, peer: Peer{NodeID: p.NodeID, PubKey: pub}, expiresAt: now.Add(s.ttl)}
+		entEl = s.order.PushFront(ent)
+		s.hot[key] = entEl
+	} else {
+		ent.peer.NodeID = p.NodeID
+		ent.peer.PubKey = pub
+		ent.expiresAt = now.Add(s.ttl)
+		s.order.MoveToFront(entEl)
+	}
+	host := hostForAddr(observedAddr)
+	obsByHost := s.addrObs[p.NodeID]
+	if obsByHost == nil {
+		obsByHost = make(map[string]*addrObservation)
+		s.addrObs[p.NodeID] = obsByHost
+	}
+	obs := obsByHost[host]
+	if obs == nil {
+		obs = &addrObservation{}
+		obsByHost[host] = obs
+	}
+	obs.count++
+	obs.lastSeen = now
+	if candidateAddr == "" {
+		s.mu.Unlock()
+		return false, nil
+	}
+	allowUpdate := verified || obs.count >= s.addrObservation
+	if !allowUpdate {
+		s.mu.Unlock()
+		return false, nil
+	}
+	prevAddr := ent.peer.Addr
+	if err := s.setAddrLocked(ent, candidateAddr, now, false, true); err != nil {
+		s.mu.Unlock()
+		return false, err
+	}
+	changed := ent.peer.Addr != prevAddr
+	s.mu.Unlock()
+	if !persist || len(ent.peer.PubKey) == 0 {
+		return changed, nil
+	}
+	rec := diskPeer{
+		NodeID: hex.EncodeToString(ent.peer.NodeID[:]),
+		PubKey: hex.EncodeToString(ent.peer.PubKey),
+		Addr:   ent.peer.Addr,
+	}
+	return changed, store.AppendJSONL(s.path, rec)
+}
+
 func (s *Store) List() []Peer {
 	s.mu.Lock()
 	s.pruneLocked()
@@ -204,6 +336,100 @@ func (s *Store) List() []Peer {
 	}
 	s.mu.Unlock()
 	return out
+}
+
+func (s *Store) SetAddrUnverified(p Peer, addr string, persist bool) (bool, error) {
+	if addr == "" || isZeroNodeID(p.NodeID) || len(p.PubKey) == 0 {
+		return false, nil
+	}
+	derived := s.deriveNodeID(p.PubKey)
+	if derived != p.NodeID {
+		return false, fmt.Errorf("node_id/pubkey mismatch")
+	}
+	now := time.Now()
+	s.mu.Lock()
+	s.pruneLocked()
+	if owner, ok := s.addrIndex[addr]; ok && owner != p.NodeID {
+		s.mutedAddrs[addr] = now.Add(DefaultAddrMuteDuration)
+		s.mu.Unlock()
+		return false, ErrAddrConflict
+	}
+	if owner, ok := s.hintIndex[addr]; ok && owner != p.NodeID {
+		s.mutedAddrs[addr] = now.Add(DefaultAddrMuteDuration)
+		s.mu.Unlock()
+		return false, ErrAddrConflict
+	}
+	key := keyForPeer(p)
+	var ent *entry
+	var entEl *list.Element
+	if el, ok := s.hot[key]; ok {
+		entEl = el
+		ent = el.Value.(*entry)
+	}
+	if ent == nil {
+		if s.cap > 0 && len(s.hot) >= s.cap {
+			s.evictLocked(len(s.hot) - s.cap + 1)
+		}
+		ent = &entry{key: key, peer: Peer{NodeID: p.NodeID, PubKey: p.PubKey}, expiresAt: now.Add(s.ttl)}
+		entEl = s.order.PushFront(ent)
+		s.hot[key] = entEl
+	} else {
+		ent.peer.NodeID = p.NodeID
+		ent.peer.PubKey = p.PubKey
+		ent.expiresAt = now.Add(s.ttl)
+		s.order.MoveToFront(entEl)
+	}
+	if s.addrVerified[p.NodeID] {
+		s.mu.Unlock()
+		return false, nil
+	}
+	if ent.peer.Addr != "" && ent.peer.Addr != addr {
+		currentHost := hostForAddr(ent.peer.Addr)
+		newHost := hostForAddr(addr)
+		if currentHost == "" || newHost == "" || currentHost != newHost {
+			if last, ok := s.addrChange[ent.peer.NodeID]; ok && now.Sub(last) < s.addrCooldown {
+				s.mu.Unlock()
+				return false, ErrAddrCooldown
+			}
+		}
+	}
+	changed := ent.peer.Addr != addr
+	ent.peer.Addr = addr
+	s.addrVerified[p.NodeID] = false
+	s.addrHints[p.NodeID] = addr
+	s.hintIndex[addr] = p.NodeID
+	if changed {
+		s.addrChange[ent.peer.NodeID] = now
+	}
+	s.mu.Unlock()
+	if !persist || len(ent.peer.PubKey) == 0 || !changed {
+		return changed, nil
+	}
+	rec := diskPeer{
+		NodeID: hex.EncodeToString(ent.peer.NodeID[:]),
+		PubKey: hex.EncodeToString(ent.peer.PubKey),
+		Addr:   ent.peer.Addr,
+	}
+	return changed, store.AppendJSONL(s.path, rec)
+}
+
+func (s *Store) AddrHint(id [32]byte) (string, bool) {
+	if isZeroNodeID(id) {
+		return "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	addr, ok := s.addrHints[id]
+	return addr, ok
+}
+
+func (s *Store) IsAddrVerified(id [32]byte) bool {
+	if isZeroNodeID(id) {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.addrVerified[id]
 }
 
 func (s *Store) Len() int {
@@ -237,9 +463,28 @@ func (s *Store) pruneLocked() {
 			el = prev
 			continue
 		}
+		if ent.peer.Addr != "" {
+			if owner, ok := s.addrIndex[ent.peer.Addr]; ok && owner == ent.peer.NodeID {
+				delete(s.addrIndex, ent.peer.Addr)
+			}
+		}
+		delete(s.addrVerified, ent.peer.NodeID)
+		if hint, ok := s.addrHints[ent.peer.NodeID]; ok {
+			delete(s.addrHints, ent.peer.NodeID)
+			if owner, ok := s.hintIndex[hint]; ok && owner == ent.peer.NodeID {
+				delete(s.hintIndex, hint)
+			}
+		}
+		delete(s.addrObs, ent.peer.NodeID)
+		delete(s.addrChange, ent.peer.NodeID)
 		delete(s.hot, ent.key)
 		s.order.Remove(el)
 		el = prev
+	}
+	for addr, until := range s.mutedAddrs {
+		if until.Before(now) {
+			delete(s.mutedAddrs, addr)
+		}
 	}
 }
 
@@ -250,6 +495,20 @@ func (s *Store) evictLocked(n int) {
 			return
 		}
 		ent := el.Value.(*entry)
+		if ent.peer.Addr != "" {
+			if owner, ok := s.addrIndex[ent.peer.Addr]; ok && owner == ent.peer.NodeID {
+				delete(s.addrIndex, ent.peer.Addr)
+			}
+		}
+		delete(s.addrVerified, ent.peer.NodeID)
+		if hint, ok := s.addrHints[ent.peer.NodeID]; ok {
+			delete(s.addrHints, ent.peer.NodeID)
+			if owner, ok := s.hintIndex[hint]; ok && owner == ent.peer.NodeID {
+				delete(s.hintIndex, hint)
+			}
+		}
+		delete(s.addrObs, ent.peer.NodeID)
+		delete(s.addrChange, ent.peer.NodeID)
 		delete(s.hot, ent.key)
 		s.order.Remove(el)
 		n--
@@ -272,7 +531,7 @@ func (s *Store) loadLast(limit int) error {
 		}
 		var id [32]byte
 		copy(id[:], idBytes)
-		_ = s.Upsert(Peer{NodeID: id, PubKey: pub, Addr: rec.Addr}, false)
+		_ = s.loadRecord(Peer{NodeID: id, PubKey: pub, Addr: rec.Addr})
 	}
 	return nil
 }
@@ -324,6 +583,109 @@ func peerScanPaths(path string) []string {
 
 func keyForPeer(p Peer) string {
 	return hex.EncodeToString(p.NodeID[:])
+}
+
+func (s *Store) loadRecord(p Peer) error {
+	if isZeroNodeID(p.NodeID) || len(p.PubKey) == 0 {
+		return fmt.Errorf("invalid peer")
+	}
+	derived := s.deriveNodeID(p.PubKey)
+	if derived != p.NodeID {
+		return fmt.Errorf("node_id/pubkey mismatch")
+	}
+	s.mu.Lock()
+	s.pruneLocked()
+	now := time.Now()
+	key := keyForPeer(p)
+	var ent *entry
+	var entEl *list.Element
+	if el, ok := s.hot[key]; ok {
+		entEl = el
+		ent = el.Value.(*entry)
+	}
+	pub := make([]byte, len(p.PubKey))
+	copy(pub, p.PubKey)
+	p.PubKey = pub
+	if ent == nil {
+		if s.cap > 0 && len(s.hot) >= s.cap {
+			s.evictLocked(len(s.hot) - s.cap + 1)
+		}
+		ent = &entry{key: key, peer: Peer{NodeID: p.NodeID, PubKey: p.PubKey}, expiresAt: now.Add(s.ttl)}
+		entEl = s.order.PushFront(ent)
+		s.hot[key] = entEl
+	} else {
+		ent.peer.NodeID = p.NodeID
+		ent.peer.PubKey = p.PubKey
+		ent.expiresAt = now.Add(s.ttl)
+		s.order.MoveToFront(entEl)
+	}
+	if p.Addr != "" {
+		_ = s.setAddrLocked(ent, p.Addr, now, true, true)
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Store) setAddrLocked(ent *entry, addr string, now time.Time, ignoreCooldown bool, verified bool) error {
+	if addr == "" {
+		return nil
+	}
+	if until, ok := s.mutedAddrs[addr]; ok && until.After(now) {
+		return ErrAddrMuted
+	}
+	if owner, ok := s.addrIndex[addr]; ok && owner != ent.peer.NodeID {
+		s.mutedAddrs[addr] = now.Add(DefaultAddrMuteDuration)
+		return ErrAddrConflict
+	}
+	if ent.peer.Addr == addr {
+		if verified && !s.addrVerified[ent.peer.NodeID] {
+			s.addrIndex[addr] = ent.peer.NodeID
+			s.addrVerified[ent.peer.NodeID] = true
+			s.addrChange[ent.peer.NodeID] = now
+			if hint, ok := s.addrHints[ent.peer.NodeID]; ok {
+				delete(s.addrHints, ent.peer.NodeID)
+				if owner, ok := s.hintIndex[hint]; ok && owner == ent.peer.NodeID {
+					delete(s.hintIndex, hint)
+				}
+			}
+		}
+		return nil
+	}
+	if ent.peer.Addr != "" && !ignoreCooldown {
+		currentHost := hostForAddr(ent.peer.Addr)
+		newHost := hostForAddr(addr)
+		if currentHost == "" || newHost == "" || currentHost != newHost {
+			if last, ok := s.addrChange[ent.peer.NodeID]; ok && now.Sub(last) < s.addrCooldown {
+				return ErrAddrCooldown
+			}
+		}
+	}
+	if ent.peer.Addr != "" && verified {
+		if owner, ok := s.addrIndex[ent.peer.Addr]; ok && owner == ent.peer.NodeID {
+			delete(s.addrIndex, ent.peer.Addr)
+		}
+	}
+	ent.peer.Addr = addr
+	if verified {
+		s.addrIndex[addr] = ent.peer.NodeID
+	}
+	s.addrChange[ent.peer.NodeID] = now
+	s.addrVerified[ent.peer.NodeID] = verified
+	if hint, ok := s.addrHints[ent.peer.NodeID]; ok {
+		delete(s.addrHints, ent.peer.NodeID)
+		if owner, ok := s.hintIndex[hint]; ok && owner == ent.peer.NodeID {
+			delete(s.hintIndex, hint)
+		}
+	}
+	return nil
+}
+
+func hostForAddr(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
 }
 
 func isZeroNodeID(id [32]byte) bool {

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"net"
 	"sync"
 
 	"web4mvp/internal/crypto"
@@ -31,15 +32,17 @@ type PendingHandshake struct {
 }
 
 type SessionStore struct {
-	mu       sync.Mutex
-	sessions map[[32]byte]*SessionState
-	pending  map[[32]byte]*PendingHandshake
+	mu         sync.Mutex
+	sessions   map[[32]byte]*SessionState
+	pending    map[[32]byte]*PendingHandshake
+	lastHello1 map[[32]byte][32]byte
 }
 
 func NewSessionStore() *SessionStore {
 	return &SessionStore{
-		sessions: make(map[[32]byte]*SessionState),
-		pending:  make(map[[32]byte]*PendingHandshake),
+		sessions:   make(map[[32]byte]*SessionState),
+		pending:    make(map[[32]byte]*PendingHandshake),
+		lastHello1: make(map[[32]byte][32]byte),
 	}
 }
 
@@ -77,6 +80,21 @@ func (s *SessionStore) Has(id [32]byte) bool {
 	defer s.mu.Unlock()
 	_, ok := s.sessions[id]
 	return ok
+}
+
+func (s *SessionStore) IsHello1Replay(id [32]byte, hash [32]byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if last, ok := s.lastHello1[id]; ok && last == hash {
+		return true
+	}
+	return false
+}
+
+func (s *SessionStore) RecordHello1(id [32]byte, hash [32]byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastHello1[id] = hash
 }
 
 func (s *SessionState) NextSendSeq() (uint64, error) {
@@ -146,6 +164,10 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 }
 
 func (n *Node) HandleHello1(m proto.Hello1Msg) (proto.Hello2Msg, error) {
+	return n.HandleHello1From(m, "")
+}
+
+func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hello2Msg, error) {
 	if n == nil || n.Sessions == nil || n.Peers == nil {
 		return proto.Hello2Msg{}, errors.New("node unavailable")
 	}
@@ -164,8 +186,32 @@ func (n *Node) HandleHello1(m proto.Hello1Msg) (proto.Hello2Msg, error) {
 	if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
 		return proto.Hello2Msg{}, errors.New("bad hello1 signature")
 	}
-	if err := n.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub, Addr: m.FromAddr}, true); err != nil {
+	h1BytesForReplay := proto.Hello1Bytes(fromID, toID, ea, na)
+	h1HashBytes := crypto.SHA3_256(h1BytesForReplay)
+	var h1Hash [32]byte
+	copy(h1Hash[:], h1HashBytes)
+	if n.Sessions.IsHello1Replay(fromID, h1Hash) {
+		return proto.Hello2Msg{}, errors.New("hello1 replay")
+	}
+	n.Sessions.RecordHello1(fromID, h1Hash)
+	if err := n.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub}, true); err != nil {
 		return proto.Hello2Msg{}, err
+	}
+	if senderAddr != "" {
+		candidateAddr := ""
+		verified := false
+		if m.FromAddr != "" && sameHost(senderAddr, m.FromAddr) {
+			candidateAddr = m.FromAddr
+			verified = m.FromAddr == senderAddr
+		}
+		if _, err := n.Peers.ObserveAddr(peer.Peer{NodeID: fromID, PubKey: fromPub}, senderAddr, candidateAddr, verified, true); err != nil {
+			return proto.Hello2Msg{}, err
+		}
+		if candidateAddr != "" && !verified {
+			if _, err := n.Peers.SetAddrUnverified(peer.Peer{NodeID: fromID, PubKey: fromPub}, candidateAddr, true); err != nil {
+				return proto.Hello2Msg{}, err
+			}
+		}
 	}
 	eph, err := crypto.GenerateEphemeral()
 	if err != nil {
@@ -221,6 +267,10 @@ func (n *Node) HandleHello1(m proto.Hello1Msg) (proto.Hello2Msg, error) {
 }
 
 func (n *Node) HandleHello2(m proto.Hello2Msg) error {
+	return n.HandleHello2From(m, "")
+}
+
+func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 	if n == nil || n.Sessions == nil || n.Peers == nil {
 		return errors.New("node unavailable")
 	}
@@ -244,9 +294,27 @@ func (n *Node) HandleHello2(m proto.Hello2Msg) error {
 		pending.Ephemeral.Destroy()
 		return errors.New("bad hello2 signature")
 	}
-	if err := n.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub, Addr: m.FromAddr}, true); err != nil {
+	if err := n.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub}, true); err != nil {
 		pending.Ephemeral.Destroy()
 		return err
+	}
+	if senderAddr != "" {
+		candidateAddr := ""
+		verified := false
+		if m.FromAddr != "" && sameHost(senderAddr, m.FromAddr) {
+			candidateAddr = m.FromAddr
+			verified = m.FromAddr == senderAddr
+		}
+		if _, err := n.Peers.ObserveAddr(peer.Peer{NodeID: fromID, PubKey: fromPub}, senderAddr, candidateAddr, verified, true); err != nil {
+			pending.Ephemeral.Destroy()
+			return err
+		}
+		if candidateAddr != "" && !verified {
+			if _, err := n.Peers.SetAddrUnverified(peer.Peer{NodeID: fromID, PubKey: fromPub}, candidateAddr, true); err != nil {
+				pending.Ephemeral.Destroy()
+				return err
+			}
+		}
 	}
 	h1Bytes := pending.Hello1Bytes
 	h2Bytes := proto.Hello2Bytes(fromID, toID, eb, nb)
@@ -299,4 +367,16 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+func sameHost(a, b string) bool {
+	ha, _, err := net.SplitHostPort(a)
+	if err != nil {
+		ha = a
+	}
+	hb, _, err := net.SplitHostPort(b)
+	if err != nil {
+		hb = b
+	}
+	return ha != "" && hb != "" && ha == hb
 }

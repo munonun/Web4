@@ -300,74 +300,11 @@ func ensureDevTLSCA() error {
 }
 
 func Send(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) error {
-	tlsConf, err := clientTLSConfig(insecure, devTLS, devTLSCAPath)
-	if err != nil {
-		return err
-	}
-	quicConf := &quic.Config{
-		MaxIdleTimeout:       maxIdleTimeout,
-		KeepAlivePeriod:      keepAlivePeriod,
-		HandshakeIdleTimeout: handshakeIdleTimeout,
-	}
-	conn, err := quic.DialAddr(context.Background(), addr, tlsConf, quicConf)
-	if err != nil {
-		return err
-	}
-	stream, err := conn.OpenStreamSync(context.Background())
-	if err != nil {
-		_ = conn.CloseWithError(0, "")
-		return err
-	}
-	if err := writeFrameWithTimeout(stream, streamRWTimeout, data); err != nil {
-		_ = conn.CloseWithError(0, "")
-		return err
-	}
-	if err := stream.Close(); err != nil {
-		logInfo("quic stream close error: %v", err)
-		_ = conn.CloseWithError(0, "")
-		return err
-	}
-	time.Sleep(100 * time.Millisecond)
-	_ = conn.CloseWithError(0, "")
-	return nil
+	return SendWithContext(context.Background(), addr, data, insecure, devTLS, devTLSCAPath)
 }
 
 func Exchange(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) ([]byte, error) {
-	tlsConf, err := clientTLSConfig(insecure, devTLS, devTLSCAPath)
-	if err != nil {
-		return nil, err
-	}
-	quicConf := &quic.Config{
-		MaxIdleTimeout:       maxIdleTimeout,
-		KeepAlivePeriod:      keepAlivePeriod,
-		HandshakeIdleTimeout: handshakeIdleTimeout,
-	}
-	conn, err := quic.DialAddr(context.Background(), addr, tlsConf, quicConf)
-	if err != nil {
-		return nil, err
-	}
-	stream, err := conn.OpenStreamSync(context.Background())
-	if err != nil {
-		_ = conn.CloseWithError(0, "")
-		return nil, err
-	}
-	if err := writeFrameWithTimeout(stream, streamRWTimeout, data); err != nil {
-		_ = conn.CloseWithError(0, "")
-		return nil, err
-	}
-	resp, err := readFrameWithTimeout(stream, streamRWTimeout)
-	if err != nil {
-		_ = conn.CloseWithError(0, "")
-		return nil, err
-	}
-	if err := stream.Close(); err != nil {
-		logInfo("quic stream close error: %v", err)
-		_ = conn.CloseWithError(0, "")
-		return nil, err
-	}
-	time.Sleep(100 * time.Millisecond)
-	_ = conn.CloseWithError(0, "")
-	return resp, nil
+	return ExchangeWithContext(context.Background(), addr, data, insecure, devTLS, devTLSCAPath)
 }
 
 func devTLSCertPath() (string, error) {

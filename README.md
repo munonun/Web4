@@ -137,5 +137,8 @@ Web4 tries to remove it.
 If a state transition violates conservation,  
 it should not exist at all.
 
+**Node philosophy: math filter, no history.**  
+Nodes only enforce invariants and transport hygiene. They stay dumb about identity and history.
+
 ---
 This project values falsifiability over completeness.

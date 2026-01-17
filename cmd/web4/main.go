@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"container/list"
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -192,51 +193,90 @@ func openSecureEnvelope(self *node.Node, env proto.SecureEnvelope) (string, []by
 	return env.MsgType, plain, fromID, nil
 }
 
+type exchangeFunc func(ctx context.Context, addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) ([]byte, error)
+
 func handshakeWithPeer(self *node.Node, peerID [32]byte, addr string, devTLS bool, devTLSCA string) error {
+	return handshakeWithPeerWithExchange(self, peerID, addr, devTLS, devTLSCA, network.ExchangeOnceWithContext)
+}
+
+func handshakeWithPeerWithExchange(self *node.Node, peerID [32]byte, addr string, devTLS bool, devTLSCA string, exchange exchangeFunc) error {
 	if self == nil {
 		return fmt.Errorf("missing node")
 	}
 	if addr == "" {
 		return fmt.Errorf("missing addr")
 	}
-	hello1, err := self.BuildHello1(peerID)
-	if err != nil {
-		return err
+	if exchange == nil {
+		return fmt.Errorf("missing exchange")
 	}
-	data, err := proto.EncodeHello1Msg(hello1)
-	if err != nil {
-		return err
-	}
-	if err := enforceTypeMax(proto.MsgTypeHello1, len(data)); err != nil {
-		return err
-	}
-	respData, err := network.Exchange(addr, data, false, devTLS, devTLSCA)
-	if err != nil {
-		return err
-	}
-	respType := ""
-	if len(respData) > 0 {
-		var respHdr struct {
-			Type string `json:"type"`
+	const maxAttempts = 3
+	backoff := 100 * time.Millisecond
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		hello1, err := self.BuildHello1(peerID)
+		if err != nil {
+			return err
 		}
-		if err := json.Unmarshal(respData, &respHdr); err == nil {
-			respType = respHdr.Type
+		data, err := proto.EncodeHello1Msg(hello1)
+		if err != nil {
+			return err
 		}
-	}
-	if os.Getenv("WEB4_DEBUG") == "1" {
-		fmt.Fprintf(os.Stderr, "handshakeWithPeer got resp type=%s len=%d\n", respType, len(respData))
-	}
-	resp, err := proto.DecodeHello2Msg(respData)
-	if err != nil {
+		if err := enforceTypeMax(proto.MsgTypeHello1, len(data)); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		respData, err := exchange(ctx, addr, data, false, devTLS, devTLSCA)
+		cancel()
+		if err != nil {
+			debugCount.incSend("handshake_exchange")
+			lastErr = err
+			if attempt < maxAttempts-1 {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return err
+		}
+		respType := ""
+		if len(respData) > 0 {
+			var respHdr struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(respData, &respHdr); err == nil {
+				respType = respHdr.Type
+			}
+		}
 		if os.Getenv("WEB4_DEBUG") == "1" {
-			fmt.Fprintf(os.Stderr, "handshakeWithPeer decode hello2 failed: %v\n", err)
+			fmt.Fprintf(os.Stderr, "handshakeWithPeer got resp type=%s len=%d\n", respType, len(respData))
 		}
-		return err
+		resp, err := proto.DecodeHello2Msg(respData)
+		if err != nil {
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "handshakeWithPeer decode hello2 failed: %v\n", err)
+			}
+			lastErr = err
+			if attempt < maxAttempts-1 {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return err
+		}
+		if err := self.HandleHello2(resp); err != nil {
+			lastErr = err
+			if attempt < maxAttempts-1 {
+				time.Sleep(backoff)
+				backoff *= 2
+				continue
+			}
+			return err
+		}
+		return nil
 	}
-	if err := self.HandleHello2(resp); err != nil {
-		return err
+	if lastErr != nil {
+		return lastErr
 	}
-	return nil
+	return fmt.Errorf("handshake failed")
 }
 
 type recvError struct {
@@ -298,6 +338,7 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if os.Getenv("WEB4_DEBUG") == "1" {
 			fmt.Fprintf(os.Stderr, "recv reject: %s: %v\n", msg, err)
 		}
+		debugCount.incDrop(msg)
 		return &recvError{msg: msg, err: err}
 	}
 
@@ -314,6 +355,12 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 	if self == nil {
 		return nil, false, reject("node unavailable", fmt.Errorf("missing node"))
 	}
+	if senderAddr != "" {
+		host := hostForAddr(senderAddr)
+		if !recvHostLimiter.Allow(host) {
+			return nil, false, reject("rate_limit_host", errors.New("rate limited"))
+		}
+	}
 	wasSecure := false
 	var secureFromID [32]byte
 	if hdr.Type == proto.MsgTypeSecureEnvelope {
@@ -321,8 +368,37 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err != nil {
 			return nil, false, reject("decode secure envelope failed", err)
 		}
+		fromID, err := proto.DecodeNodeIDHex(env.FromNodeID)
+		if err != nil {
+			return nil, false, reject("decode secure envelope failed", err)
+		}
+		toID, err := proto.DecodeNodeIDHex(env.ToNodeID)
+		if err != nil {
+			return nil, false, reject("decode secure envelope failed", err)
+		}
+		if toID != self.ID {
+			return nil, false, reject("open secure envelope failed", fmt.Errorf("to_id mismatch"))
+		}
+		if self.Peers == nil {
+			return nil, false, reject("node unavailable", fmt.Errorf("peer store unavailable"))
+		}
+		if senderAddr != "" {
+			if mapped, ok := findPeerByAddr(self.Peers.List(), senderAddr); ok && mapped.NodeID != fromID {
+				return nil, false, reject("addr conflict", fmt.Errorf("addr maps to different node_id"))
+			}
+		}
+		if !hasPeerID(self.Peers.List(), fromID) {
+			return nil, false, reject("unknown peer", fmt.Errorf("missing peer"))
+		}
+		if self.Sessions == nil || !self.Sessions.Has(fromID) {
+			return nil, false, reject("unknown sender", fmt.Errorf("missing session"))
+		}
+		if !recvNodeLimiter.Allow(hex.EncodeToString(fromID[:])) {
+			return nil, false, reject("rate_limit_node", errors.New("rate limited"))
+		}
 		msgType, plain, fromID, err := openSecureEnvelope(self, env)
 		if err != nil {
+			debugCount.incDecrypt("secure_envelope")
 			return nil, false, reject("open secure envelope failed", err)
 		}
 		data = plain
@@ -333,9 +409,22 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err := enforceTypeMax(hdr.Type, len(data)); err != nil {
 			return nil, false, reject("message too large", err)
 		}
+		debugCount.incRecv(hdr.Type)
+		if senderAddr != "" && self.Peers != nil {
+			if p, ok := findPeerByNodeID(self.Peers.List(), fromID); ok && len(p.PubKey) > 0 {
+				if changed, err := self.Peers.ObserveAddr(peer.Peer{NodeID: fromID, PubKey: p.PubKey}, senderAddr, "", false, true); err != nil {
+					return nil, false, reject("addr observe failed", err)
+				} else if changed {
+					debugCount.incAddrChange("observe")
+				}
+			}
+		}
 	}
 	if !wasSecure && hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 && hdr.Type != proto.MsgTypeGossipPush {
 		return nil, false, reject("handshake required", fmt.Errorf("missing secure envelope"))
+	}
+	if !wasSecure {
+		debugCount.incRecv(hdr.Type)
 	}
 
 	switch hdr.Type {
@@ -348,6 +437,12 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err != nil {
 			return nil, false, reject("decode hello1 failed", err)
 		}
+		prevAddr := ""
+		if senderAddr != "" {
+			if existing, ok := findPeerByNodeID(self.Peers.List(), fromID); ok {
+				prevAddr = existing.Addr
+			}
+		}
 		if toID != self.ID && senderAddr == "" {
 			derived := node.DeriveNodeID(fromPub)
 			if derived != fromID {
@@ -355,22 +450,30 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			}
 			sigInput := hello1SigInput(fromID, toID, ea, na)
 			if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
+				debugCount.incVerify("hello1")
 				return nil, false, reject("invalid hello1", errors.New("bad hello1 signature"))
 			}
 			newState := true
 			if existing, ok := findPeerByNodeID(self.Peers.List(), fromID); ok {
-				if m.FromAddr == "" || existing.Addr == m.FromAddr {
-					newState = false
-				}
+				_ = existing
+				newState = false
 			}
-			if err := self.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub, Addr: m.FromAddr}, true); err != nil {
+			if err := self.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub}, true); err != nil {
 				return nil, false, reject("invalid hello1", err)
 			}
 			return nil, newState, nil
 		}
-		resp, err := self.HandleHello1(m)
+		resp, err := self.HandleHello1From(m, senderAddr)
 		if err != nil {
+			if strings.Contains(err.Error(), "signature") {
+				debugCount.incVerify("hello1")
+			}
 			return nil, false, reject("invalid hello1", err)
+		}
+		if senderAddr != "" {
+			if updated, ok := findPeerByNodeID(self.Peers.List(), fromID); ok && updated.Addr != "" && updated.Addr != prevAddr {
+				debugCount.incAddrChange("hello1")
+			}
 		}
 		respData, err := proto.EncodeHello2Msg(resp)
 		if err != nil {
@@ -383,8 +486,26 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err != nil {
 			return nil, false, reject("decode hello2 failed", err)
 		}
-		if err := self.HandleHello2(m); err != nil {
+		prevAddr := ""
+		var fromID [32]byte
+		if senderAddr != "" {
+			if id, err := decodeNodeIDHex(m.FromNodeID); err == nil {
+				fromID = id
+				if existing, ok := findPeerByNodeID(self.Peers.List(), fromID); ok {
+					prevAddr = existing.Addr
+				}
+			}
+		}
+		if err := self.HandleHello2From(m, senderAddr); err != nil {
+			if strings.Contains(err.Error(), "signature") {
+				debugCount.incVerify("hello2")
+			}
 			return nil, false, reject("invalid hello2", err)
+		}
+		if senderAddr != "" && !isZeroNodeID(fromID) {
+			if updated, ok := findPeerByNodeID(self.Peers.List(), fromID); ok && updated.Addr != "" && updated.Addr != prevAddr {
+				debugCount.incAddrChange("hello2")
+			}
 		}
 		return nil, false, nil
 
@@ -444,9 +565,10 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			return nil, false, reject("invalid contract open", err)
 		}
 		id := proto.ContractID(c.IOU)
-		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(proto.OpenSignBytes(c.IOU, c.EphemeralPub, c.Sealed)), c.SigDebt) {
-			return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
-		}
+	if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(proto.OpenSignBytes(c.IOU, c.EphemeralPub, c.Sealed)), c.SigDebt) {
+		debugCount.incVerify("contract_open")
+		return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
+	}
 		plain, err := e2eOpen(proto.MsgTypeContractOpen, id, 0, self.PrivKey, c.EphemeralPub, c.Sealed)
 		if err != nil {
 			return nil, false, reject("sealed open failed", err)
@@ -515,9 +637,10 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			return nil, false, reject("invalid repay request fields", err)
 		}
 		reqSign := proto.RepayReqSignBytes(req, ephPub, sealed)
-		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqSign), sigB) {
-			return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
-		}
+	if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqSign), sigB) {
+		debugCount.incVerify("repay_req")
+		return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
+	}
 		plain, err := e2eOpen(proto.MsgTypeRepayReq, cid, req.ReqNonce, self.PrivKey, ephPub, sealed)
 		if err != nil {
 			return nil, false, reject("sealed repay request failed", err)
@@ -584,9 +707,10 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			return nil, false, reject("missing repay request", fmt.Errorf("ack without repay request"))
 		}
 		ackSign := proto.AckSignBytes(a.ContractID, a.Decision, a.Close, a.EphemeralPub, a.Sealed)
-		if !crypto.Verify(c.IOU.Creditor, crypto.SHA3_256(ackSign), sigA) {
-			return nil, false, reject("invalid siga", fmt.Errorf("creditor signature check failed"))
-		}
+	if !crypto.Verify(c.IOU.Creditor, crypto.SHA3_256(ackSign), sigA) {
+		debugCount.incVerify("repay_ack")
+		return nil, false, reject("invalid siga", fmt.Errorf("creditor signature check failed"))
+	}
 		if reqMsg.Close != a.Close {
 			return nil, false, reject("ack close mismatch", fmt.Errorf("close flag mismatch"))
 		}
@@ -809,6 +933,7 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 		mt = proto.MsgTypeGossipPush
 	}
 	if !verifySigFrom(version, suite, mt, fromID, payload, sig, forwarder.PubKey) {
+		debugCount.incVerify("gossip_push")
 		gossipDebugf("drop gossip_push: sig verify failed node_id=%x", fromID[:])
 		return nil, false, nil
 	}
@@ -824,6 +949,7 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 	var zero [32]byte
 	envelope, err := e2eOpen(proto.MsgTypeGossipPush, zero, 0, self.PrivKey, ephPub, sealed)
 	if err != nil {
+		debugCount.incDecrypt("gossip_push")
 		gossipDebugf("gossip_push open failed msg.from_node_id=%x sender_pub_node_id=%s sender_pub_hash=%s", fromID[:], nodeIDHexFromPub(forwarder.PubKey), hashHex(forwarder.PubKey))
 		gossipDebugf("drop gossip_push: envelope open failed err=%v", err)
 		return nil, false, &recvError{msg: "decode gossip envelope failed", err: err}
@@ -877,7 +1003,13 @@ func forwardGossip(msg proto.GossipPushMsg, envelope []byte, self *node.Node, se
 		gossipDebugf("skip gossip_forward: fanout=%d", fanout)
 		return
 	}
-	candidates := filterGossipPeers(self.Peers.List(), senderAddr)
+	candidates := filterGossipPeers(self.Peers.List(), senderAddr, self.Peers, self.ID)
+	if self.Members != nil {
+		memberCandidates := filterMemberPeers(candidates, self.Members)
+		if len(memberCandidates) > 0 {
+			candidates = memberCandidates
+		}
+	}
 	if len(candidates) == 0 {
 		gossipDebugf("skip gossip_forward: no candidates")
 		return
@@ -914,6 +1046,7 @@ func forwardGossip(msg proto.GossipPushMsg, envelope []byte, self *node.Node, se
 		}
 		gossipDebugf("forward seal ok to node_id=%x addr=%s", p.NodeID[:], p.Addr)
 		if err := network.Send(p.Addr, out, false, true, ""); err != nil {
+			debugCount.incSend("gossip_forward")
 			gossipDebugf("gossip forward failed: node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
 			if os.Getenv("WEB4_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "gossip forward failed: %v\n", err)
@@ -924,16 +1057,40 @@ func forwardGossip(msg proto.GossipPushMsg, envelope []byte, self *node.Node, se
 	}
 }
 
-func filterGossipPeers(peers []peer.Peer, excludeAddr string) []peer.Peer {
+func filterGossipPeers(peers []peer.Peer, excludeAddr string, store *peer.Store, selfID [32]byte) []peer.Peer {
 	out := make([]peer.Peer, 0, len(peers))
 	for _, p := range peers {
-		if p.Addr == "" || len(p.PubKey) == 0 {
+		if p.NodeID == selfID {
 			continue
 		}
-		if excludeAddr != "" && p.Addr == excludeAddr {
+		addr := p.Addr
+		if addr == "" && store != nil {
+			if hint, ok := store.AddrHint(p.NodeID); ok {
+				addr = hint
+			}
+		}
+		if addr == "" || len(p.PubKey) == 0 {
 			continue
 		}
-		out = append(out, p)
+		if excludeAddr != "" && addr == excludeAddr {
+			continue
+		}
+		cp := p
+		cp.Addr = addr
+		out = append(out, cp)
+	}
+	return out
+}
+
+func filterMemberPeers(peers []peer.Peer, members *peer.MemberStore) []peer.Peer {
+	if members == nil {
+		return peers
+	}
+	out := make([]peer.Peer, 0, len(peers))
+	for _, p := range peers {
+		if members.Has(p.NodeID) {
+			out = append(out, p)
+		}
 	}
 	return out
 }
@@ -1066,12 +1223,22 @@ func findPeerByAddr(peers []peer.Peer, addr string) (peer.Peer, bool) {
 	return peer.Peer{}, false
 }
 
-func verifiedPeerForAddr(peers []peer.Peer, addr string) (peer.Peer, bool) {
+func hostForAddr(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
+}
+
+func verifiedPeerForAddr(peers []peer.Peer, addr string, store *peer.Store) (peer.Peer, bool) {
 	if addr == "" {
 		return peer.Peer{}, false
 	}
 	if p, ok := findPeerByAddr(peers, addr); ok && len(p.PubKey) > 0 {
-		return p, true
+		if store == nil || store.IsAddrVerified(p.NodeID) {
+			return p, true
+		}
 	}
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -1079,6 +1246,9 @@ func verifiedPeerForAddr(peers []peer.Peer, addr string) (peer.Peer, bool) {
 	}
 	for _, p := range peers {
 		if len(p.PubKey) == 0 || p.Addr == "" {
+			continue
+		}
+		if store != nil && !store.IsAddrVerified(p.NodeID) {
 			continue
 		}
 		peerHost, _, err := net.SplitHostPort(p.Addr)
@@ -1092,8 +1262,8 @@ func verifiedPeerForAddr(peers []peer.Peer, addr string) (peer.Peer, bool) {
 	return peer.Peer{}, false
 }
 
-func isVerifiedSender(peers []peer.Peer, addr string) bool {
-	_, ok := verifiedPeerForAddr(peers, addr)
+func isVerifiedSender(peers []peer.Peer, addr string, store *peer.Store) bool {
+	_, ok := verifiedPeerForAddr(peers, addr, store)
 	return ok
 }
 
@@ -1180,6 +1350,13 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 		if err != nil {
 			return added, err
 		}
+		if p.Addr != "" && self.Candidates != nil {
+			self.Candidates.Add(p.Addr)
+		}
+		if p.Addr != "" && self.Peers != nil {
+			_, _ = self.Peers.SetAddrUnverified(p, p.Addr, true)
+		}
+		p.Addr = ""
 		persist := len(p.PubKey) > 0
 		if err := self.Peers.Upsert(p, persist); err != nil {
 			return added, err

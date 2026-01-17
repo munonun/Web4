@@ -44,3 +44,8 @@ The following are explicitly forbidden:
 - Ledgers or transaction logs
 - Global ordering or consensus mechanisms
 - Account balances or UTXO-style models
+
+## 7. Node Philosophy: Math Filter, No History
+
+- Nodes enforce only invariants and transport hygiene.
+- Nodes do not retain history or use reputation for validity.
