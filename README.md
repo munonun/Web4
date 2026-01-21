@@ -140,7 +140,6 @@ Instead, correctness is demonstrated through testing.
 go test ./...
 ```
 ### These verify:
-
 - framing and size limits
 
 - signature and tamper rejection
@@ -165,7 +164,7 @@ These tests exercise:
 
 If these pass, the system is behaving as designed.
 
-### What this is not
+## What this is not
 - not a blockchain
 
 - not a PoW or PoS system
@@ -176,7 +175,7 @@ If these pass, the system is behaving as designed.
 
 This repository is a research-driven protocol experiment.
 
-### Philosophy
+## Philosophy
 Most systems attempt to redistribute trust.
 
 Web4 attempts to remove it.
