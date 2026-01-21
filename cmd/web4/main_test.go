@@ -837,6 +837,15 @@ func runOK(t *testing.T, home string, args ...string) {
 	}
 }
 
+func findPeer(peers []peer.Peer, id [32]byte) (peer.Peer, bool) {
+	for _, p := range peers {
+		if p.NodeID == id {
+			return p, true
+		}
+	}
+	return peer.Peer{}, false
+}
+
 func runWithHome(home string, args ...string) error {
 	if err := ensureGoCaches(); err != nil {
 		return err
@@ -1526,6 +1535,190 @@ func TestGossipRejectsUnknownSender(t *testing.T) {
 	}
 	if len(cs) != 0 {
 		t.Fatalf("expected gossip drop for unknown sender")
+	}
+}
+
+func TestGossipForwardHello1LearnsPeer(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+	homeD := t.TempDir()
+	homeTLS := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+	runOK(t, homeC, "keygen")
+	runOK(t, homeD, "keygen")
+
+	t.Setenv("HOME", homeTLS)
+	t.Setenv("WEB4_GOSSIP_FANOUT", "1")
+	t.Setenv("WEB4_GOSSIP_TTL_HOPS", "2")
+	t.Setenv("WEB4_DEBUG", "1")
+
+	rootA := filepath.Join(homeA, ".web4mvp")
+	rootB := filepath.Join(homeB, ".web4mvp")
+	rootC := filepath.Join(homeC, ".web4mvp")
+	rootD := filepath.Join(homeD, ".web4mvp")
+
+	selfA, err := node.NewNode(rootA, node.Options{})
+	if err != nil {
+		t.Fatalf("load node A failed: %v", err)
+	}
+	selfB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load node B failed: %v", err)
+	}
+	selfC, err := node.NewNode(rootC, node.Options{})
+	if err != nil {
+		t.Fatalf("load node C failed: %v", err)
+	}
+	selfD, err := node.NewNode(rootD, node.Options{})
+	if err != nil {
+		t.Fatalf("load node D failed: %v", err)
+	}
+
+	addrC := freeUDPAddr(t)
+	if err := selfB.Peers.Upsert(peer.Peer{NodeID: selfA.ID, PubKey: selfA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+	if err := selfB.Peers.Upsert(peer.Peer{NodeID: selfC.ID, PubKey: selfC.PubKey}, true); err != nil {
+		t.Fatalf("seed peer C failed: %v", err)
+	}
+	if _, err := selfB.Peers.SetAddrUnverified(peer.Peer{NodeID: selfC.ID, PubKey: selfC.PubKey}, addrC, true); err != nil {
+		t.Fatalf("set C addr hint failed: %v", err)
+	}
+	if err := selfC.Peers.Upsert(peer.Peer{NodeID: selfB.ID, PubKey: selfB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+
+	if err := selfB.Members.Add(selfA.ID, false); err != nil {
+		t.Fatalf("add member A to B failed: %v", err)
+	}
+	if err := selfB.Members.Add(selfB.ID, false); err != nil {
+		t.Fatalf("add member B to B failed: %v", err)
+	}
+	if err := selfB.Members.Add(selfC.ID, false); err != nil {
+		t.Fatalf("add member C to B failed: %v", err)
+	}
+	if err := selfC.Members.Add(selfB.ID, false); err != nil {
+		t.Fatalf("add member B to C failed: %v", err)
+	}
+	if err := selfC.Members.Add(selfC.ID, false); err != nil {
+		t.Fatalf("add member C to C failed: %v", err)
+	}
+
+	checker := math4.NewLocalChecker(math4.Options{})
+	ready := make(chan struct{})
+	go func() {
+		_ = network.ListenAndServeWithResponderFrom(addrC, ready, true, func(senderAddr string, data []byte) ([]byte, error) {
+			resp, _, err := recvDataWithResponse(data, nil, selfC, checker, senderAddr)
+			if err != nil {
+				return nil, err
+			}
+			return resp, nil
+		})
+	}()
+	select {
+	case <-ready:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timeout waiting for C quic server ready")
+	}
+
+	hello1, err := selfD.BuildHello1(selfA.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	hello1Data, err := proto.EncodeHello1Msg(hello1)
+	if err != nil {
+		t.Fatalf("encode hello1 failed: %v", err)
+	}
+	if err := enforceTypeMax(proto.MsgTypeHello1, len(hello1Data)); err != nil {
+		t.Fatalf("hello1 too large: %v", err)
+	}
+
+	peerB := peer.Peer{NodeID: selfB.ID, PubKey: selfB.PubKey}
+	gossipData, err := buildGossipPushForPeer(peerB, hello1Data, 2, selfA)
+	if err != nil {
+		t.Fatalf("build gossip push failed: %v", err)
+	}
+	_, _, recvErr := handleGossipPush(gossipData, nil, selfB, checker, "127.0.0.1:1111")
+	if recvErr != nil {
+		t.Fatalf("handle gossip push failed: msg=%s err=%v", recvErr.msg, recvErr.err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := findPeer(selfC.Peers.List(), selfD.ID); ok {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("expected C to learn D from forwarded gossip")
+}
+
+func TestGossipForwardSendsGossipPush(t *testing.T) {
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+
+	runOK(t, homeB, "keygen")
+	runOK(t, homeC, "keygen")
+
+	t.Setenv("WEB4_GOSSIP_FANOUT", "1")
+	t.Setenv("WEB4_GOSSIP_TTL_HOPS", "2")
+
+	rootB := filepath.Join(homeB, ".web4mvp")
+	rootC := filepath.Join(homeC, ".web4mvp")
+
+	selfB, err := node.NewNode(rootB, node.Options{})
+	if err != nil {
+		t.Fatalf("load node B failed: %v", err)
+	}
+	selfC, err := node.NewNode(rootC, node.Options{})
+	if err != nil {
+		t.Fatalf("load node C failed: %v", err)
+	}
+
+	addrC := freeUDPAddr(t)
+	if err := selfB.Peers.Upsert(peer.Peer{NodeID: selfC.ID, PubKey: selfC.PubKey}, true); err != nil {
+		t.Fatalf("seed peer C failed: %v", err)
+	}
+	if _, err := selfB.Peers.SetAddrUnverified(peer.Peer{NodeID: selfC.ID, PubKey: selfC.PubKey}, addrC, true); err != nil {
+		t.Fatalf("set C addr hint failed: %v", err)
+	}
+	if err := selfB.Members.Add(selfC.ID, false); err != nil {
+		t.Fatalf("add member C failed: %v", err)
+	}
+
+	var sent []byte
+	prevSend := sendFunc
+	sendFunc = func(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) error {
+		sent = append([]byte(nil), data...)
+		return nil
+	}
+	t.Cleanup(func() {
+		sendFunc = prevSend
+	})
+
+	hello1, err := selfC.BuildHello1(selfB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	envelope, err := proto.EncodeHello1Msg(hello1)
+	if err != nil {
+		t.Fatalf("encode hello1 failed: %v", err)
+	}
+	forwardGossip(proto.GossipPushMsg{Hops: 2}, envelope, proto.MsgTypeHello1, "testmsgid", selfB, "127.0.0.1:12345")
+	if len(sent) == 0 {
+		t.Fatalf("expected gossip forward send")
+	}
+	var hdr struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(sent, &hdr); err != nil {
+		t.Fatalf("decode forwarded message failed: %v", err)
+	}
+	if hdr.Type != proto.MsgTypeGossipPush {
+		t.Fatalf("expected gossip_push, got %q", hdr.Type)
 	}
 }
 

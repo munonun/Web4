@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 : "${WEB4_STORE_MAX_BYTES:?set WEB4_STORE_MAX_BYTES (e.g. 65536) to run smoke tests}"
+: "${WEB4_QUIC_IDLE_TIMEOUT_SEC:=60}"
+: "${WEB4_QUIC_HANDSHAKE_TIMEOUT_SEC:=30}"
+: "${WEB4_QUIC_STREAM_TIMEOUT_SEC:=20}"
+: "${WEB4_QUIC_ACQUIRE_TIMEOUT_MS:=500}"
+: "${WEB4_DISABLE_LIMITER:=1}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=check6_lib.sh
+source "${SCRIPT_DIR}/check6_lib.sh"
 pass() {
 	echo "PASS: $1"
 }
@@ -30,6 +39,32 @@ PY
 }
 
 declare -A USED_PORTS=()
+USED_PORT_LIST=()
+
+port_available() {
+	local port="$1"
+	if command -v python3 >/dev/null 2>&1; then
+		python3 - "$port" <<'PY' >/dev/null 2>&1
+import socket, sys
+port = int(sys.argv[1])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("127.0.0.1", port))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+sys.exit(0)
+PY
+		return $?
+	fi
+	# Fallback: /dev/tcp returns success if something is listening.
+	if (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1; then
+		return 1
+	fi
+	return 0
+}
 
 pick_unique_port() {
 	local fallback="$1"
@@ -40,7 +75,11 @@ pick_unique_port() {
 		if [[ -n "${USED_PORTS[${p}]:-}" ]]; then
 			continue
 		fi
+		if ! port_available "${p}"; then
+			continue
+		fi
 		USED_PORTS["${p}"]=1
+		USED_PORT_LIST+=("${p}")
 		printf '%s' "${p}"
 		return 0
 	done
@@ -93,7 +132,19 @@ cleanup() {
 		kill "${SENDER_PID}" 2>/dev/null || true
 		wait "${SENDER_PID}" 2>/dev/null || true
 	fi
-	rm -rf "${TMPA}" "${TMPB}" "${TMPC}" "${TMPD}" "${TMPWORK}"
+	for port in "${USED_PORT_LIST[@]}"; do
+		for _ in $(seq 1 200); do
+			if port_available "${port}"; then
+				break
+			fi
+			sleep 0.01
+		done
+	done
+	if [[ "${SMOKE_KEEP_TMP:-}" == "1" ]]; then
+		echo "SMOKE_KEEP_TMP=1 leaving tmp dirs: ${TMPA} ${TMPB} ${TMPC} ${TMPD} ${TMPWORK}" >&2
+	else
+		rm -rf "${TMPA}" "${TMPB}" "${TMPC}" "${TMPD}" "${TMPWORK}"
+	fi
 	exit "${status}"
 }
 trap cleanup EXIT
@@ -102,8 +153,14 @@ if [[ "${WEB4_SMOKE_PKILL:-}" == "1" ]]; then
 	pkill -f "web4 quic-listen" 2>/dev/null || true
 fi
 
-WEB4_BIN="${TMPWORK}/web4"
-go build -o "${WEB4_BIN}" ./cmd/web4
+if [[ -n "${WEB4_BIN:-}" ]]; then
+	if [[ ! -x "${WEB4_BIN}" ]]; then
+		fail "WEB4_BIN not executable: ${WEB4_BIN}"
+	fi
+else
+	WEB4_BIN="${TMPWORK}/web4"
+	go build -o "${WEB4_BIN}" ./cmd/web4
+fi
 
 run_a() {
 	HOME="${TMPA}" "${WEB4_BIN}" "$@"
@@ -121,10 +178,30 @@ run_d() {
 	HOME="${TMPD}" "${WEB4_BIN}" "$@"
 }
 
+declare -A DEBUG_PEER_SEEN
+debug_peer_seen_once() {
+	if [[ "${WEB4_DEBUG:-}" != "1" ]]; then
+		return 0
+	fi
+	local label="$1"
+	local file="$2"
+	local id="$3"
+	local key="${label}:${id}"
+	if [[ -n "${DEBUG_PEER_SEEN[${key}]:-}" ]]; then
+		return 0
+	fi
+	if [[ -f "${file}" ]] && grep -q "${id}" "${file}"; then
+		DEBUG_PEER_SEEN["${key}"]=1
+		local line
+		line="$(grep -n "${id}" "${file}" | head -n 1 || true)"
+		echo "debug peers: ${label} saw ${id} at ${line}" >&2
+	fi
+}
+
 wait_quic_ready() {
 	local log="$1"
 	local label="$2"
-	for _ in $(seq 1 80); do
+	for _ in $(seq 1 400); do
 		if grep -q "quic listen ready:" "${log}"; then
 			return 0
 		fi
@@ -605,208 +682,333 @@ wait "${SERVER_PID}" 2>/dev/null || true
 SERVER_PID=""
 pass "check 5 (QUIC peer exchange)"
 
-server_log_a="${TMPWORK}/quic_gossip_a.log"
-server_log_b="${TMPWORK}/quic_gossip_b.log"
-server_log_c="${TMPWORK}/quic_gossip_c.log"
-server_log="${server_log_b}"
-echo "Starting QUIC server A (hello): env HOME=${TMPA} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORTA_HELLO}"
-env HOME="${TMPA}" "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORTA_HELLO}" >"${server_log_a}" 2>&1 &
-SERVER_PID_A=$!
-LISTENER_PIDS+=("${SERVER_PID_A}")
-echo "Starting QUIC server B: env HOME=${TMPB} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORTB}"
-env HOME="${TMPB}" WEB4_GOSSIP_FANOUT=2 WEB4_GOSSIP_TTL_HOPS=3 "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORTB}" >"${server_log_b}" 2>&1 &
-SERVER_PID_B=$!
-LISTENER_PIDS+=("${SERVER_PID_B}")
-echo "Starting QUIC server C: env HOME=${TMPC} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORTC}"
-env HOME="${TMPC}" "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORTC}" >"${server_log_c}" 2>&1 &
-SERVER_PID_C=$!
-LISTENER_PIDS+=("${SERVER_PID_C}")
+(
+	check6_apply_env_defaults
+	CHECK6_FAIL_EXIT=0
+	CHECK6_SUMMARY_ON_FAIL=1
+	CHECK6_PHASE=""
+	CHECK6_ADDR_A=""
+	CHECK6_ADDR_B=""
+	CHECK6_ADDR_C=""
 
-wait_quic_ready "${server_log_a}" "check 6 (gossip forward): server A did not start"
-wait_quic_ready "${server_log_b}" "check 6 (gossip forward): server B did not start"
-wait_quic_ready "${server_log_c}" "check 6 (gossip forward): server C did not start"
+	check6_cleanup() {
+		if [[ -n "${SERVER_PID_A:-}" ]]; then
+			kill "${SERVER_PID_A}" 2>/dev/null || true
+			wait "${SERVER_PID_A}" 2>/dev/null || true
+			SERVER_PID_A=""
+		fi
+		if [[ -n "${SERVER_PID_B:-}" ]]; then
+			kill "${SERVER_PID_B}" 2>/dev/null || true
+			wait "${SERVER_PID_B}" 2>/dev/null || true
+			SERVER_PID_B=""
+		fi
+		if [[ -n "${SERVER_PID_C:-}" ]]; then
+			kill "${SERVER_PID_C}" 2>/dev/null || true
+			wait "${SERVER_PID_C}" 2>/dev/null || true
+			SERVER_PID_C=""
+		fi
+	}
+	trap check6_cleanup EXIT
+	check6_quic_fail() {
+		local reason="$1"
+		local msg="$2"
+		check6_fail "${reason}" "${msg}"
+		quic_fail "${msg}"
+	}
 
-for _ in $(seq 1 20); do
-	if [[ -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
-		break
+	server_log_a="${TMPWORK}/quic_gossip_a.log"
+	server_log_b="${TMPWORK}/quic_gossip_b.log"
+	server_log_c="${TMPWORK}/quic_gossip_c.log"
+	server_log="${server_log_b}"
+	if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
+		echo "CHECK6_LIB_SOURCED=1"
+		type -t pick_n_ports >/dev/null || { echo "MISSING pick_n_ports"; exit 1; }
 	fi
-	sleep 0.05
-done
-for _ in $(seq 1 20); do
-	if [[ -f "${TMPB}/.web4mvp/devtls_ca.pem" ]]; then
-		break
+	ports="$(pick_n_ports 3)" || {
+		echo "CHECK6_FAIL reason=bad_port phase=servers_start details=\"pick_n_ports rc=$?\""
+		exit 1
+	}
+	if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
+		echo "CHECK6_PICKED_PORTS raw='${ports}'"
 	fi
-	sleep 0.05
-done
-for _ in $(seq 1 20); do
-	if [[ -f "${TMPC}/.web4mvp/devtls_ca.pem" ]]; then
-		break
+	read -r PORTA_HELLO PORTB PORTC <<<"${ports}"
+	if [[ -z "${PORTA_HELLO}" || -z "${PORTB}" || -z "${PORTC}" ]]; then
+		echo "CHECK6_FAIL reason=bad_port phase=servers_start details=\"empty ports after read\""
+		exit 1
 	fi
-	sleep 0.05
-done
-if [[ ! -f "${TMPA}/.web4mvp/devtls_ca.pem" || ! -f "${TMPB}/.web4mvp/devtls_ca.pem" || ! -f "${TMPC}/.web4mvp/devtls_ca.pem" ]]; then
-	quic_fail "check 6 (gossip forward): missing devtls CA"
-fi
-
-PUBC="$(cat "${TMPC}/.web4mvp/pub.hex")"
-NODEIDC="$(run_c node id | awk '/node_id:/ {print $2}')"
-NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
-NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
-
-# Seed A's peer store so gossip push can resolve B's pubkey+addr
-PUBB="$(cat "${TMPB}/.web4mvp/pub.hex")"
-printf '{"node_id":"%s","pubkey":"%s","addr":"%s"}\n' "${NODEIDB}" "${PUBB}" "127.0.0.1:${PORTB}" >> "${TMPA}/.web4mvp/peers.jsonl"
-found=0
-for _ in $(seq 1 20); do
-	if grep -q "${NODEIDB}" "${TMPA}/.web4mvp/peers.jsonl" && grep -q "${PORTB}" "${TMPA}/.web4mvp/peers.jsonl"; then
-		found=1
-		break
+	if ! [[ "${PORTA_HELLO}" =~ ^[0-9]+$ && "${PORTB}" =~ ^[0-9]+$ && "${PORTC}" =~ ^[0-9]+$ ]]; then
+		echo "CHECK6_FAIL reason=bad_port phase=servers_start details=\"port selection failed\""
+		check6_env_summary
+		exit 1
 	fi
-	sleep 0.05
-done
-if [[ "${found}" -ne 1 ]]; then
-	quic_fail "check 6 (gossip forward): peer seed missing on A"
-fi
-
-# Build peer mappings first so B learns C's pubkey+addr and vice versa
-run_checked "check 6 (gossip forward): node hello (A->B)" --log "${server_log_b}" --quiet run_a node hello --devtls --addr "127.0.0.1:${PORTB}" --devtls-ca "${TMPB}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDB}" --advertise-addr "127.0.0.1:${PORTA_HELLO}"
-run_checked "check 6 (gossip forward): node hello (C->B)" --log "${server_log_b}" --quiet run_c node hello --devtls --addr "127.0.0.1:${PORTB}" --devtls-ca "${TMPB}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDB}" --advertise-addr "127.0.0.1:${PORTC}"
-run_checked "check 6 (gossip forward): node hello (B->C)" --log "${server_log_c}" --quiet run_b node hello --devtls --addr "127.0.0.1:${PORTC}" --devtls-ca "${TMPC}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDC}"
-
-# Wait until B knows A and C identities
-found=0
-for _ in $(seq 1 60); do
-	if run_b node list | grep -q "${NODEIDA}" && run_b node list | grep -q "${NODEIDC}"; then
-		found=1
-		break
+	HOME_A="${TMPA}"
+	HOME_B="${TMPB}"
+	HOME_C="${TMPC}"
+	export HOME_A HOME_B HOME_C
+	a_addr="127.0.0.1:${PORTA_HELLO}"
+	b_addr="127.0.0.1:${PORTB}"
+	c_addr="127.0.0.1:${PORTC}"
+	CHECK6_ADDR_A="${a_addr}"
+	CHECK6_ADDR_B="${b_addr}"
+	CHECK6_ADDR_C="${c_addr}"
+	CA_A="${HOME_A}/.web4mvp/devtls_ca.pem"
+	CA_B="${HOME_B}/.web4mvp/devtls_ca.pem"
+	CA_C="${HOME_C}/.web4mvp/devtls_ca.pem"
+	export CA_A CA_B CA_C
+	if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
+		echo "CHECK6_PORTS porta=${PORTA_HELLO} portb=${PORTB} portc=${PORTC}"
+		echo "CHECK6_HOMES a=${HOME_A} b=${HOME_B} c=${HOME_C}"
+		echo "CHECK6_CAS ca_a=${CA_A} ca_b=${CA_B} ca_c=${CA_C}"
+		echo "CHECK6_ADDRS a=${a_addr} b=${b_addr} c=${c_addr}"
 	fi
-	sleep 0.05
-done
-if [[ "${found}" -ne 1 ]]; then
-	quic_fail "check 6 (gossip forward): peer hello missing on B"
-fi
-# Wait until C knows B identity (needed for membership gate on receive)
-found=0
-for _ in $(seq 1 60); do
-	if run_c node list | grep -q "${NODEIDB}"; then
-		found=1
-		break
+	if [[ -z "${PORTB}" || -z "${PORTC}" ]]; then
+		echo "CHECK6_FAIL reason=bad_port phase=servers_start details=\"empty PORTB/PORTC\""
+		check6_env_summary
+		exit 1
 	fi
-	sleep 0.05
-done
-if [[ "${found}" -ne 1 ]]; then
-	quic_fail "check 6 (gossip forward): peer hello missing on C"
-fi
-# Ensure B has C addr+pubkey so forward target resolves (membership alone is not enough)
-found=0
-for _ in $(seq 1 60); do
-	if run_b node list | grep -q "${NODEIDC}" && grep -q "${PORTC}" "${TMPB}/.web4mvp/peers.jsonl"; then
-		found=1
-		break
+	if ! check6_must_addr "${b_addr}" || ! check6_must_addr "${c_addr}"; then
+		echo "CHECK6_FAIL reason=bad_addr phase=servers_start details=\"empty port for B/C\""
+		check6_env_summary
+		exit 1
 	fi
-	sleep 0.05
-done
-if [[ "${found}" -ne 1 ]]; then
-	quic_fail "check 6 (gossip forward): B missing C addr/pubkey"
-fi
-# Ensure addr->node_id mapping points to C's identity based on latest JSONL entry
-if ! tac "${TMPB}/.web4mvp/peers.jsonl" | awk -v addr="127.0.0.1:${PORTC}" -v id="${NODEIDC}" '
-	$0 ~ addr {found=1; if ($0 ~ id) ok=1; exit}
-	END {exit !(found && ok)}
-'; then
-	quic_fail "check 6 (gossip forward): B addr mapping mismatch for C"
-	quic_fail "grep "127.0.0.1:${PORTC}" -n "${TMPB}/.web4mvp/peers.jsonl" | tail -n 20"
-fi
+	echo "Starting QUIC server A (hello): env HOME=${HOME_A} ${WEB4_BIN} quic-listen --devtls --addr ${a_addr}"
+	env HOME="${HOME_A}" "${WEB4_BIN}" quic-listen --devtls --addr "${a_addr}" >"${server_log_a}" 2>&1 &
+	SERVER_PID_A=$!
+	LISTENER_PIDS+=("${SERVER_PID_A}")
+	echo "Starting QUIC server B: env HOME=${HOME_B} ${WEB4_BIN} quic-listen --devtls --addr ${b_addr}"
+	env HOME="${HOME_B}" WEB4_GOSSIP_FANOUT=2 WEB4_GOSSIP_TTL_HOPS=3 "${WEB4_BIN}" quic-listen --devtls --addr "${b_addr}" >"${server_log_b}" 2>&1 &
+	SERVER_PID_B=$!
+	LISTENER_PIDS+=("${SERVER_PID_B}")
+	echo "Starting QUIC server C: env HOME=${HOME_C} ${WEB4_BIN} quic-listen --devtls --addr ${c_addr}"
+	env HOME="${HOME_C}" "${WEB4_BIN}" quic-listen --devtls --addr "${c_addr}" >"${server_log_c}" 2>&1 &
+	SERVER_PID_C=$!
+	LISTENER_PIDS+=("${SERVER_PID_C}")
 
-# Club gate: membership must be set before gossip is accepted/forwarded
-run_checked "check 6 (gossip forward): node join (B<-A)" --quiet run_b node join --node-id "${NODEIDA}"
-run_checked "check 6 (gossip forward): node join (B<-C)" --quiet run_b node join --node-id "${NODEIDC}"
-run_checked "check 6 (gossip forward): node join (B<-B)" --quiet run_b node join --node-id "${NODEIDB}"
-run_checked "check 6 (gossip forward): node join (C<-B)" --quiet run_c node join --node-id "${NODEIDB}"
-run_checked "check 6 (gossip forward): node join (C<-C)" --quiet run_c node join --node-id "${NODEIDC}"
+	check6_wait_ready "${server_log_a}" || { check6_quic_fail "listen_error" "check 6 (gossip forward): server A did not start"; }
+	check6_wait_ready "${server_log_b}" || { check6_quic_fail "listen_error" "check 6 (gossip forward): server B did not start"; }
+	check6_wait_ready "${server_log_c}" || { check6_quic_fail "listen_error" "check 6 (gossip forward): server C did not start"; }
+	a_addr="$(check6_extract_ready_addr "${server_log_a}")"
+	b_addr="$(check6_extract_ready_addr "${server_log_b}")"
+	c_addr="$(check6_extract_ready_addr "${server_log_c}")"
+	if [[ -z "${a_addr}" || -z "${b_addr}" || -z "${c_addr}" ]]; then
+		check6_quic_fail "listen_error" "check 6 (gossip forward): server did not start"
+	fi
+	CHECK6_ADDR_A="${a_addr}"
+	CHECK6_ADDR_B="${b_addr}"
+	CHECK6_ADDR_C="${c_addr}"
 
-run_b node members
-run_c node members
-run_b node list
-gossip_hello="${TMPWORK}/gossip_hello.json"
-forwarded=0
-for attempt in $(seq 1 5); do
-	run_checked "check 6 (gossip forward): node keygen (D) attempt ${attempt}" --quiet run_d keygen >/dev/null
-	NODEIDD="$(run_d node id | awk '/node_id:/ {print $2}')"
-	run_checked "check 6 (gossip forward): node join (B<-D) attempt ${attempt}" --quiet run_b node join --node-id "${NODEIDD}"
-	joined=0
-	for _ in $(seq 1 60); do
-		if run_b node members | grep -q "${NODEIDD}"; then
-			joined=1
+	for home_label in A B C; do
+		ca_var="CA_${home_label}"
+		ca_path="${!ca_var}"
+		if [[ ! -f "${ca_path}" ]]; then
+			echo "CHECK6_FAIL reason=missing_ca phase=servers_start details=\"CA not found for ${home_label}\""
+			check6_env_summary
+			exit 1
+		fi
+	done
+	check6_phase_mark "servers_ready"
+
+	PUBC="$(cat "${TMPC}/.web4mvp/pub.hex")"
+	NODEIDC="$(run_c node id | awk '/node_id:/ {print $2}')"
+	NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
+	NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
+
+	# Seed A's peer store so gossip push can resolve B's pubkey+addr
+	PUBB="$(cat "${TMPB}/.web4mvp/pub.hex")"
+	printf '{"node_id":"%s","pubkey":"%s","addr":"%s"}\n' "${NODEIDB}" "${PUBB}" "${b_addr}" >> "${TMPA}/.web4mvp/peers.jsonl"
+	found=0
+	for _ in $(seq 1 20); do
+		if grep -q "${NODEIDB}" "${TMPA}/.web4mvp/peers.jsonl" && grep -q "${b_addr}" "${TMPA}/.web4mvp/peers.jsonl"; then
+			found=1
 			break
 		fi
 		sleep 0.05
 	done
-	if [[ "${joined}" -ne 1 ]]; then
-		quic_fail "check 6 (gossip forward): B missing D membership"
+	if [[ "${found}" -ne 1 ]]; then
+		check6_quic_fail "no_conn" "check 6 (gossip forward): peer seed missing on A"
 	fi
-	run_checked "check 6 (gossip forward): node hello (D) attempt ${attempt}" --quiet run_d node hello --devtls --addr "127.0.0.1:${PORTA_HELLO}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDA}" --advertise-addr "127.0.0.1:${PORTD}" --out "${gossip_hello}"
-	if ! ( export WEB4_GOSSIP_TTL_HOPS=3; run_a gossip push --devtls --addr "127.0.0.1:${PORTB}" --devtls-ca "${TMPB}/.web4mvp/devtls_ca.pem" --in "${gossip_hello}" ); then
-		echo "gossip push attempt ${attempt} failed"
-		sleep 0.2
-		continue
-	fi
-	server_log="${server_log_c}"
-	for _ in $(seq 1 160); do
-		if run_c node list | grep -q "${NODEIDD}"; then
-			forwarded=1
+
+	# forward precondition: B must know C (addr+pubkey)
+	run_checked "check 6: learn C on B" --log "${server_log_c}" --quiet run_b node hello --devtls --addr "${c_addr}" --devtls-ca "${CA_C}" --to-id "${NODEIDC}"
+	run_checked "check 6: learn B on C" --log "${server_log_b}" --quiet run_c node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --to-id "${NODEIDB}"
+
+	# Build peer mappings first so B learns C's pubkey+addr and vice versa
+	run_checked "check 6 (gossip forward): node hello (A->B)" --log "${server_log_b}" --quiet run_a node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --to-id "${NODEIDB}" --advertise-addr "${a_addr}"
+	run_checked "check 6 (gossip forward): node hello (C->B)" --log "${server_log_b}" --quiet run_c node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --to-id "${NODEIDB}" --advertise-addr "${c_addr}"
+	run_checked "check 6 (gossip forward): node hello (B->C)" --log "${server_log_c}" --quiet run_b node hello --devtls --addr "${c_addr}" --devtls-ca "${CA_C}" --to-id "${NODEIDC}"
+
+	# Wait until B knows A and C identities
+	found=0
+	for _ in $(seq 1 60); do
+		if run_b node list | grep -q "${NODEIDA}" && run_b node list | grep -q "${NODEIDC}"; then
+			found=1
 			break
 		fi
-		sleep 0.1
+		sleep 0.05
 	done
-	if [[ "${forwarded}" -eq 1 ]]; then
-		break
+	if [[ "${found}" -ne 1 ]]; then
+		check6_quic_fail "no_conn" "check 6 (gossip forward): peer hello missing on B"
 	fi
-	sleep 0.2
-done
-if [[ "${forwarded}" -ne 1 ]]; then
-	# club model: print full command and state for easier diagnostics
-	echo "Command failed (check 6 (gossip forward): gossip push (A->B)): ( export WEB4_GOSSIP_TTL_HOPS=3; run_a gossip push --devtls --addr 127.0.0.1:${PORTB} --devtls-ca ${TMPB}/.web4mvp/devtls_ca.pem --in ${gossip_hello} )"
-	for log in "${server_log_a}" "${server_log_b}" "${server_log_c}"; do
-		if [[ -n "${log}" && -f "${log}" ]]; then
-			echo "Log tail (${log}):"
-			tail -n 80 "${log}" || true
-			echo "Membership gate hints (${log}):"
-			grep -E "unaccepted|unknown sender|unverified|member" "${log}" || true
+	# Wait until C knows B identity (needed for membership gate on receive)
+	found=0
+	for _ in $(seq 1 60); do
+		if run_c node list | grep -q "${NODEIDB}"; then
+			found=1
+			break
+		fi
+		sleep 0.05
+	done
+	if [[ "${found}" -ne 1 ]]; then
+		check6_quic_fail "no_conn" "check 6 (gossip forward): peer hello missing on C"
+	fi
+	wait_for_member_b_c() {
+		local deadline=$((SECONDS + 30))
+		while [[ "${SECONDS}" -lt "${deadline}" ]]; do
+			if run_b node list | grep -q "${NODEIDC}"; then
+				if awk -v id="${NODEIDC}" -v pub="${PUBC}" -v addr="${c_addr}" '$0 ~ id && $0 ~ pub && $0 ~ addr {found=1} END {exit !found}' "${TMPB}/.web4mvp/peers.jsonl"; then
+					return 0
+				fi
+			fi
+			sleep 0.2
+		done
+		return 1
+	}
+	# Precondition gate: B must already know C addr+pubkey before forward.
+	check6_phase_mark "pre_forward"
+	if ! wait_for_member_b_c; then
+		if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
+			node_list_summary="$(run_b node list | tr '\n' ' ' | tr -s ' ' | sed 's/ $//')"
+			echo "check 6 debug: B node list=${node_list_summary}"
+		fi
+		echo "CHECK6_FAIL reason=missing_member phase=pre_forward details=\"B missing C addr/pubkey\""
+		check6_env_summary
+		exit 1
+	fi
+	# Ensure addr->node_id mapping points to C's identity based on latest JSONL entry
+	found=0
+	for _ in $(seq 1 60); do
+		if tac "${TMPB}/.web4mvp/peers.jsonl" | awk -v addr="${c_addr}" -v id="${NODEIDC}" '
+			$0 ~ addr {found=1; if ($0 ~ id) ok=1; exit}
+			END {exit !(found && ok)}
+		'; then
+			found=1
+			break
+		fi
+		sleep 0.05
+	done
+	if [[ "${found}" -ne 1 ]]; then
+		check6_quic_fail "no_conn" "check 6 (gossip forward): B addr mapping mismatch for C"
+		check6_quic_fail "no_conn" "grep \"${c_addr}\" -n \"${TMPB}/.web4mvp/peers.jsonl\" | tail -n 20"
+	fi
+	check6_phase_mark "hello_done"
+
+	# Club gate: membership must be set before gossip is accepted/forwarded
+	run_checked "check 6 (gossip forward): node join (B<-A)" --quiet run_b node join --node-id "${NODEIDA}"
+	run_checked "check 6 (gossip forward): node join (B<-C)" --quiet run_b node join --node-id "${NODEIDC}"
+	run_checked "check 6 (gossip forward): node join (B<-B)" --quiet run_b node join --node-id "${NODEIDB}"
+	run_checked "check 6 (gossip forward): node join (C<-B)" --quiet run_c node join --node-id "${NODEIDB}"
+	run_checked "check 6 (gossip forward): node join (C<-C)" --quiet run_c node join --node-id "${NODEIDC}"
+
+	if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
+		run_b node members
+		run_c node members
+		run_b node list
+	fi
+	gossip_hello="${TMPWORK}/gossip_hello.json"
+	forwarded=0
+	run_checked "check 6 (gossip forward): node hello payload (A->B)" --quiet run_a node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --to-id "${NODEIDB}" --advertise-addr "${a_addr}" --out "${gossip_hello}"
+	if [[ "${WEB4_DEBUG:-}" == "1" ]]; then
+		payload_from="$(awk -F\" '/"from_node_id"/{print $4; exit}' "${gossip_hello}" 2>/dev/null || true)"
+		payload_to="$(awk -F\" '/"to_node_id"/{print $4; exit}' "${gossip_hello}" 2>/dev/null || true)"
+		echo "check 6 debug: A_ID=${NODEIDA} B_ID=${NODEIDB} C_ID=${NODEIDC} payload_from=${payload_from} payload_to=${payload_to}" >&2
+	fi
+	server_log="${server_log_c}"
+	for attempt in $(seq 1 1); do
+		if ! ( export WEB4_GOSSIP_TTL_HOPS=3; run_a gossip push --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --in "${gossip_hello}" ); then
+			echo "gossip push attempt failed"
+		fi
+		check6_phase_mark "gossip_push_sent"
+		b_received_phase=0
+		for _ in $(seq 1 300); do
+			debug_peer_seen_once "A peers" "${TMPA}/.web4mvp/peers.jsonl" "${NODEIDA}"
+			debug_peer_seen_once "A peers" "${TMPA}/.web4mvp/peers.jsonl" "${NODEIDB}"
+			debug_peer_seen_once "A peers" "${TMPA}/.web4mvp/peers.jsonl" "${NODEIDC}"
+			debug_peer_seen_once "B peers" "${TMPB}/.web4mvp/peers.jsonl" "${NODEIDA}"
+			debug_peer_seen_once "B peers" "${TMPB}/.web4mvp/peers.jsonl" "${NODEIDB}"
+			debug_peer_seen_once "B peers" "${TMPB}/.web4mvp/peers.jsonl" "${NODEIDC}"
+			debug_peer_seen_once "C peers" "${TMPC}/.web4mvp/peers.jsonl" "${NODEIDA}"
+			debug_peer_seen_once "C peers" "${TMPC}/.web4mvp/peers.jsonl" "${NODEIDB}"
+			debug_peer_seen_once "C peers" "${TMPC}/.web4mvp/peers.jsonl" "${NODEIDC}"
+			if run_c node list | grep -q "${NODEIDA}"; then
+				forwarded=1
+				check6_phase_mark "c_learned_a"
+				break
+			fi
+			if [[ "${b_received_phase}" -eq 0 ]] && grep -q "type=gossip_push" "${server_log_b}"; then
+				check6_phase_mark "b_received_gossip_push"
+				b_received_phase=1
+			fi
+			if grep -q "type=gossip_push" "${server_log_c}"; then
+				forwarded=1
+				break
+			fi
+			sleep 0.1
+		done
+		if [[ "${forwarded}" -eq 1 ]]; then
+			break
 		fi
 	done
-	echo "A members:"
-	run_a node members || true
-	echo "A peers file tail:"
-	tail -n 5 "${TMPA}/.web4mvp/peers.jsonl" || true
-	echo "B members:"
-	run_b node members || true
-	echo "B peers (list):"
-	run_b node list || true
-	echo "B peers file tail:"
-	tail -n 5 "${TMPB}/.web4mvp/peers.jsonl" || true
-	echo "gossip payload head:"
-	head -n 30 "${gossip_hello}" || true
-	echo "Log tail (${server_log_a}):"
-	tail -n 80 "${server_log_a}" || true
-	echo "Log tail (${server_log_b}):"
-	tail -n 80 "${server_log_b}" || true
-	echo "Log tail (${server_log_c}):"
-	tail -n 80 "${server_log_c}" || true
-	quic_fail "check 6 (gossip forward): peer not forwarded"
-fi
+	if [[ "${forwarded}" -ne 1 ]]; then
+		# club model: print full command and state for easier diagnostics
+		echo "Command failed (check 6 (gossip forward): gossip push (A->B)): ( export WEB4_GOSSIP_TTL_HOPS=3; run_a gossip push --devtls --addr ${b_addr} --devtls-ca ${CA_B} --in ${gossip_hello} )"
+		pattern="dial|connect|handshake|open stream|accept|timeout|deadline|reject|member|unaccepted|unknown sender"
+		for log in "${server_log_a}" "${server_log_b}" "${server_log_c}"; do
+			if [[ -n "${log}" && -f "${log}" ]]; then
+				echo "Log matches (${log}):"
+				grep -nE "${pattern}" "${log}" | tail -n 200 || true
+			fi
+		done
+		if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
+			echo "A members:"
+			run_a node members || true
+		fi
+		echo "A peers file tail:"
+		tail -n 5 "${TMPA}/.web4mvp/peers.jsonl" || true
+		if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
+			echo "B members:"
+			run_b node members || true
+			echo "B peers (list):"
+			run_b node list || true
+		fi
+		echo "B peers file tail:"
+		tail -n 5 "${TMPB}/.web4mvp/peers.jsonl" || true
+		echo "gossip payload head:"
+		head -n 30 "${gossip_hello}" || true
+		pattern="dial|connect|handshake|open stream|accept|timeout|deadline|reject|member|unaccepted|unknown sender"
+		echo "Log matches (${server_log_a}):"
+		grep -nE "${pattern}" "${server_log_a}" | tail -n 200 || true
+		echo "Log matches (${server_log_b}):"
+		grep -nE "${pattern}" "${server_log_b}" | tail -n 200 || true
+		echo "Log matches (${server_log_c}):"
+		grep -nE "${pattern}" "${server_log_c}" | tail -n 200 || true
+		check6_quic_fail "no_conn" "check 6 (gossip forward): peer not forwarded"
+	fi
 
-if grep -n "\\.\\.\\." scripts/smoke.sh >/dev/null 2>&1; then
-	echo "ERROR: ellipsis present in scripts/smoke.sh"
-	exit 1
-fi
+	if grep -n "\\.\\.\\." scripts/smoke.sh >/dev/null 2>&1; then
+		echo "ERROR: ellipsis present in scripts/smoke.sh"
+		exit 1
+	fi
 
-kill "${SERVER_PID_B}" 2>/dev/null || true
-wait "${SERVER_PID_B}" 2>/dev/null || true
-SERVER_PID_B=""
-kill "${SERVER_PID_C}" 2>/dev/null || true
-wait "${SERVER_PID_C}" 2>/dev/null || true
-SERVER_PID_C=""
-pass "check 6 (gossip forward)"
+	kill "${SERVER_PID_B}" 2>/dev/null || true
+	wait "${SERVER_PID_B}" 2>/dev/null || true
+	SERVER_PID_B=""
+	kill "${SERVER_PID_C}" 2>/dev/null || true
+	wait "${SERVER_PID_C}" 2>/dev/null || true
+	SERVER_PID_C=""
+	kill "${SERVER_PID_A}" 2>/dev/null || true
+	wait "${SERVER_PID_A}" 2>/dev/null || true
+	SERVER_PID_A=""
+	pass "check 6 (gossip forward)"
+)
 
 echo "ALL SMOKE CHECKS PASSED"

@@ -19,8 +19,9 @@ const (
 )
 
 type pooledConn struct {
-	conn     *quic.Conn
-	lastUsed time.Time
+	conn        *quic.Conn
+	lastUsed    time.Time
+	established time.Time
 }
 
 type addrFailure struct {
@@ -66,12 +67,14 @@ func (p *clientPool) get(ctx context.Context, addr string, tlsConf *tls.Config, 
 	} else {
 		p.mu.Unlock()
 	}
+	debugLog("quic dial to %s", addr)
 	conn, err := quic.DialAddr(ctx, addr, tlsConf, quicConf)
 	if err != nil {
 		return nil, err
 	}
+	debugLog("quic conn established to %s", addr)
 	p.mu.Lock()
-	p.conns[addr] = &pooledConn{conn: conn, lastUsed: now}
+	p.conns[addr] = &pooledConn{conn: conn, lastUsed: now, established: now}
 	p.mu.Unlock()
 	return conn, nil
 }
@@ -98,6 +101,30 @@ func (p *clientPool) drop(addr string, conn *quic.Conn, reason string) {
 	}
 	p.mu.Unlock()
 	_ = conn.CloseWithError(0, reason)
+}
+
+func (p *clientPool) forget(addr string, conn *quic.Conn) {
+	if p == nil || addr == "" || conn == nil {
+		return
+	}
+	p.mu.Lock()
+	if ent, ok := p.conns[addr]; ok && ent.conn == conn {
+		delete(p.conns, addr)
+	}
+	p.mu.Unlock()
+}
+
+func (p *clientPool) establishedAt(addr string, conn *quic.Conn) (time.Time, bool) {
+	if p == nil || addr == "" || conn == nil {
+		return time.Time{}, false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ent, ok := p.conns[addr]
+	if !ok || ent.conn != conn {
+		return time.Time{}, false
+	}
+	return ent.established, !ent.established.IsZero()
 }
 
 func (p *clientPool) recordFailure(addr string) int {

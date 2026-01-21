@@ -113,6 +113,62 @@ func TestStoreAddrCooldown(t *testing.T) {
 	}
 }
 
+func TestStoreDoesNotOverwriteAddrWithEmpty(t *testing.T) {
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	pub := pubWithByte(4)
+	id := node.DeriveNodeID(pub)
+	if err := st.Upsert(peer.Peer{NodeID: id, PubKey: pub}, true); err != nil {
+		t.Fatalf("upsert failed: %v", err)
+	}
+	if _, err := st.SetAddrUnverified(peer.Peer{NodeID: id, PubKey: pub}, "127.0.0.1:1111", true); err != nil {
+		t.Fatalf("set unverified addr failed: %v", err)
+	}
+	if err := st.Upsert(peer.Peer{NodeID: id, PubKey: pub, Addr: ""}, true); err != nil {
+		t.Fatalf("upsert empty addr failed: %v", err)
+	}
+	p, ok := findPeer(st.List(), id)
+	if !ok || p.Addr != "127.0.0.1:1111" {
+		t.Fatalf("expected addr to remain, got %q", p.Addr)
+	}
+}
+
+func TestStoreUnverifiedUpgradesToVerifiedOnMatch(t *testing.T) {
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	pub := pubWithByte(5)
+	id := node.DeriveNodeID(pub)
+	if err := st.Upsert(peer.Peer{NodeID: id, PubKey: pub}, true); err != nil {
+		t.Fatalf("upsert failed: %v", err)
+	}
+	if _, err := st.SetAddrUnverified(peer.Peer{NodeID: id, PubKey: pub}, "127.0.0.1:2222", true); err != nil {
+		t.Fatalf("set unverified addr failed: %v", err)
+	}
+	if st.IsAddrVerified(id) {
+		t.Fatalf("expected addr to be unverified")
+	}
+	if _, err := st.ObserveAddr(peer.Peer{NodeID: id, PubKey: pub}, "127.0.0.1:2222", "127.0.0.1:2222", true, true); err != nil {
+		t.Fatalf("observe addr failed: %v", err)
+	}
+	if !st.IsAddrVerified(id) {
+		t.Fatalf("expected addr to be verified")
+	}
+}
+
 func pubWithByte(b byte) []byte {
 	_ = b
 	pub, _, err := crypto.GenKeypair()

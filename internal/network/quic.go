@@ -15,6 +15,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync/atomic"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
@@ -105,18 +107,28 @@ func clientTLSConfig(insecure bool, devTLS bool, devTLSCAPath string) (*tls.Conf
 const (
 	maxIncomingStreams    = 64
 	maxIncomingUniStreams = 64
-	maxIdleTimeout        = 20 * time.Second
-	keepAlivePeriod       = 10 * time.Second
-	handshakeIdleTimeout  = 10 * time.Second
 
 	maxConnHandlers   = 128
 	maxStreamHandlers = 128
-	acquireTimeout    = 100 * time.Millisecond
-	streamRWTimeout   = 5 * time.Second
 	maxConnsPerIP     = 4
 	maxStreamsPerIP   = 32
 
 	streamBusyErrCode quic.StreamErrorCode = 0x10
+)
+
+var (
+	maxIdleTimeout       = 60 * time.Second
+	handshakeIdleTimeout = 10 * time.Second
+	acquireTimeout       = 100 * time.Millisecond
+	streamRWTimeout      = 5 * time.Second
+	streamAcceptTimeout  = 5 * time.Second
+	keepAlivePeriod      = 10 * time.Second
+	maxConnsPerIPEnv     = maxConnsPerIP
+	maxStreamsPerIPEnv   = maxStreamsPerIP
+)
+var (
+	connSeq   uint64
+	streamSeq uint64
 )
 
 type Semaphore struct {
@@ -125,6 +137,63 @@ type Semaphore struct {
 
 func NewSemaphore(n int) *Semaphore {
 	return &Semaphore{ch: make(chan struct{}, n)}
+}
+
+func init() {
+	maxIdleTimeout = envDurationSeconds("WEB4_QUIC_IDLE_TIMEOUT_SEC", maxIdleTimeout)
+	handshakeIdleTimeout = envDurationSeconds("WEB4_QUIC_HANDSHAKE_TIMEOUT_SEC", handshakeIdleTimeout)
+	streamRWTimeout = envDurationSeconds("WEB4_QUIC_STREAM_TIMEOUT_SEC", streamRWTimeout)
+	streamAcceptTimeout = envDurationSeconds("WEB4_QUIC_ACCEPT_TIMEOUT_SEC", streamRWTimeout)
+	acquireTimeout = envDurationMillis("WEB4_QUIC_ACQUIRE_TIMEOUT_MS", acquireTimeout)
+	keepAlivePeriod = envDurationSeconds("WEB4_QUIC_KEEPALIVE_SEC", keepAlivePeriod)
+	maxConnsPerIPEnv = envLimiter("WEB4_LIMITER_MAX_CONNS_PER_IP", "WEB4_LIMITER_MULTIPLIER", maxConnsPerIP)
+	maxStreamsPerIPEnv = envLimiter("WEB4_LIMITER_MAX_STREAMS_PER_IP", "WEB4_LIMITER_MULTIPLIER", maxStreamsPerIP)
+	if os.Getenv("WEB4_DISABLE_LIMITER") == "1" {
+		maxConnsPerIPEnv = 0
+		maxStreamsPerIPEnv = 0
+	}
+}
+
+func envDurationSeconds(name string, def time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return time.Duration(v) * time.Second
+}
+
+func envDurationMillis(name string, def time.Duration) time.Duration {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return time.Duration(v) * time.Millisecond
+}
+
+func envLimiter(baseVar string, multVar string, def int) int {
+	raw := os.Getenv(baseVar)
+	if raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+			return v
+		}
+	}
+	multRaw := os.Getenv(multVar)
+	if multRaw == "" {
+		return def
+	}
+	mult, err := strconv.Atoi(multRaw)
+	if err != nil || mult <= 0 {
+		return def
+	}
+	return def * mult
 }
 
 func (s *Semaphore) Acquire(ctx context.Context) error {
@@ -182,13 +251,19 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 		logInfo("quic listen error: %v", err)
 		return err
 	}
-	logInfo("quic listen ready: %s", addr)
+	// Readiness signal is used by check6 to avoid flaky startup races (ports not yet bound).
+	readyAddr := addr
+	if listener != nil && listener.Addr() != nil {
+		readyAddr = listener.Addr().String()
+	}
+	logInfo("quic listen ready: %s", readyAddr)
+	logInfo("READY addr=%s", readyAddr)
 	if ready != nil {
 		close(ready)
 	}
 	connSem := NewSemaphore(maxConnHandlers)
 	streamSem := NewSemaphore(maxStreamHandlers)
-	ipLimits := newIPLimiter(maxConnsPerIP, maxStreamsPerIP)
+	ipLimits := newIPLimiter(maxConnsPerIPEnv, maxStreamsPerIPEnv)
 	for {
 		conn, err := listener.Accept(context.Background())
 		if err != nil {
@@ -196,10 +271,12 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 			return err
 		}
 		remoteAddr := conn.RemoteAddr().String()
+		connToken := fmt.Sprintf("%p", conn)
+		connID := atomic.AddUint64(&connSeq, 1)
 		ip := remoteIP(conn.RemoteAddr())
 		if !ipLimits.acquireConn(ip) {
 			_ = conn.CloseWithError(0, "too many connections")
-			logInfo("quic connection rejected: per-ip limit")
+			logInfo("DROP reason=per_ip_limit from=%s type=conn err=too_many_connections", remoteAddr)
 			continue
 		}
 		acceptCtx, cancel := context.WithTimeout(context.Background(), acquireTimeout)
@@ -211,14 +288,21 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 			continue
 		}
 		cancel()
-		logInfo("accepted connection")
-		go func() {
+		logInfo("accepted connection addr=%s conn_id=%d conn=%s", remoteAddr, connID, connToken)
+		go func(connID uint64, remoteAddr string, connToken string) {
 			defer connSem.Release()
 			defer ipLimits.releaseConn(ip)
 			c := conn
+			lastStreamAt := time.Now()
 			for {
-				stream, err := c.AcceptStream(context.Background())
+				acceptCtx, cancel := context.WithTimeout(context.Background(), streamAcceptTimeout)
+				stream, err := c.AcceptStream(acceptCtx)
+				cancel()
 				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						logInfo("quic accept stream timeout conn_id=%d since_last_stream=%s", connID, time.Since(lastStreamAt))
+						continue
+					}
 					if isBenignAcceptErr(err) {
 						logInfo("quic accept stream closed: %v", err)
 						return
@@ -226,10 +310,12 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 					logInfo("quic accept stream error: %v", err)
 					return
 				}
-				logInfo("accepted stream")
+				lastStreamAt = time.Now()
+				streamID := atomic.AddUint64(&streamSeq, 1)
+				logInfo("accepted stream addr=%s conn_id=%d stream_id=%d conn=%s stream=%s", remoteAddr, connID, streamID, connToken, streamIDString(stream))
 				if !ipLimits.acquireStream(ip) {
 					closeStreamWithError(stream, streamBusyErrCode, "per-ip stream limit")
-					logInfo("quic stream rejected: per-ip limit")
+					logInfo("DROP reason=per_ip_stream_limit from=%s type=stream err=per_ip_stream_limit", remoteAddr)
 					continue
 				}
 				streamCtx, streamCancel := context.WithTimeout(context.Background(), acquireTimeout)
@@ -241,11 +327,11 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 					continue
 				}
 				streamCancel()
-				go func(s *quic.Stream, sender string) {
+				go func(s *quic.Stream, sender string, connID uint64, streamID uint64) {
 					defer streamSem.Release()
 					defer ipLimits.releaseStream(ip)
 					defer s.Close()
-					logInfo("read start")
+					logInfo("read start conn_id=%d stream_id=%d", connID, streamID)
 					data, err := readFrameWithTimeout(s, streamRWTimeout)
 					if err != nil {
 						if errors.Is(err, io.EOF) {
@@ -255,15 +341,20 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 						}
 						return
 					}
-					logInfo("read %d bytes", len(data))
+					logInfo("read conn_id=%d stream_id=%d addr=%s raw_len=%d sha256=%s", connID, streamID, sender, len(data), hashHex(data))
+					if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+						logInfo("WIRE RECV addr=%s conn_id=%d stream_id=%d conn=%s stream=%s raw_len=%d sha256=%s preview=%s", sender, connID, streamID, connToken, streamIDString(s), len(data), hashHex(data), previewBytes(data, 80))
+					}
 					msgType := "unknown"
 					var hdr struct {
 						Type string `json:"type"`
 					}
 					if err := json.Unmarshal(data, &hdr); err == nil && hdr.Type != "" {
 						msgType = hdr.Type
+					} else if err != nil && os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+						logInfo("quic read type parse error: %v", err)
 					}
-					logInfo("read %d bytes, type=%s, calling recv", len(data), msgType)
+					logInfo("read %d bytes, type=%s, calling recv conn_id=%d stream_id=%d", len(data), msgType, connID, streamID)
 					resp, err := handle(sender, data)
 					if err != nil {
 						logInfo("quic handler error: %v", err)
@@ -285,9 +376,9 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 							logInfo("sent hello2")
 						}
 					}
-				}(stream, remoteAddr)
+				}(stream, remoteAddr, connID, streamID)
 			}
-		}()
+		}(connID, remoteAddr, connToken)
 	}
 }
 
@@ -367,6 +458,46 @@ func loadDevTLSCertPoolWithFallback(path string, allowFallback bool) (*x509.Cert
 
 func logInfo(format string, args ...any) {
 	_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func debugLog(format string, args ...any) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	logInfo(format, args...)
+}
+
+func previewBytes(b []byte, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(b) > max {
+		b = b[:max]
+	}
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c >= 32 && c < 127 {
+			out[i] = c
+		} else {
+			out[i] = '.'
+		}
+	}
+	return string(out)
+}
+
+func hashHex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func streamIDString(stream *quic.Stream) string {
+	if stream == nil {
+		return ""
+	}
+	if s, ok := any(stream).(interface{ StreamID() quic.StreamID }); ok {
+		return fmt.Sprintf("%d", s.StreamID())
+	}
+	return ""
 }
 
 func remoteIP(addr net.Addr) string {

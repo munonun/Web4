@@ -179,6 +179,9 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	if derived != fromID {
 		return proto.Hello2Msg{}, errors.New("hello1 from_id mismatch")
 	}
+	if fromID == n.ID {
+		return proto.Hello2Msg{}, errors.New("hello1 from_id self")
+	}
 	if toID != n.ID {
 		return proto.Hello2Msg{}, errors.New("hello1 to_id mismatch")
 	}
@@ -194,21 +197,29 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 		return proto.Hello2Msg{}, errors.New("hello1 replay")
 	}
 	n.Sessions.RecordHello1(fromID, h1Hash)
-	if err := n.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub}, true); err != nil {
+	peerInfo := peer.Peer{NodeID: fromID, PubKey: fromPub}
+	if err := n.Peers.Upsert(peerInfo, true); err != nil {
 		return proto.Hello2Msg{}, err
 	}
-	if senderAddr != "" {
+	observedAddr := senderAddr
+	if observedAddr == "" && m.FromAddr != "" && isAddrParseable(m.FromAddr) {
+		observedAddr = m.FromAddr
+	}
+	if observedAddr != "" {
 		candidateAddr := ""
 		verified := false
-		if m.FromAddr != "" && sameHost(senderAddr, m.FromAddr) {
+		if m.FromAddr != "" && isAddrParseable(m.FromAddr) && (senderAddr == "" || sameHost(senderAddr, m.FromAddr)) {
 			candidateAddr = m.FromAddr
-			verified = m.FromAddr == senderAddr
+			verified = senderAddr != "" && m.FromAddr == senderAddr
+		} else if senderAddr != "" {
+			candidateAddr = senderAddr
+			verified = true
 		}
-		if _, err := n.Peers.ObserveAddr(peer.Peer{NodeID: fromID, PubKey: fromPub}, senderAddr, candidateAddr, verified, true); err != nil {
+		if _, err := n.Peers.ObserveAddr(peerInfo, observedAddr, candidateAddr, verified, true); err != nil {
 			return proto.Hello2Msg{}, err
 		}
 		if candidateAddr != "" && !verified {
-			if _, err := n.Peers.SetAddrUnverified(peer.Peer{NodeID: fromID, PubKey: fromPub}, candidateAddr, true); err != nil {
+			if _, err := n.Peers.SetAddrUnverified(peerInfo, candidateAddr, true); err != nil {
 				return proto.Hello2Msg{}, err
 			}
 		}
@@ -378,5 +389,21 @@ func sameHost(a, b string) bool {
 	if err != nil {
 		hb = b
 	}
-	return ha != "" && hb != "" && ha == hb
+	if ha == "" || hb == "" {
+		return false
+	}
+	if ha == hb {
+		return true
+	}
+	ipA := net.ParseIP(ha)
+	ipB := net.ParseIP(hb)
+	if ipA != nil && ipB != nil && ipA.IsLoopback() && ipB.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+func isAddrParseable(addr string) bool {
+	_, _, err := net.SplitHostPort(addr)
+	return err == nil
 }

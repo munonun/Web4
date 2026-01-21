@@ -76,6 +76,8 @@ func MaxSizeForType(t string) int {
 		return MaxPeerExchangeRespSize
 	case MsgTypeGossipPush:
 		return MaxGossipPushSize
+	case MsgTypeGossipAck:
+		return MaxGossipAckSize
 	case MsgTypeSecureEnvelope:
 		return MaxSecureEnvelopeSize
 	default:

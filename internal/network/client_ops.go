@@ -3,12 +3,104 @@ package network
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"time"
 
 	quic "github.com/quic-go/quic-go"
+
+	"web4mvp/internal/proto"
 )
 
 var clientConns = newClientPool(clientConnIdle)
+
+func check6WireEnabled() bool {
+	return os.Getenv("WEB4_CHECK6_DEBUG") == "1"
+}
+
+func logWireSend(stage string, addr string, conn *quic.Conn, stream *quic.Stream, payload []byte) {
+	frameLen := -1
+	if frame, err := proto.EncodeFrame(payload); err == nil {
+		frameLen = len(frame)
+	}
+	connID := fmt.Sprintf("%p", conn)
+	localAddr := ""
+	remoteAddr := ""
+	if conn != nil {
+		if la := conn.LocalAddr(); la != nil {
+			localAddr = la.String()
+		}
+		if ra := conn.RemoteAddr(); ra != nil {
+			remoteAddr = ra.String()
+		}
+	}
+	logInfo("WIRE SEND %s addr=%s conn=%s stream=%s intended_len=%d written_len=%d sha256=%s preview=%s",
+		stage, addr, connID, streamIDString(stream), len(payload), frameLen, hashHex(payload), previewBytes(payload, 80))
+	if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+		logInfo("WIRE SEND %s local=%s remote=%s conn=%s stream=%s", stage, localAddr, remoteAddr, connID, streamIDString(stream))
+	}
+}
+
+func logWireWrite(addr string, conn *quic.Conn, stream *quic.Stream, payload []byte, writtenLen int, closeWriteErr error) {
+	if !check6WireEnabled() {
+		return
+	}
+	connID := fmt.Sprintf("%p", conn)
+	errStr := ""
+	if closeWriteErr != nil {
+		errStr = closeWriteErr.Error()
+	}
+	logInfo("WIRE SEND WRITE addr=%s conn=%s stream=%s written_len=%d sha256=%s close_write_err=%s",
+		addr, connID, streamIDString(stream), writtenLen, hashHex(payload), errStr)
+}
+
+func closeWrite(stream *quic.Stream) error {
+	if stream == nil {
+		return nil
+	}
+	if cw, ok := any(stream).(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
+}
+
+func formatRFC3339Nano(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339Nano)
+}
+
+func logSendTiming(addr string, conn *quic.Conn, stream *quic.Stream, connEstablished time.Time, streamOpenStart time.Time, streamOpenEnd time.Time, writeStart time.Time, writeEnd time.Time, frameLen int, writeErr error, streamCloseErr error, connCloseErr error) {
+	if os.Getenv("WEB4_WIRE_DEBUG") != "1" {
+		return
+	}
+	connID := fmt.Sprintf("%p", conn)
+	connAge := ""
+	if !connEstablished.IsZero() {
+		connAge = time.Since(connEstablished).String()
+	}
+	streamOpenDur := streamOpenEnd.Sub(streamOpenStart).String()
+	writeDur := writeEnd.Sub(writeStart).String()
+	writeErrStr := ""
+	if writeErr != nil {
+		writeErrStr = writeErr.Error()
+	}
+	streamCloseErrStr := ""
+	if streamCloseErr != nil {
+		streamCloseErrStr = streamCloseErr.Error()
+	}
+	connCloseErrStr := ""
+	if connCloseErr != nil {
+		connCloseErrStr = connCloseErr.Error()
+	}
+	logInfo("WIRE SEND META addr=%s conn=%s stream=%s conn_established=%s conn_age=%s stream_open_start=%s stream_open_end=%s stream_open_ms=%s write_start=%s write_end=%s write_ms=%s written_len=%d write_err=%s stream_close_err=%s conn_close_err=%s",
+		addr, connID, streamIDString(stream),
+		formatRFC3339Nano(connEstablished), connAge,
+		formatRFC3339Nano(streamOpenStart), formatRFC3339Nano(streamOpenEnd), streamOpenDur,
+		formatRFC3339Nano(writeStart), formatRFC3339Nano(writeEnd), writeDur,
+		frameLen, writeErrStr, streamCloseErrStr, connCloseErrStr)
+}
 
 func SendWithContext(ctx context.Context, addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) error {
 	tlsConf, err := clientTLSConfig(insecure, devTLS, devTLSCAPath)
@@ -38,7 +130,9 @@ func SendWithContext(ctx context.Context, addr string, data []byte, insecure boo
 			}
 			continue
 		}
+		streamOpenStart := time.Now()
 		stream, err := conn.OpenStreamSync(ctx)
+		streamOpenEnd := time.Now()
 		if err != nil {
 			lastErr = err
 			clientConns.drop(addr, conn, "open stream failed")
@@ -47,19 +141,47 @@ func SendWithContext(ctx context.Context, addr string, data []byte, insecure boo
 			}
 			continue
 		}
-		if err := writeFrameWithTimeout(stream, streamRWTimeout, data); err != nil {
-			lastErr = err
+		if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+			logWireSend("pre", addr, conn, stream, data)
+		}
+		connEstablished := mustEstablishedAt(addr, conn)
+		writeStart := time.Now()
+		writeErr := writeFrameWithTimeout(stream, streamRWTimeout, data)
+		writeEnd := time.Now()
+		frameLen := len(data) + 4
+		if frame, err := proto.EncodeFrame(data); err == nil {
+			frameLen = len(frame)
+		}
+		if writeErr != nil {
+			lastErr = writeErr
 			_ = stream.Close()
 			clientConns.drop(addr, conn, "write failed")
+			logSendTiming(addr, conn, stream, connEstablished, streamOpenStart, streamOpenEnd, writeStart, writeEnd, frameLen, writeErr, nil, nil)
 			if !backoffRetry(ctx, clientConns.recordFailure(addr)) {
 				break
 			}
 			continue
 		}
-		if err := stream.Close(); err != nil {
-			logInfo("quic stream close error: %v", err)
+		closeWriteErr := error(nil)
+		if check6WireEnabled() {
+			closeWriteErr = closeWrite(stream)
+			logWireWrite(addr, conn, stream, data, frameLen, closeWriteErr)
 		}
-		clientConns.touch(addr, conn)
+		if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+			logWireSend("post", addr, conn, stream, data)
+		}
+		streamCloseErr := stream.Close()
+		if streamCloseErr != nil {
+			logInfo("quic stream close error: %v", streamCloseErr)
+		}
+		connCloseErr := error(nil)
+		if os.Getenv("WEB4_WIRE_CLOSE_CONN") == "1" {
+			connCloseErr = conn.CloseWithError(0, "client done")
+			clientConns.forget(addr, conn)
+		} else {
+			clientConns.touch(addr, conn)
+		}
+		logSendTiming(addr, conn, stream, connEstablished, streamOpenStart, streamOpenEnd, writeStart, writeEnd, frameLen, nil, streamCloseErr, connCloseErr)
 		clientConns.resetFailures(addr)
 		return nil
 	}
@@ -97,7 +219,9 @@ func ExchangeWithContext(ctx context.Context, addr string, data []byte, insecure
 			}
 			continue
 		}
+		streamOpenStart := time.Now()
 		stream, err := conn.OpenStreamSync(ctx)
+		streamOpenEnd := time.Now()
 		if err != nil {
 			lastErr = err
 			clientConns.drop(addr, conn, "open stream failed")
@@ -106,29 +230,58 @@ func ExchangeWithContext(ctx context.Context, addr string, data []byte, insecure
 			}
 			continue
 		}
-		if err := writeFrameWithTimeout(stream, streamRWTimeout, data); err != nil {
-			lastErr = err
+		if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+			logWireSend("pre", addr, conn, stream, data)
+		}
+		connEstablished := mustEstablishedAt(addr, conn)
+		writeStart := time.Now()
+		writeErr := writeFrameWithTimeout(stream, streamRWTimeout, data)
+		writeEnd := time.Now()
+		frameLen := len(data) + 4
+		if frame, err := proto.EncodeFrame(data); err == nil {
+			frameLen = len(frame)
+		}
+		if writeErr != nil {
+			lastErr = writeErr
 			_ = stream.Close()
 			clientConns.drop(addr, conn, "write failed")
+			logSendTiming(addr, conn, stream, connEstablished, streamOpenStart, streamOpenEnd, writeStart, writeEnd, frameLen, writeErr, nil, nil)
 			if !backoffRetry(ctx, clientConns.recordFailure(addr)) {
 				break
 			}
 			continue
+		}
+		closeWriteErr := error(nil)
+		if check6WireEnabled() {
+			closeWriteErr = closeWrite(stream)
+			logWireWrite(addr, conn, stream, data, frameLen, closeWriteErr)
+		}
+		if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+			logWireSend("post", addr, conn, stream, data)
 		}
 		resp, err := readFrameWithTimeout(stream, streamRWTimeout)
 		if err != nil {
 			lastErr = err
 			_ = stream.Close()
 			clientConns.drop(addr, conn, "read failed")
+			logSendTiming(addr, conn, stream, connEstablished, streamOpenStart, streamOpenEnd, writeStart, writeEnd, frameLen, nil, nil, nil)
 			if !backoffRetry(ctx, clientConns.recordFailure(addr)) {
 				break
 			}
 			continue
 		}
-		if err := stream.Close(); err != nil {
-			logInfo("quic stream close error: %v", err)
+		streamCloseErr := stream.Close()
+		if streamCloseErr != nil {
+			logInfo("quic stream close error: %v", streamCloseErr)
 		}
-		clientConns.touch(addr, conn)
+		connCloseErr := error(nil)
+		if os.Getenv("WEB4_WIRE_CLOSE_CONN") == "1" {
+			connCloseErr = conn.CloseWithError(0, "client done")
+			clientConns.forget(addr, conn)
+		} else {
+			clientConns.touch(addr, conn)
+		}
+		logSendTiming(addr, conn, stream, connEstablished, streamOpenStart, streamOpenEnd, writeStart, writeEnd, frameLen, nil, streamCloseErr, connCloseErr)
 		clientConns.resetFailures(addr)
 		return resp, nil
 	}
@@ -154,27 +307,68 @@ func ExchangeOnceWithContext(ctx context.Context, addr string, data []byte, inse
 	if err != nil {
 		return nil, err
 	}
+	streamOpenStart := time.Now()
 	stream, err := conn.OpenStreamSync(ctx)
+	streamOpenEnd := time.Now()
 	if err != nil {
 		clientConns.drop(addr, conn, "open stream failed")
 		return nil, err
 	}
-	if err := writeFrameWithTimeout(stream, streamRWTimeout, data); err != nil {
+	if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+		logWireSend("pre", addr, conn, stream, data)
+	}
+	connEstablished := mustEstablishedAt(addr, conn)
+	writeStart := time.Now()
+	writeErr := writeFrameWithTimeout(stream, streamRWTimeout, data)
+	writeEnd := time.Now()
+	frameLen := len(data) + 4
+	if frame, err := proto.EncodeFrame(data); err == nil {
+		frameLen = len(frame)
+	}
+	if writeErr != nil {
 		_ = stream.Close()
 		clientConns.drop(addr, conn, "write failed")
-		return nil, err
+		logSendTiming(addr, conn, stream, connEstablished, streamOpenStart, streamOpenEnd, writeStart, writeEnd, frameLen, writeErr, nil, nil)
+		return nil, writeErr
+	}
+	closeWriteErr := error(nil)
+	if check6WireEnabled() {
+		closeWriteErr = closeWrite(stream)
+		logWireWrite(addr, conn, stream, data, frameLen, closeWriteErr)
+	}
+	if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+		logWireSend("post", addr, conn, stream, data)
 	}
 	resp, err := readFrameWithTimeout(stream, streamRWTimeout)
 	if err != nil {
 		_ = stream.Close()
 		clientConns.drop(addr, conn, "read failed")
+		logSendTiming(addr, conn, stream, connEstablished, streamOpenStart, streamOpenEnd, writeStart, writeEnd, frameLen, nil, nil, nil)
 		return nil, err
 	}
-	if err := stream.Close(); err != nil {
-		logInfo("quic stream close error: %v", err)
+	streamCloseErr := stream.Close()
+	if streamCloseErr != nil {
+		logInfo("quic stream close error: %v", streamCloseErr)
 	}
-	clientConns.touch(addr, conn)
+	connCloseErr := error(nil)
+	if os.Getenv("WEB4_WIRE_CLOSE_CONN") == "1" {
+		connCloseErr = conn.CloseWithError(0, "client done")
+		clientConns.forget(addr, conn)
+	} else {
+		clientConns.touch(addr, conn)
+	}
+	logSendTiming(addr, conn, stream, connEstablished, streamOpenStart, streamOpenEnd, writeStart, writeEnd, frameLen, nil, streamCloseErr, connCloseErr)
 	return resp, nil
+}
+
+func mustEstablishedAt(addr string, conn *quic.Conn) time.Time {
+	if clientConns == nil {
+		return time.Time{}
+	}
+	if t, ok := clientConns.establishedAt(addr, conn); ok {
+		return t
+	}
+	return time.Time{}
 }
 
 func backoffRetry(ctx context.Context, failures int) bool {

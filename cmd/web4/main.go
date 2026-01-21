@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	stdsha256 "crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -348,7 +349,7 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 	if err := json.Unmarshal(data, &hdr); err != nil {
 		return nil, false, reject("decode message type failed", err)
 	}
-	debugRecv("parsed type=%s secure=false sender=%s", hdr.Type, senderAddr)
+	debugRecv("recv top-level type=%s sender=%s", hdr.Type, senderAddr)
 	if err := enforceTypeMax(hdr.Type, len(data)); err != nil {
 		return nil, false, reject("message too large", err)
 	}
@@ -433,35 +434,28 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err != nil {
 			return nil, false, reject("decode hello1 failed", err)
 		}
-		fromID, toID, fromPub, ea, na, sig, err := proto.DecodeHello1Fields(m)
+		fromID, toID, _, _, _, _, err := proto.DecodeHello1Fields(m)
 		if err != nil {
 			return nil, false, reject("decode hello1 failed", err)
+		}
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			via := "direct"
+			if wasSecure || senderAddr == "" {
+				via = "gossip"
+			}
+			fmt.Fprintf(os.Stderr, "hello1 recv from=%x to=%x via=%s\n", fromID[:], toID[:], via)
+		}
+		if fromID == self.ID {
+			return nil, false, reject("invalid hello1", errors.New("hello1 from_id self"))
+		}
+		if toID != self.ID {
+			return nil, false, reject("invalid hello1", errors.New("hello1 to_id mismatch"))
 		}
 		prevAddr := ""
 		if senderAddr != "" {
 			if existing, ok := findPeerByNodeID(self.Peers.List(), fromID); ok {
 				prevAddr = existing.Addr
 			}
-		}
-		if toID != self.ID && senderAddr == "" {
-			derived := node.DeriveNodeID(fromPub)
-			if derived != fromID {
-				return nil, false, reject("invalid hello1", errors.New("hello1 from_id mismatch"))
-			}
-			sigInput := hello1SigInput(fromID, toID, ea, na)
-			if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
-				debugCount.incVerify("hello1")
-				return nil, false, reject("invalid hello1", errors.New("bad hello1 signature"))
-			}
-			newState := true
-			if existing, ok := findPeerByNodeID(self.Peers.List(), fromID); ok {
-				_ = existing
-				newState = false
-			}
-			if err := self.Peers.Upsert(peer.Peer{NodeID: fromID, PubKey: fromPub}, true); err != nil {
-				return nil, false, reject("invalid hello1", err)
-			}
-			return nil, newState, nil
 		}
 		resp, err := self.HandleHello1From(m, senderAddr)
 		if err != nil {
@@ -474,6 +468,9 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			if updated, ok := findPeerByNodeID(self.Peers.List(), fromID); ok && updated.Addr != "" && updated.Addr != prevAddr {
 				debugCount.incAddrChange("hello1")
 			}
+		}
+		if wasSecure || senderAddr == "" {
+			return nil, false, nil
 		}
 		respData, err := proto.EncodeHello2Msg(resp)
 		if err != nil {
@@ -565,10 +562,10 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			return nil, false, reject("invalid contract open", err)
 		}
 		id := proto.ContractID(c.IOU)
-	if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(proto.OpenSignBytes(c.IOU, c.EphemeralPub, c.Sealed)), c.SigDebt) {
-		debugCount.incVerify("contract_open")
-		return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
-	}
+		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(proto.OpenSignBytes(c.IOU, c.EphemeralPub, c.Sealed)), c.SigDebt) {
+			debugCount.incVerify("contract_open")
+			return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
+		}
 		plain, err := e2eOpen(proto.MsgTypeContractOpen, id, 0, self.PrivKey, c.EphemeralPub, c.Sealed)
 		if err != nil {
 			return nil, false, reject("sealed open failed", err)
@@ -637,10 +634,10 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			return nil, false, reject("invalid repay request fields", err)
 		}
 		reqSign := proto.RepayReqSignBytes(req, ephPub, sealed)
-	if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqSign), sigB) {
-		debugCount.incVerify("repay_req")
-		return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
-	}
+		if !crypto.Verify(c.IOU.Debtor, crypto.SHA3_256(reqSign), sigB) {
+			debugCount.incVerify("repay_req")
+			return nil, false, reject("invalid sigb", fmt.Errorf("debtor signature check failed"))
+		}
 		plain, err := e2eOpen(proto.MsgTypeRepayReq, cid, req.ReqNonce, self.PrivKey, ephPub, sealed)
 		if err != nil {
 			return nil, false, reject("sealed repay request failed", err)
@@ -707,10 +704,10 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			return nil, false, reject("missing repay request", fmt.Errorf("ack without repay request"))
 		}
 		ackSign := proto.AckSignBytes(a.ContractID, a.Decision, a.Close, a.EphemeralPub, a.Sealed)
-	if !crypto.Verify(c.IOU.Creditor, crypto.SHA3_256(ackSign), sigA) {
-		debugCount.incVerify("repay_ack")
-		return nil, false, reject("invalid siga", fmt.Errorf("creditor signature check failed"))
-	}
+		if !crypto.Verify(c.IOU.Creditor, crypto.SHA3_256(ackSign), sigA) {
+			debugCount.incVerify("repay_ack")
+			return nil, false, reject("invalid siga", fmt.Errorf("creditor signature check failed"))
+		}
 		if reqMsg.Close != a.Close {
 			return nil, false, reject("ack close mismatch", fmt.Errorf("close flag mismatch"))
 		}
@@ -761,6 +758,8 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 var gossipSeen = newGossipCache(gossipCacheCap, gossipCacheTTL)
 var gossipRand = mrand.New(mrand.NewSource(time.Now().UnixNano()))
 var gossipRandMu sync.Mutex
+var sendFunc = network.Send
+var exchangeFn = network.ExchangeWithContext
 
 func gossipDebugf(format string, args ...any) {
 	if os.Getenv("WEB4_DEBUG") == "1" {
@@ -782,6 +781,43 @@ func hashHex(data []byte) string {
 	}
 	sum := crypto.SHA3_256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func sha256Hex(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	sum := stdsha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func msgIDFor(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	sum := stdsha256.Sum256(data)
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+func check6Enabled() bool {
+	return os.Getenv("WEB4_CHECK6_DEBUG") == "1"
+}
+
+func check6Phase(format string, args ...any) {
+	if !check6Enabled() {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func check6Drop(msgID string, reason string, details string) {
+	if !check6Enabled() {
+		return
+	}
+	if details == "" {
+		details = "-"
+	}
+	fmt.Fprintf(os.Stderr, "DROP msg_id=%s reason=%s details=%s\n", msgID, reason, details)
 }
 
 func isZeroNodeID(id [32]byte) bool {
@@ -876,13 +912,61 @@ func (c *gossipCache) pruneLocked(now time.Time) {
 }
 
 func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker math4.LocalChecker, senderAddr string) ([]byte, bool, *recvError) {
+	msgID := msgIDFor(data)
+	check6Phase("PHASE recv_push msg_id=%s", msgID)
+	drop := func(reason string, t string, err error) {
+		msg := ""
+		if err != nil {
+			msg = err.Error()
+		}
+		fmt.Fprintf(os.Stderr, "DROP reason=%s from=%s type=%s err=%s\n", reason, senderAddr, t, msg)
+	}
 	msg, err := proto.DecodeGossipPushMsg(data)
 	if err != nil {
+		drop("decode_gossip_push", "gossip_push", err)
+		check6Drop(msgID, "bad_json", err.Error())
 		return nil, false, &recvError{msg: "decode gossip push failed", err: err}
 	}
-	gossipDebugf("recv gossip_push from addr=%s from_node_id=%s hops=%d", senderAddr, msg.FromNodeID, msg.Hops)
+	ackResp := []byte(nil)
+	ackSHA := ""
+	if os.Getenv("WEB4_CHECK6_ACK") == "1" {
+		ackSHA = sha256Hex(data)
+		ack := proto.GossipAckMsg{Sha256: ackSHA}
+		if self != nil {
+			ack.FromNodeID = hex.EncodeToString(self.ID[:])
+		}
+		if encoded, err := proto.EncodeGossipAckMsg(ack); err == nil {
+			ackResp = encoded
+		} else {
+			fmt.Fprintf(os.Stderr, "gossip_ack encode failed: %v\n", err)
+		}
+	}
+	if check6Enabled() {
+		check6Phase("PARSE_OK msg_id=%s type=%s", msgID, msg.Type)
+		if ackResp != nil {
+			fmt.Fprintf(os.Stderr, "ACK_SENT msg_id=%s sha256=%s\n", msgID, ackSHA)
+		}
+		go func() {
+			_, _ = handleGossipPushInner(msg, data, st, self, checker, senderAddr, msgID, drop)
+		}()
+		return ackResp, false, nil
+	}
+	newState, recvErr := handleGossipPushInner(msg, data, st, self, checker, senderAddr, msgID, drop)
+	if recvErr != nil {
+		return nil, false, recvErr
+	}
+	if ackResp != nil {
+		fmt.Fprintf(os.Stderr, "ACK_SENT msg_id=%s sha256=%s\n", msgID, ackSHA)
+	}
+	return ackResp, newState, nil
+}
+
+func handleGossipPushInner(msg proto.GossipPushMsg, data []byte, st *store.Store, self *node.Node, checker math4.LocalChecker, senderAddr string, msgID string, drop func(string, string, error)) (bool, *recvError) {
+	gossipDebugf("gossip_push start incoming_type=%s inner_type=? forward_addr=? outbound_type=? addr=%s from_node_id=%s hops=%d", msg.Type, senderAddr, msg.FromNodeID, msg.Hops)
 	if self == nil || self.Peers == nil {
-		return nil, false, &recvError{msg: "node unavailable", err: fmt.Errorf("peer store unavailable")}
+		drop("peer_store_unavailable", msg.Type, fmt.Errorf("peer store unavailable"))
+		check6Drop(msgID, "no_members", "peer store unavailable")
+		return false, &recvError{msg: "node unavailable", err: fmt.Errorf("peer store unavailable")}
 	}
 	if err := self.Peers.Refresh(); err != nil {
 		gossipDebugf("gossip_push peer refresh failed: %v", err)
@@ -895,30 +979,39 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 	fromID, err := decodeNodeIDHex(msg.FromNodeID)
 	if err != nil {
 		gossipDebugf("drop gossip_push: bad from_node_id=%s", msg.FromNodeID)
-		return nil, false, nil
+		drop("bad_from_node_id", msg.Type, err)
+		check6Drop(msgID, "bad_json", err.Error())
+		return false, nil
 	}
 	forwarder, ok := findPeerByNodeID(self.Peers.List(), fromID)
 	if !ok || len(forwarder.PubKey) == 0 {
 		gossipDebugf("drop gossip_push: unknown forwarder node_id=%x addr=%s", fromID[:], senderAddr)
-		return nil, false, nil
+		drop("unknown_forwarder", msg.Type, fmt.Errorf("forwarder missing"))
+		check6Drop(msgID, "no_members", "unknown forwarder")
+		return false, nil
 	}
 	gossipDebugf("gossip_push forwarder node_id=%x addr=%s", fromID[:], senderAddr)
 	gossipDebugf("gossip_push recv msg.from_node_id=%x sender_pub_node_id=%s sender_pub_hash=%s", fromID[:], nodeIDHexFromPub(forwarder.PubKey), nodeIDHexFromPub(forwarder.PubKey))
 	if self.Members == nil || !self.Members.Has(fromID) {
 		gossipDebugf("drop gossip_push: forwarder not member node_id=%x", fromID[:])
-		return nil, false, nil
+		drop("membership_gate", msg.Type, fmt.Errorf("forwarder not member"))
+		check6Drop(msgID, "no_members", "forwarder not member")
+		return false, nil
 	}
 	gossipDebugf("gossip_push forwarder ok node_id=%x", fromID[:])
 	sig, err := decodeSigHex(msg.SigFrom)
 	if err != nil {
 		gossipDebugf("drop gossip_push: bad sig_from")
-		return nil, false, nil
+		drop("bad_sig_from", msg.Type, err)
+		check6Drop(msgID, "bad_sig", err.Error())
+		return false, nil
 	}
 	payloadMsg := msg
 	payloadMsg.SigFrom = ""
 	payload, err := proto.EncodeGossipPushMsg(payloadMsg)
 	if err != nil {
-		return nil, false, &recvError{msg: "encode gossip push failed", err: err}
+		check6Drop(msgID, "bad_json", err.Error())
+		return false, &recvError{msg: "encode gossip push failed", err: err}
 	}
 	version := payloadMsg.ProtoVersion
 	if version == "" {
@@ -935,13 +1028,16 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 	if !verifySigFrom(version, suite, mt, fromID, payload, sig, forwarder.PubKey) {
 		debugCount.incVerify("gossip_push")
 		gossipDebugf("drop gossip_push: sig verify failed node_id=%x", fromID[:])
-		return nil, false, nil
+		drop("sig_verify_failed", msg.Type, fmt.Errorf("sig verify failed"))
+		check6Drop(msgID, "bad_sig", "sig verify failed")
+		return false, nil
 	}
 	gossipDebugf("gossip_push sig verify ok node_id=%x", fromID[:])
 	ephPub, sealed, err := proto.DecodeSealedFields(msg.EphemeralPub, msg.Sealed)
 	if err != nil {
 		gossipDebugf("drop gossip_push: bad sealed fields err=%v", err)
-		return nil, false, &recvError{msg: "decode gossip envelope failed", err: err}
+		check6Drop(msgID, "bad_json", err.Error())
+		return false, &recvError{msg: "decode gossip envelope failed", err: err}
 	}
 	selfPubNodeID := nodeIDHexFromPub(self.PubKey)
 	gossipDebugf("gossip_push self_node_id=%x self_pub_node_id=%s self_pub_hash=%s", self.ID[:], selfPubNodeID, hashHex(self.PubKey))
@@ -952,13 +1048,16 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 		debugCount.incDecrypt("gossip_push")
 		gossipDebugf("gossip_push open failed msg.from_node_id=%x sender_pub_node_id=%s sender_pub_hash=%s", fromID[:], nodeIDHexFromPub(forwarder.PubKey), hashHex(forwarder.PubKey))
 		gossipDebugf("drop gossip_push: envelope open failed err=%v", err)
-		return nil, false, &recvError{msg: "decode gossip envelope failed", err: err}
+		drop("open_failed", msg.Type, err)
+		check6Drop(msgID, "bad_json", err.Error())
+		return false, &recvError{msg: "decode gossip envelope failed", err: err}
 	}
+	var hdr struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(envelope, &hdr)
+	check6Phase("PHASE parse_inner msg_id=%s inner_type=%s", msgID, hdr.Type)
 	if os.Getenv("WEB4_DEBUG") == "1" {
-		var hdr struct {
-			Type string `json:"type"`
-		}
-		_ = json.Unmarshal(envelope, &hdr)
 		gossipDebugf("gossip_push opened payload_len=%d type=%s", len(envelope), hdr.Type)
 	}
 	var hash [32]byte
@@ -968,26 +1067,34 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 	copy(hash[:], crypto.SHA3_256(hashInput))
 	if gossipSeen.Seen(hash) {
 		gossipDebugf("drop gossip_push: already seen hash=%x", hash[:])
-		return nil, false, nil
+		drop("already_seen", msg.Type, fmt.Errorf("already seen"))
+		check6Drop(msgID, "no_members", "already seen")
+		return false, nil
 	}
 	gossipDebugf("gossip_push new hash=%x", hash[:])
-	_, newState, innerErr := recvDataWithResponse(envelope, st, self, checker, "")
+	var newState bool
+	var innerErr error
+	if hdr.Type == proto.MsgTypeHello1 {
+		newState, innerErr = handleGossipHello1Payload(envelope, self, senderAddr)
+	} else {
+		_, newState, innerErr = recvDataWithResponse(envelope, st, self, checker, "")
+	}
 	if innerErr != nil {
 		gossipDebugf("drop gossip_push: payload recv failed err=%v", innerErr)
-		return nil, false, &recvError{msg: "gossip payload failed", err: innerErr}
+		drop("payload_recv_failed", hdr.Type, innerErr)
+		check6Drop(msgID, "bad_json", innerErr.Error())
+		return false, &recvError{msg: "gossip payload failed", err: innerErr}
 	}
 	gossipSeen.Add(hash)
-	if !newState {
-		gossipDebugf("drop gossip_push: payload produced no new state")
-		return nil, false, nil
-	}
 	gossipDebugf("forward gossip_push: peers=%d", len(self.Peers.List()))
-	forwardGossip(msg, envelope, self, senderAddr)
-	return nil, true, nil
+	forwardGossip(msg, envelope, hdr.Type, msgID, self, senderAddr)
+	gossipDebugf("gossip_push end incoming_type=%s inner_type=%s forward_addr=%s outbound_type=gossip_push", msg.Type, hdr.Type, senderAddr)
+	return newState, nil
 }
 
-func forwardGossip(msg proto.GossipPushMsg, envelope []byte, self *node.Node, senderAddr string) {
+func forwardGossip(msg proto.GossipPushMsg, envelope []byte, innerType string, msgID string, self *node.Node, senderAddr string) {
 	if self == nil || self.Peers == nil {
+		check6Drop(msgID, "no_members", "peer store unavailable")
 		return
 	}
 	hops := msg.Hops
@@ -996,65 +1103,235 @@ func forwardGossip(msg proto.GossipPushMsg, envelope []byte, self *node.Node, se
 	}
 	if hops <= 1 {
 		gossipDebugf("skip gossip_forward: hops=%d", hops)
+		check6Phase("PHASE ttl_check msg_id=%s ttl=%d decision=drop", msgID, hops)
+		check6Drop(msgID, "ttl_zero", fmt.Sprintf("hops=%d", hops))
 		return
 	}
+	check6Phase("PHASE ttl_check msg_id=%s ttl=%d decision=pass", msgID, hops)
 	fanout := gossipFanout()
 	if fanout <= 0 {
 		gossipDebugf("skip gossip_forward: fanout=%d", fanout)
+		check6Drop(msgID, "no_members", "fanout disabled")
 		return
 	}
 	candidates := filterGossipPeers(self.Peers.List(), senderAddr, self.Peers, self.ID)
+	fromMembers := false
 	if self.Members != nil {
 		memberCandidates := filterMemberPeers(candidates, self.Members)
 		if len(memberCandidates) > 0 {
+			fromMembers = true
 			candidates = memberCandidates
 		}
 	}
 	if len(candidates) == 0 {
 		gossipDebugf("skip gossip_forward: no candidates")
+		check6Phase("PHASE membership_lookup msg_id=%s targets=0", msgID)
+		check6Drop(msgID, "no_members", "no candidates")
 		return
 	}
+	check6Phase("PHASE membership_lookup msg_id=%s targets=%d", msgID, len(candidates))
 	gossipDebugf("gossip_forward candidates=%d fanout=%d hops=%d", len(candidates), fanout, hops)
 	gossipDebugf("gossip_forward self_node_id=%x signing_pub_node_id=%s sealing_priv_node_id=%x", self.ID[:], nodeIDHexFromPub(self.PubKey), self.ID[:])
 	selected := pickRandomPeers(candidates, fanout)
 	if len(selected) == 0 {
 		gossipDebugf("skip gossip_forward: empty selection")
+		check6Drop(msgID, "no_members", "empty selection")
 		return
 	}
 	for _, p := range selected {
-		if p.Addr == "" || isZeroNodeID(p.NodeID) {
+		addrSource := "default"
+		if fromMembers {
+			addrSource = "members"
+		}
+		gossipDebugf("forward attempt node_id=%x addr=%s", p.NodeID[:], p.Addr)
+		if p.NodeID == self.ID {
+			check6Drop(msgID, "self_target", "target is self")
+			continue
+		}
+		if p.Addr == "" {
+			gossipDebugf("forward skip reason=missing_addr node_id=%x", p.NodeID[:])
+			check6Drop(msgID, "no_addr_for_target", "missing addr")
+			continue
+		}
+		if isZeroNodeID(p.NodeID) {
+			gossipDebugf("forward skip reason=missing_node_id addr=%s", p.Addr)
+			check6Drop(msgID, "no_members", "missing node id")
 			continue
 		}
 		if mapped, ok := findPeerByAddr(self.Peers.List(), p.Addr); ok && mapped.NodeID != p.NodeID {
-			gossipDebugf("gossip forward drop: addr node_id mismatch addr=%s want=%x got=%x", p.Addr, p.NodeID[:], mapped.NodeID[:])
+			gossipDebugf("forward skip reason=addr_mismatch addr=%s want=%x got=%x", p.Addr, p.NodeID[:], mapped.NodeID[:])
+			check6Drop(msgID, "self_target", "addr mismatch")
 			continue
 		}
 		peerForSeal := p
 		if byID, ok := findPeerByNodeID(self.Peers.List(), p.NodeID); ok && len(byID.PubKey) > 0 {
 			peerForSeal = byID
 			peerForSeal.Addr = p.Addr
+			if byID.Addr != "" {
+				addrSource = "peer.addr"
+			}
 		}
 		if len(peerForSeal.PubKey) == 0 {
-			gossipDebugf("gossip forward skip: missing pubkey node_id=%x addr=%s", p.NodeID[:], p.Addr)
+			gossipDebugf("forward skip reason=missing_pubkey node_id=%x addr=%s", p.NodeID[:], p.Addr)
+			check6Drop(msgID, "no_members", "missing pubkey")
 			continue
 		}
+		if addrSource == "default" {
+			addrSource = "peer.addr"
+		}
+		check6Phase("PHASE send_attempt msg_id=%s target=%x addr=%s addr_source=%s", msgID, p.NodeID[:], p.Addr, addrSource)
 		gossipDebugf("gossip_forward target_peer_node_id=%x target_peer_pub_node_id=%s", peerForSeal.NodeID[:], nodeIDHexFromPub(peerForSeal.PubKey))
 		out, err := buildGossipPushForPeer(peerForSeal, envelope, hops-1, self)
 		if err != nil {
-			gossipDebugf("gossip forward skip: node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
+			gossipDebugf("forward skip reason=seal_error node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
+			check6Drop(msgID, "bad_json", err.Error())
 			continue
 		}
+		forwardSHA := sha256Hex(out)
+		forwardMsgID := ""
+		if forwardSHA != "" {
+			forwardMsgID = forwardSHA[:12]
+		}
+		if check6Enabled() {
+			fmt.Fprintf(os.Stderr, "FORWARD payload msg_id=%s forward_msg_id=%s sha256=%s len=%d\n", msgID, forwardMsgID, forwardSHA, len(out))
+		}
+		var outHdr struct {
+			Type string `json:"type"`
+		}
+		if err := json.Unmarshal(out, &outHdr); err != nil || outHdr.Type != proto.MsgTypeGossipPush {
+			panic(fmt.Sprintf("gossip forward produced non-gossip_push outbound=%q inner=%s addr=%s err=%v", outHdr.Type, innerType, p.Addr, err))
+		}
+		gossipDebugf("gossip_push forward meta incoming_type=%s inner_type=%s forward_addr=%s outbound_type=%s", msg.Type, innerType, p.Addr, outHdr.Type)
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			var top struct {
+				Type string `json:"type"`
+			}
+			if err := json.Unmarshal(out, &top); err == nil && top.Type != "" {
+				gossipDebugf("forward send type=%s to=%s", top.Type, p.Addr)
+			} else {
+				gossipDebugf("forward send type=unknown to=%s", p.Addr)
+			}
+		}
 		gossipDebugf("forward seal ok to node_id=%x addr=%s", p.NodeID[:], p.Addr)
-		if err := network.Send(p.Addr, out, false, true, ""); err != nil {
+		if check6Enabled() {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			resp, err := exchangeFn(ctx, p.Addr, out, false, true, "")
+			cancel()
+			if err != nil {
+				debugCount.incSend("gossip_forward")
+				errStr := err.Error()
+				reason := "send_error"
+				if errors.Is(err, context.DeadlineExceeded) {
+					reason = "ctx_deadline"
+				} else if strings.Contains(strings.ToLower(errStr), "rate") {
+					reason = "rate_limited"
+				} else if strings.Contains(strings.ToLower(errStr), "dial") {
+					reason = "send_error"
+				}
+				check6Phase("PHASE send_result msg_id=%s target=%x ok=0 err=%s", msgID, p.NodeID[:], errStr)
+				check6Drop(msgID, reason, errStr)
+				fmt.Fprintf(os.Stderr, "FORWARD_ACK msg_id=%s forward_msg_id=%s sha256=%s ack_sha= status=error err=%s\n", msgID, forwardMsgID, forwardSHA, errStr)
+				continue
+			}
+			ack, err := proto.DecodeGossipAckMsg(resp)
+			if err != nil {
+				errStr := err.Error()
+				check6Phase("PHASE send_result msg_id=%s target=%x ok=0 err=%s", msgID, p.NodeID[:], errStr)
+				check6Drop(msgID, "bad_json", errStr)
+				fmt.Fprintf(os.Stderr, "FORWARD_ACK msg_id=%s forward_msg_id=%s sha256=%s ack_sha= status=decode_error err=%s\n", msgID, forwardMsgID, forwardSHA, errStr)
+				continue
+			}
+			if ack.Sha256 != forwardSHA {
+				errStr := fmt.Sprintf("ack sha mismatch want=%s got=%s", forwardSHA, ack.Sha256)
+				check6Phase("PHASE send_result msg_id=%s target=%x ok=0 err=%s", msgID, p.NodeID[:], errStr)
+				check6Drop(msgID, "bad_json", errStr)
+				fmt.Fprintf(os.Stderr, "FORWARD_ACK msg_id=%s forward_msg_id=%s sha256=%s ack_sha=%s status=mismatch err=%s\n", msgID, forwardMsgID, forwardSHA, ack.Sha256, errStr)
+				continue
+			}
+			check6Phase("PHASE send_result msg_id=%s target=%x ok=1 err=", msgID, p.NodeID[:])
+			fmt.Fprintf(os.Stderr, "FORWARD_ACK msg_id=%s forward_msg_id=%s sha256=%s ack_sha=%s status=ok err=\n", msgID, forwardMsgID, forwardSHA, ack.Sha256)
 			debugCount.incSend("gossip_forward")
-			gossipDebugf("gossip forward failed: node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
+			continue
+		}
+		if err := sendFunc(p.Addr, out, false, true, ""); err != nil {
+			debugCount.incSend("gossip_forward")
+			gossipDebugf("forward failed reason=send_error node_id=%x addr=%s err=%v", p.NodeID[:], p.Addr, err)
 			if os.Getenv("WEB4_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "gossip forward failed: %v\n", err)
 			}
+			errStr := err.Error()
+			reason := "send_error"
+			if errors.Is(err, context.DeadlineExceeded) {
+				reason = "ctx_deadline"
+			} else if strings.Contains(strings.ToLower(errStr), "rate") {
+				reason = "rate_limited"
+			}
+			check6Phase("PHASE send_result msg_id=%s target=%x ok=0 err=%s", msgID, p.NodeID[:], errStr)
+			check6Drop(msgID, reason, errStr)
 			continue
 		}
+		check6Phase("PHASE send_result msg_id=%s target=%x ok=1 err=", msgID, p.NodeID[:])
 		gossipDebugf("gossip forward ok: node_id=%x addr=%s", p.NodeID[:], p.Addr)
 	}
+}
+
+func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string) (bool, error) {
+	if self == nil || self.Peers == nil {
+		return false, errors.New("peer store unavailable")
+	}
+	if err := enforceTypeMax(proto.MsgTypeHello1, len(data)); err != nil {
+		return false, err
+	}
+	m, err := proto.DecodeHello1Msg(data)
+	if err != nil {
+		return false, err
+	}
+	fromID, toID, fromPub, ea, na, sig, err := proto.DecodeHello1Fields(m)
+	if err != nil {
+		return false, err
+	}
+	if os.Getenv("WEB4_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "hello1 recv from=%x to=%x via=gossip\n", fromID[:], toID[:])
+	}
+	derived := node.DeriveNodeID(fromPub)
+	if derived != fromID {
+		return false, errors.New("hello1 from_id mismatch")
+	}
+	if fromID == self.ID {
+		return false, errors.New("hello1 from_id self")
+	}
+	sigInput := hello1SigInput(fromID, toID, ea, na)
+	if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
+		debugCount.incVerify("hello1")
+		return false, errors.New("bad hello1 signature")
+	}
+	newState := true
+	if _, ok := findPeerByNodeID(self.Peers.List(), fromID); ok {
+		newState = false
+	}
+	peerInfo := peer.Peer{NodeID: fromID, PubKey: fromPub}
+	if err := self.Peers.Upsert(peerInfo, true); err != nil {
+		return false, err
+	}
+	observedAddr := senderAddr
+	if observedAddr == "" && m.FromAddr != "" && isAddrParseable(m.FromAddr) {
+		observedAddr = m.FromAddr
+	}
+	if observedAddr != "" {
+		candidateAddr := ""
+		verified := false
+		if m.FromAddr != "" && isAddrParseable(m.FromAddr) && (senderAddr == "" || sameHost(senderAddr, m.FromAddr)) {
+			candidateAddr = m.FromAddr
+			verified = true
+		} else if senderAddr != "" {
+			candidateAddr = senderAddr
+			verified = true
+		}
+		if _, err := self.Peers.ObserveAddr(peerInfo, observedAddr, candidateAddr, verified, true); err != nil {
+			return false, err
+		}
+	}
+	return newState, nil
 }
 
 func filterGossipPeers(peers []peer.Peer, excludeAddr string, store *peer.Store, selfID [32]byte) []peer.Peer {
@@ -1229,6 +1506,52 @@ func hostForAddr(addr string) string {
 		return addr
 	}
 	return host
+}
+
+func previewBytes(b []byte, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	if len(b) > max {
+		b = b[:max]
+	}
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c >= 32 && c < 127 {
+			out[i] = c
+		} else {
+			out[i] = '.'
+		}
+	}
+	return string(out)
+}
+
+func sameHost(a, b string) bool {
+	ha, _, err := net.SplitHostPort(a)
+	if err != nil {
+		ha = a
+	}
+	hb, _, err := net.SplitHostPort(b)
+	if err != nil {
+		hb = b
+	}
+	if ha == "" || hb == "" {
+		return false
+	}
+	if ha == hb {
+		return true
+	}
+	ipA := net.ParseIP(ha)
+	ipB := net.ParseIP(hb)
+	if ipA != nil && ipB != nil && ipA.IsLoopback() && ipB.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+func isAddrParseable(addr string) bool {
+	_, _, err := net.SplitHostPort(addr)
+	return err == nil
 }
 
 func verifiedPeerForAddr(peers []peer.Peer, addr string, store *peer.Store) (peer.Peer, bool) {
@@ -2170,10 +2493,15 @@ func main() {
 			fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 
 			fail := func(msg string, err error) {
-				if os.Getenv("WEB4_DEBUG") == "1" {
+				reason := msg
+				if err != nil {
+					reason = fmt.Sprintf("%s: %v", msg, err)
+				}
+				fmt.Fprintf(os.Stderr, "gossip push failed: %s\n", reason)
+				if os.Getenv("WEB4_DEBUG") == "1" && err != nil {
 					die(msg, err)
 				}
-				dieMsg(invalidMessage)
+				os.Exit(1)
 			}
 
 			self, err := node.NewNode(root, node.Options{})
@@ -2293,6 +2621,14 @@ func main() {
 			if err != nil {
 				fail("read envelope failed", err)
 			}
+			inType := ""
+			var inHdr struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(data, &inHdr) == nil {
+				inType = inHdr.Type
+			}
+			fmt.Fprintf(os.Stderr, "OUTBOUND input type=%s bytes=%d preview=%s\n", inType, len(data), previewBytes(data, 80))
 			self, err := node.NewNode(root, node.Options{})
 			if err != nil {
 				fail("load node failed", err)
@@ -2305,10 +2641,30 @@ func main() {
 			if err != nil {
 				fail("encode gossip push failed", err)
 			}
-			if err := network.Send(*addr, out, false, *devTLS, *devTLSCA); err != nil {
+			outType := ""
+			var outHdr struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(out, &outHdr) == nil {
+				outType = outHdr.Type
+			}
+			fmt.Fprintf(os.Stderr, "OUTBOUND top-level type=%s bytes=%d to=%s preview=%s\n", outType, len(out), *addr, previewBytes(out, 80))
+			if os.Getenv("WEB4_CHECK6_ACK") == "1" {
+				resp, err := network.Exchange(*addr, out, false, *devTLS, *devTLSCA)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "GOSSIP_ACK status=error err=%v\n", err)
+				} else if len(resp) == 0 {
+					fmt.Fprintln(os.Stderr, "GOSSIP_ACK status=empty")
+				} else if ack, err := proto.DecodeGossipAckMsg(resp); err != nil {
+					fmt.Fprintf(os.Stderr, "GOSSIP_ACK status=error err=%v\n", err)
+				} else {
+					fmt.Fprintf(os.Stderr, "GOSSIP_ACK status=ok sha256=%s from_node_id=%s\n", ack.Sha256, ack.FromNodeID)
+				}
+			} else if err := network.Send(*addr, out, false, *devTLS, *devTLSCA); err != nil {
 				fail("gossip push failed", err)
 			}
 			fmt.Println("OK gossip push sent")
+			os.Exit(0)
 		default:
 			dieMsg("usage: web4 gossip <push>")
 		}
