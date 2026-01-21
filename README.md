@@ -1,144 +1,192 @@
 > Status: experimental / test-validated
 
-# Web4-MVP
+# Web4
 
-**Ledgerless P2P contracts. Verified by tests, not promises.**
+Ledgerless P2P contracts.
+Verified by tests, not promises.
 
-Web4-MVP is an experimental peer-to-peer contract protocol that removes the global ledger entirely.  
-No blockchain. No validators. No global consensus.
+Web4 is an experimental peer-to-peer protocol that removes the global ledger entirely.
+No blockchain.
+No validators.
+No global consensus.
 
-State is conserved locally through mathematical constraints,  
-and correctness is demonstrated through tests and real smoke runs.
+State correctness is enforced locally through structural constraints,
+and validated through deterministic tests rather than social agreement.
 
 ---
 
-## Why this exists
+## Motivation
 
-Blockchains solve trust by **adding structure**:
-ledgers, consensus, validators, staking, finality rules.
+Most distributed systems solve trust by adding structure:
+
+- global ledgers
+- consensus protocols
+- validators and finality rules
+- long-lived global history
 
 Web4 explores the opposite direction.
 
-What if we **remove** the global structure entirely,
-and only keep what is mathematically unavoidable?
+What if we remove the global structure entirely,
+and keep only what is mathematically unavoidable?
 
-- No shared ledger.
-- No global history.
-- Only local imbalance updates that must cancel out.
+- no shared ledger
+- no total ordering
+- no replayable global history
+- only local state transitions that must cancel out
 
----
-
-## What makes this different
-
-- **No global ledger**  
-  There is nothing to sync, replay, or finalize.
-
-- **Local correctness instead of global consensus**  
-  State transitions are validated locally using Laplacian-style constraints,
-  meaning every local imbalance must be canceled by another.
-
-- **Gossip instead of ordering**  
-  Messages propagate probabilistically, not sequentially.
-
-- **Cryptography as enforcement, not decoration**  
-  Every meaningful message is signed, framed, size-capped, and E2E sealed.
+If a transition does not conserve state locally,
+it is invalid immediately.
+There is no “later” reconciliation.
 
 ---
 
-## Project status (honest)
+## Core design principles
 
-This is **not** a finished product.
+### Ledgerless state
 
-What *is* ready:
+There is no global history to replay or synchronize.
+Each node validates state transitions locally using conservation-style constraints.
 
-- crypto primitives, framing, and signatures
-- E2E sealed payloads with PFS
-- gossip push plumbing with hop limits and fanout
-- store rotation and lookup correctness
-- QUIC transport hardening (type caps, size limits, rate limiting)
+If a state update cannot be balanced by another update,
+it is rejected.
 
-What is **not** ready yet:
+State correctness is local, not emergent.
 
-- a stable end-user CLI
-- long-running multi-node demo
+---
+
+### Gossip instead of ordering
+
+Messages propagate probabilistically via gossip.
+There is no canonical ordering of events.
+
+If a message matters, it survives by redundancy.
+If it does not propagate, it does not exist.
+
+---
+
+### Cryptography as enforcement
+
+Cryptography is used to enforce invariants, not to decorate the protocol.
+
+- all meaningful messages are signed
+- payloads are end-to-end sealed with PFS
+- message sizes and types are strictly capped
+- malformed or replayed data is rejected structurally
+
+Trust is minimized by construction.
+
+---
+
+### QUIC transport
+
+All communication uses QUIC as the underlying transport.
+
+- encrypted by default
+- connection-oriented without TCP head-of-line blocking
+- explicit framing and backpressure handling
+- suitable for hostile or unreliable networks
+
+---
+
+## Project scope
+
+This repository is not a finished product.
+
+What currently exists:
+
+- cryptographic framing and signatures
+- end-to-end sealed payloads with forward secrecy
+- gossip push and forwarding logic with hop limits
+- bounded storage with rotation invariants
+- deterministic smoke testing for multi-node scenarios
+- QUIC transport hardening (size caps, type caps, rate limits)
+
+What does not exist yet:
+
+- stable end-user CLI
+- long-running public network
 - production deployment assumptions
 
+This is a protocol and testing infrastructure experiment.
+
 ---
 
-## How this project is validated
+## Deterministic testing focus
 
-There is currently no stable `./web4` workflow for users.
+A core goal of Web4 is making non-deterministic P2P failures reproducible.
 
-Instead, correctness is demonstrated via tests.
+Distributed systems often fail in ways that cannot be replayed:
+timing races, message loss, partial propagation, inconsistent forwarding.
 
-### 1) Unit tests
+Web4 includes deterministic multi-node smoke tests that:
+
+- reproduce previously intermittent failures
+- classify failures explicitly (timeout, no-conn, forwarding failure)
+- allow repeated execution with identical outcomes
+
+Correctness is demonstrated by tests, not claims.
+
+---
+
+## Validation
+
+There is currently no stable user-facing workflow.
+
+Instead, correctness is demonstrated through testing.
+
+### Unit tests
 
 ```bash
 go test ./...
 ```
-These tests verify:
+### These verify:
 
-- message framing and size caps
+- framing and size limits
+
 - signature and tamper rejection
-- store rotation invariants
+
+- storage rotation invariants
+
 - sealed payload integrity
 
-
-### 2) Integration smoke run
-
+### Integration smoke tests
 ```bash
 WEB4_STORE_MAX_BYTES=65536 ./scripts/smoke.sh
 ```
+These tests exercise:
 
-The smoke run exercises:
+- real multi-node interaction
 
-- real node interaction
-- gossip forwarding paths
-- persistence under pressure
-- failure modes that unit tests do not cover
+- gossip propagation paths
+
+- persistence under load
+
+- failure modes invisible to unit tests
 
 If these pass, the system is behaving as designed.
 
----
-
-## Core ideas (no math, just intuition)
-
-### Ledgerless state
-Every update must cancel somewhere else.  
-If it doesn’t, the update is invalid. There is no “later”.
-
-### Gossip propagation
-There is no ordering, only spread.  
-If a message matters, it survives by redundancy.
-
-### Trust minimization
-Peers are authenticated, but not trusted.  
-Validity is structural, not social.
-
----
-
-## What this is NOT
-
+### What this is not
 - not a blockchain
-- not a PoS / PoW system
+
+- not a PoW or PoS system
+
 - not a payment network (yet)
-- not production-ready
 
-This repository is a protocol experiment, not a startup pitch.
+- not production-ready software
 
----
+This repository is a research-driven protocol experiment.
 
-## Philosophy
+### Philosophy
+Most systems attempt to redistribute trust.
 
-Most systems try to redistribute trust.
+Web4 attempts to remove it.
 
-Web4 tries to remove it.
+Nodes do not reason about identity, reputation, or history.
+They only enforce invariants and transport hygiene.
 
-If a state transition violates conservation,  
+If a state transition violates conservation,
 it should not exist at all.
 
-**Node philosophy: math filter, no history.**  
-Nodes only enforce invariants and transport hygiene. They stay dumb about identity and history.
+Falsifiability is valued over completeness.
 
 ---
-This project values falsifiability over completeness.
