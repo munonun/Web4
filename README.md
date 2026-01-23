@@ -190,10 +190,13 @@ Falsifiability is valued over completeness.
 
 ---
 
-## Donation
-Donations help keep the project running.
-No promises. No roadmap guarantees.
-All results are published openly.
+## Donation (optional)
+This project is developed independently.
+
+If you wish to support continued research and experimentation, donations are welcome.
 (Monero: 42tRSXZRK4bNV18dqXcEsuDpb8UbrYu8oViosk1M5b6PFSYL1PxDhfW7d2xLFQaunaMwuH1jRMrPjbtk7niZDN9UMSmkum4)
+(Bitcoin: bc1qaz5dz2cze0me979j9prhxr6dc5x9j7esyhcxzp)
+
+No promises. No roadmap tied to donations.
 
 ---
