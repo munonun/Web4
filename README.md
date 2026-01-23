@@ -186,6 +186,14 @@ They only enforce invariants and transport hygiene.
 If a state transition violates conservation,
 it should not exist at all.
 
+---
+
+## Donation
+Donations help keep the project running.
+No promises. No roadmap guarantees.
+All results are published openly.
+(Monero: 42tRSXZRK4bNV18dqXcEsuDpb8UbrYu8oViosk1M5b6PFSYL1PxDhfW7d2xLFQaunaMwuH1jRMrPjbtk7niZDN9UMSmkum4)
+
 Falsifiability is valued over completeness.
 
 ---
