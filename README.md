@@ -86,6 +86,17 @@ All communication uses QUIC as the underlying transport.
 - explicit framing and backpressure handling
 - suitable for hostile or unreliable networks
 
+## InviteCert + PoWaD admission (v0)
+- NodeID = SHA3-256(pubkey).
+- Admission uses a signed InviteCert from inviter to invitee.
+- InviteCert fields include ids, times, scope, PoWaD params, and signature.
+- Signing uses canonical binary encoding (not JSON).
+- PoWaD digest: SHA3-256("web4:v0:powad|" || invite_id || invitee_nodeid || nonce_le).
+- Valid if the top pow_bits of the digest are zero.
+- Replay protection keys (inviter_nodeid, invite_id) are persisted.
+- Scope bits gate gossip vs contract updates.
+- Non-members are ignored for state-changing operations.
+
 ---
 
 ## Project scope

@@ -19,6 +19,7 @@ const (
 	DefaultMemberCap       = 512
 	DefaultMemberTTL       = 30 * time.Minute
 	DefaultMemberLoadLimit = 512
+	DefaultMemberScope     = proto.InviteScopeAll
 	maxMemberScanSize      = 2 * proto.MaxFrameSize
 )
 
@@ -41,10 +42,12 @@ type memberEntry struct {
 	key       string
 	id        [32]byte
 	expiresAt time.Time
+	scope     uint32
 }
 
 type diskMember struct {
 	NodeID string `json:"node_id"`
+	Scope  uint32 `json:"scope,omitempty"`
 }
 
 func NewMemberStore(path string, opts MemberOptions) (*MemberStore, error) {
@@ -79,8 +82,15 @@ func NewMemberStore(path string, opts MemberOptions) (*MemberStore, error) {
 }
 
 func (s *MemberStore) Add(id [32]byte, persist bool) error {
+	return s.AddWithScope(id, DefaultMemberScope, persist)
+}
+
+func (s *MemberStore) AddWithScope(id [32]byte, scope uint32, persist bool) error {
 	if isZeroNodeID(id) {
 		return fmt.Errorf("missing node_id")
+	}
+	if scope == 0 {
+		scope = DefaultMemberScope
 	}
 	key := hex.EncodeToString(id[:])
 
@@ -90,18 +100,19 @@ func (s *MemberStore) Add(id [32]byte, persist bool) error {
 		ent := el.Value.(*memberEntry)
 		ent.id = id
 		ent.expiresAt = time.Now().Add(s.ttl)
+		ent.scope |= scope
 		s.order.MoveToFront(el)
 		s.mu.Unlock()
 		if !persist {
 			return nil
 		}
-		rec := diskMember{NodeID: key}
+		rec := diskMember{NodeID: key, Scope: ent.scope}
 		return store.AppendJSONL(s.path, rec)
 	}
 	if s.cap > 0 && len(s.hot) >= s.cap {
 		s.evictLocked(len(s.hot) - s.cap + 1)
 	}
-	ent := &memberEntry{key: key, id: id, expiresAt: time.Now().Add(s.ttl)}
+	ent := &memberEntry{key: key, id: id, expiresAt: time.Now().Add(s.ttl), scope: scope}
 	el := s.order.PushFront(ent)
 	s.hot[key] = el
 	s.mu.Unlock()
@@ -109,20 +120,50 @@ func (s *MemberStore) Add(id [32]byte, persist bool) error {
 	if !persist {
 		return nil
 	}
-	rec := diskMember{NodeID: key}
+	rec := diskMember{NodeID: key, Scope: scope}
 	return store.AppendJSONL(s.path, rec)
 }
 
 func (s *MemberStore) Has(id [32]byte) bool {
+	return s.HasScope(id, 0)
+}
+
+func (s *MemberStore) HasScope(id [32]byte, scope uint32) bool {
 	if isZeroNodeID(id) {
 		return false
 	}
 	key := hex.EncodeToString(id[:])
 	s.mu.Lock()
 	s.pruneLocked()
-	_, ok := s.hot[key]
+	el, ok := s.hot[key]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	ent := el.Value.(*memberEntry)
 	s.mu.Unlock()
-	return ok
+	if scope == 0 {
+		return ent.scope != 0
+	}
+	return ent.scope&scope == scope
+}
+
+func (s *MemberStore) Scope(id [32]byte) (uint32, bool) {
+	if isZeroNodeID(id) {
+		return 0, false
+	}
+	key := hex.EncodeToString(id[:])
+	s.mu.Lock()
+	s.pruneLocked()
+	el, ok := s.hot[key]
+	if !ok {
+		s.mu.Unlock()
+		return 0, false
+	}
+	ent := el.Value.(*memberEntry)
+	scope := ent.scope
+	s.mu.Unlock()
+	return scope, true
 }
 
 func (s *MemberStore) Refresh() error {
@@ -199,7 +240,11 @@ func (s *MemberStore) loadLast(limit int) error {
 		}
 		var id [32]byte
 		copy(id[:], idBytes)
-		_ = s.Add(id, false)
+		scope := rec.Scope
+		if scope == 0 {
+			scope = DefaultMemberScope
+		}
+		_ = s.AddWithScope(id, scope, false)
 	}
 	return nil
 }

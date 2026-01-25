@@ -313,6 +313,7 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 				lastStreamAt = time.Now()
 				streamID := atomic.AddUint64(&streamSeq, 1)
 				logInfo("accepted stream addr=%s conn_id=%d stream_id=%d conn=%s stream=%s", remoteAddr, connID, streamID, connToken, streamIDString(stream))
+				debugLog("DEBUG stream accepted addr=%s conn_id=%d stream_id=%d", remoteAddr, connID, streamID)
 				if !ipLimits.acquireStream(ip) {
 					closeStreamWithError(stream, streamBusyErrCode, "per-ip stream limit")
 					logInfo("DROP reason=per_ip_stream_limit from=%s type=stream err=per_ip_stream_limit", remoteAddr)
@@ -337,11 +338,17 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 						if errors.Is(err, io.EOF) {
 							logInfo("quic read error: EOF")
 						} else {
+							if errors.Is(err, context.DeadlineExceeded) {
+								logInfo("DROP message: read timeout before full frame")
+							} else if te, ok := err.(interface{ Timeout() bool }); ok && te.Timeout() {
+								logInfo("DROP message: read timeout before full frame")
+							}
 							logInfo("quic read error: %v", err)
 						}
 						return
 					}
 					logInfo("read conn_id=%d stream_id=%d addr=%s raw_len=%d sha256=%s", connID, streamID, sender, len(data), hashHex(data))
+					debugLog("DEBUG read bytes addr=%s conn_id=%d stream_id=%d bytes=%d", sender, connID, streamID, len(data))
 					if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
 						logInfo("WIRE RECV addr=%s conn_id=%d stream_id=%d conn=%s stream=%s raw_len=%d sha256=%s preview=%s", sender, connID, streamID, connToken, streamIDString(s), len(data), hashHex(data), previewBytes(data, 80))
 					}
@@ -516,7 +523,15 @@ func readFrameWithTimeout(stream *quic.Stream, timeout time.Duration) ([]byte, e
 		SetReadDeadline(time.Time) error
 	}); ok {
 		_ = d.SetReadDeadline(time.Now().Add(timeout))
-		return proto.ReadFrameWithTypeCap(stream, proto.SoftMaxFrameSize, proto.MaxSizeForType)
+		data, err := proto.ReadFrameWithTypeCap(stream, proto.SoftMaxFrameSize, proto.MaxSizeForType)
+		if err == nil {
+			debugLog("DEBUG read payload bytes=%d", len(data))
+			return data, nil
+		}
+		if te, ok := err.(interface{ Timeout() bool }); ok && te.Timeout() {
+			logInfo("DROP message: read timeout before full frame")
+		}
+		return data, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -531,8 +546,12 @@ func readFrameWithTimeout(stream *quic.Stream, timeout time.Duration) ([]byte, e
 	}()
 	select {
 	case res := <-ch:
+		if res.err == nil {
+			debugLog("DEBUG read payload bytes=%d", len(res.data))
+		}
 		return res.data, res.err
 	case <-ctx.Done():
+		logInfo("DROP message: read timeout before full frame")
 		closeStreamWithError(stream, streamBusyErrCode, "read timeout")
 		return nil, ctx.Err()
 	}

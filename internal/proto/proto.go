@@ -80,6 +80,10 @@ func MaxSizeForType(t string) int {
 		return MaxGossipAckSize
 	case MsgTypeSecureEnvelope:
 		return MaxSecureEnvelopeSize
+	case MsgTypeInviteCert:
+		return MaxInviteCertSize
+	case MsgTypeInviteAck:
+		return MaxInviteAckSize
 	default:
 		return MaxFrameSize
 	}

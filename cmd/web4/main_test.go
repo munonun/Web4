@@ -744,6 +744,9 @@ func TestQuicRecvOpen(t *testing.T) {
 	if err := self.Peers.Upsert(peerB, true); err != nil {
 		t.Fatalf("seed peer failed: %v", err)
 	}
+	if err := self.Members.AddWithScope(peerB.NodeID, proto.InviteScopeContract, false); err != nil {
+		t.Fatalf("seed member failed: %v", err)
+	}
 	if _, err := self.Peers.ObserveAddr(peerB, "127.0.0.1:1", "127.0.0.1:1", true, true); err != nil {
 		t.Fatalf("seed peer addr failed: %v", err)
 	}
@@ -953,6 +956,12 @@ func newSessionPair(t *testing.T, homeA, homeB string, checkerA, checkerB math4.
 	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
 		t.Fatalf("seed peer A failed: %v", err)
 	}
+	if err := nodeA.Members.AddWithScope(nodeB.ID, proto.InviteScopeAll, false); err != nil {
+		t.Fatalf("seed member B failed: %v", err)
+	}
+	if err := nodeB.Members.AddWithScope(nodeA.ID, proto.InviteScopeAll, false); err != nil {
+		t.Fatalf("seed member A failed: %v", err)
+	}
 	hello1, err := nodeA.BuildHello1(nodeB.ID)
 	if err != nil {
 		t.Fatalf("build hello1 failed: %v", err)
@@ -1016,6 +1025,244 @@ func decodeMsgType(payload []byte) (string, error) {
 		return "", fmt.Errorf("missing message type")
 	}
 	return hdr.Type, nil
+}
+
+func buildInviteCert(t *testing.T, inviter *node.Node, inviteePub []byte, inviteID []byte, scope uint32, powBits uint8, issuedAt, expiresAt uint64, powNonce *uint64) ([]byte, proto.InviteCert) {
+	t.Helper()
+	if inviteID == nil {
+		inviteID = bytes.Repeat([]byte{0x11}, 16)
+	}
+	cert := proto.InviteCert{
+		V:          1,
+		InviterPub: inviter.PubKey,
+		InviteePub: inviteePub,
+		InviteID:   inviteID,
+		IssuedAt:   issuedAt,
+		ExpiresAt:  expiresAt,
+		Scope:      scope,
+		PowBits:    powBits,
+	}
+	if powNonce != nil {
+		cert.PowNonce = *powNonce
+	} else {
+		inviteeID := node.DeriveNodeID(inviteePub)
+		nonce, ok := crypto.PoWaDSolve(inviteID, inviteeID[:], powBits)
+		if !ok {
+			t.Fatalf("powad solve failed")
+		}
+		cert.PowNonce = nonce
+	}
+	signBytes, err := proto.EncodeInviteCertForSig(cert)
+	if err != nil {
+		t.Fatalf("invite sign bytes failed: %v", err)
+	}
+	sig, err := crypto.SignDigest(inviter.PrivKey, crypto.SHA3_256(signBytes))
+	if err != nil {
+		t.Fatalf("invite sign failed: %v", err)
+	}
+	cert.Sig = sig
+	msg := proto.InviteCertMsgFromCert(cert)
+	data, err := proto.EncodeInviteCertMsg(msg)
+	if err != nil {
+		t.Fatalf("encode invite cert failed: %v", err)
+	}
+	return data, cert
+}
+
+func TestInviteCertValidAddsMember(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+	inviter, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+	receiver, err := node.NewNode(filepath.Join(homeC, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load receiver failed: %v", err)
+	}
+	now := uint64(time.Now().Unix())
+	data, cert := buildInviteCert(t, inviter, invitee.PubKey, nil, proto.InviteScopeGossip, proto.InvitePoWaDBits, now, now+3600, nil)
+	_, _, recvErr := recvDataWithResponse(data, nil, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr != nil {
+		t.Fatalf("invite recv failed: %v", recvErr)
+	}
+	inviteeID := node.DeriveNodeID(invitee.PubKey)
+	if receiver.Members == nil || !receiver.Members.HasScope(inviteeID, cert.Scope) {
+		t.Fatalf("expected invitee to be member")
+	}
+	inviterID := node.DeriveNodeID(inviter.PubKey)
+	if receiver.Invites == nil || !receiver.Invites.Seen(inviterID, cert.InviteID) {
+		t.Fatalf("expected invite replay marker")
+	}
+}
+
+func TestInviteCertReplayRejected(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+	inviter, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+	receiver, err := node.NewNode(filepath.Join(homeC, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load receiver failed: %v", err)
+	}
+	now := uint64(time.Now().Unix())
+	data, _ := buildInviteCert(t, inviter, invitee.PubKey, nil, proto.InviteScopeGossip, proto.InvitePoWaDBits, now, now+3600, nil)
+	_, _, recvErr := recvDataWithResponse(data, nil, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr != nil {
+		t.Fatalf("invite recv failed: %v", recvErr)
+	}
+	_, _, recvErr = recvDataWithResponse(data, nil, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr == nil || !strings.Contains(recvErr.err.Error(), "replay") {
+		t.Fatalf("expected replay rejection, got %v", recvErr)
+	}
+}
+
+func TestInviteCertWrongSigRejected(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+	inviter, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+	receiver, err := node.NewNode(filepath.Join(homeC, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load receiver failed: %v", err)
+	}
+	now := uint64(time.Now().Unix())
+	data, _ := buildInviteCert(t, inviter, invitee.PubKey, nil, proto.InviteScopeGossip, proto.InvitePoWaDBits, now, now+3600, nil)
+	var msg map[string]any
+	if err := json.Unmarshal(data, &msg); err != nil {
+		t.Fatalf("decode invite msg failed: %v", err)
+	}
+	sigHex := msg["sig"].(string)
+	if len(sigHex) < 2 {
+		t.Fatalf("sig too short")
+	}
+	if sigHex[len(sigHex)-1] == '0' {
+		sigHex = sigHex[:len(sigHex)-1] + "1"
+	} else {
+		sigHex = sigHex[:len(sigHex)-1] + "0"
+	}
+	msg["sig"] = sigHex
+	bad, _ := json.Marshal(msg)
+	_, _, recvErr := recvDataWithResponse(bad, nil, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr == nil || !strings.Contains(recvErr.err.Error(), "signature") {
+		t.Fatalf("expected bad signature, got %v", recvErr)
+	}
+}
+
+func TestInviteCertWrongPowRejected(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+	inviter, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+	receiver, err := node.NewNode(filepath.Join(homeC, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load receiver failed: %v", err)
+	}
+	now := uint64(time.Now().Unix())
+	badNonce := uint64(0)
+	data, _ := buildInviteCert(t, inviter, invitee.PubKey, nil, proto.InviteScopeGossip, proto.InvitePoWaDBits, now, now+3600, &badNonce)
+	_, _, recvErr := recvDataWithResponse(data, nil, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr == nil || !strings.Contains(recvErr.err.Error(), "powad") {
+		t.Fatalf("expected powad rejection, got %v", recvErr)
+	}
+}
+
+func TestInviteCertExpiredRejected(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+	inviter, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+	receiver, err := node.NewNode(filepath.Join(homeC, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load receiver failed: %v", err)
+	}
+	now := uint64(time.Now().Unix())
+	data, _ := buildInviteCert(t, inviter, invitee.PubKey, nil, proto.InviteScopeGossip, proto.InvitePoWaDBits, now-7200, now-3600, nil)
+	_, _, recvErr := recvDataWithResponse(data, nil, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr == nil || !strings.Contains(recvErr.err.Error(), "expired") {
+		t.Fatalf("expected expired rejection, got %v", recvErr)
+	}
+}
+
+func TestInviteCertNodeIDMismatchRejected(t *testing.T) {
+	homeA := t.TempDir()
+	homeC := t.TempDir()
+	inviter, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	receiver, err := node.NewNode(filepath.Join(homeC, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load receiver failed: %v", err)
+	}
+	now := uint64(time.Now().Unix())
+	badPub := []byte("not-a-valid-pubkey")
+	data, _ := buildInviteCert(t, inviter, badPub, nil, proto.InviteScopeGossip, proto.InvitePoWaDBits, now, now+3600, nil)
+	_, _, recvErr := recvDataWithResponse(data, nil, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr == nil || !strings.Contains(recvErr.err.Error(), "node_id mismatch") {
+		t.Fatalf("expected node_id mismatch rejection, got %v", recvErr)
+	}
+}
+
+func TestInviteCertAcceptsWithoutKnownPeer(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+	inviter, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+	receiver, err := node.NewNode(filepath.Join(homeC, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load receiver failed: %v", err)
+	}
+	now := uint64(time.Now().Unix())
+	data, _ := buildInviteCert(t, inviter, invitee.PubKey, nil, proto.InviteScopeGossip, proto.InvitePoWaDBits, now, now+3600, nil)
+	_, _, recvErr := recvDataWithResponse(data, nil, receiver, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr != nil {
+		t.Fatalf("invite recv failed: %v", recvErr)
+	}
+	inviteeID := node.DeriveNodeID(invitee.PubKey)
+	if receiver.Members == nil || !receiver.Members.HasScope(inviteeID, proto.InviteScopeGossip) {
+		t.Fatalf("expected invitee member without prior peer")
+	}
 }
 
 func TestHandshakeRetryRegeneratesHello1(t *testing.T) {

@@ -1,7 +1,0 @@
-./envelope.go
-./gossip.go
-./handshake.go
-./peer_exchange.go
-./proto.go
-./secure.go
-./envelope_test.go

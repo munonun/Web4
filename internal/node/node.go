@@ -15,6 +15,7 @@ type Node struct {
 	PrivKey    []byte
 	Peers      *peer.Store
 	Members    *peer.MemberStore
+	Invites    *peer.InviteStore
 	Candidates *peer.CandidatePool
 	Sessions   *SessionStore
 }
@@ -28,12 +29,17 @@ type Options struct {
 	MemberStoreCap  int
 	MemberStoreTTL  time.Duration
 	MemberStoreLoad int
+	InviteStorePath string
+	InviteStoreCap  int
+	InviteStoreTTL  time.Duration
+	InviteStoreLoad int
 	CandidateCap    int
 	CandidateTTL    time.Duration
 }
 
 const defaultPeerBook = "peers.jsonl"
 const defaultMemberBook = "members.jsonl"
+const defaultInviteBook = "invites.jsonl"
 
 func NewNode(home string, opts Options) (*Node, error) {
 	if err := os.MkdirAll(home, 0700); err != nil {
@@ -78,6 +84,21 @@ func NewNode(home string, opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := members.AddWithScope(id, peer.DefaultMemberScope, true); err != nil {
+		return nil, err
+	}
+	invitePath := opts.InviteStorePath
+	if invitePath == "" {
+		invitePath = filepath.Join(home, defaultInviteBook)
+	}
+	invites, err := peer.NewInviteStore(invitePath, peer.InviteOptions{
+		Cap:       opts.InviteStoreCap,
+		TTL:       opts.InviteStoreTTL,
+		LoadLimit: opts.InviteStoreLoad,
+	})
+	if err != nil {
+		return nil, err
+	}
 	candidates := peer.NewCandidatePool(opts.CandidateCap, opts.CandidateTTL)
 	return &Node{
 		ID:         id,
@@ -85,16 +106,14 @@ func NewNode(home string, opts Options) (*Node, error) {
 		PrivKey:    priv,
 		Peers:      peers,
 		Members:    members,
+		Invites:    invites,
 		Candidates: candidates,
 		Sessions:   NewSessionStore(),
 	}, nil
 }
 
 func DeriveNodeID(pub []byte) [32]byte {
-	buf := make([]byte, 0, len("web4:nodeid:v1")+len(pub))
-	buf = append(buf, []byte("web4:nodeid:v1")...)
-	buf = append(buf, pub...)
-	sum := crypto.SHA3_256(buf)
+	sum := crypto.SHA3_256(pub)
 	var id [32]byte
 	copy(id[:], sum)
 	return id

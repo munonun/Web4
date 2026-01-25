@@ -4,9 +4,11 @@ set -euo pipefail
 : "${WEB4_STORE_MAX_BYTES:?set WEB4_STORE_MAX_BYTES (e.g. 65536) to run smoke tests}"
 : "${WEB4_QUIC_IDLE_TIMEOUT_SEC:=60}"
 : "${WEB4_QUIC_HANDSHAKE_TIMEOUT_SEC:=30}"
-: "${WEB4_QUIC_STREAM_TIMEOUT_SEC:=20}"
+: "${WEB4_QUIC_STREAM_TIMEOUT_SEC:=30}"
+: "${WEB4_QUIC_ACCEPT_TIMEOUT_SEC:=30}"
 : "${WEB4_QUIC_ACQUIRE_TIMEOUT_MS:=500}"
 : "${WEB4_DISABLE_LIMITER:=1}"
+export WEB4_QUIC_IDLE_TIMEOUT_SEC WEB4_QUIC_HANDSHAKE_TIMEOUT_SEC WEB4_QUIC_STREAM_TIMEOUT_SEC WEB4_QUIC_ACCEPT_TIMEOUT_SEC WEB4_QUIC_ACQUIRE_TIMEOUT_MS WEB4_DISABLE_LIMITER
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=check6_lib.sh
 source "${SCRIPT_DIR}/check6_lib.sh"
@@ -92,6 +94,10 @@ TMPB="$(mktemp -d)"
 TMPC="$(mktemp -d)"
 TMPD="$(mktemp -d)"
 TMPWORK="$(mktemp -d)"
+NODEIDA=""
+NODEIDB=""
+NODEIDC=""
+NODEIDD=""
 LISTENER_PIDS=()
 SERVER_PID=""
 SERVER_PID_B=""
@@ -102,6 +108,14 @@ SENDER_PID=""
 
 cleanup() {
 	local status=$?
+	set +e
+	# Kill any child jobs/processes before removing TMPWORK.
+	if jobs -pr >/dev/null 2>&1; then
+		jobs -pr | xargs -r kill 2>/dev/null || true
+	fi
+	if command -v pgrep >/dev/null 2>&1; then
+		pgrep -P $$ | xargs -r kill 2>/dev/null || true
+	fi
 	for pid in "${LISTENER_PIDS[@]}"; do
 		if [[ -n "${pid}" ]]; then
 			kill "${pid}" 2>/dev/null || true
@@ -132,6 +146,7 @@ cleanup() {
 		kill "${SENDER_PID}" 2>/dev/null || true
 		wait "${SENDER_PID}" 2>/dev/null || true
 	fi
+	wait 2>/dev/null || true
 	for port in "${USED_PORT_LIST[@]}"; do
 		for _ in $(seq 1 200); do
 			if port_available "${port}"; then
@@ -299,6 +314,42 @@ if [[ ! -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
 	fail "check 1 (JSONL rotation): missing devtls CA"
 fi
 NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
+NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
+PUBB="$(cat "${TMPB}/.web4mvp/pub.hex")"
+invite_ab_check1="${TMPWORK}/invite_ab_check1.json"
+run_a node invite --to "${PUBB}" --scope all --pow-bits 18 --expires 3600 > "${invite_ab_check1}"
+if [[ ! -s "${invite_ab_check1}" ]]; then
+	fail "check 1 (JSONL rotation): invite payload missing"
+fi
+run_b recv --in "${invite_ab_check1}" >/dev/null
+invite_send_log="${TMPWORK}/quic_invite_send.log"
+if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${STATEFUL_PORT}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${invite_ab_check1}" >"${invite_send_log}" 2>&1 ); then
+	echo "check 1 debug: invite quic-send failed"
+	tail -n 200 "${invite_send_log}" || true
+	fail "check 1 (JSONL rotation): invite send failed"
+fi
+invite_ready=0
+for _ in $(seq 1 1200); do
+	if grep -q "RECV INVITE OK invitee=${NODEIDB}" "${stateful_log}" 2>/dev/null; then
+		invite_ready=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${invite_ready}" -ne 1 ]]; then
+	echo "check 1 debug: invite not processed"
+	tail -n 200 "${stateful_log}" || true
+	tail -n 200 "${invite_send_log}" || true
+	echo "A members:"
+	run_a node members || true
+	echo "A peers:"
+	run_a node list || true
+	echo "B members:"
+	run_b node members || true
+	echo "B peers:"
+	run_b node list || true
+	fail "check 1 (JSONL rotation): invite not processed"
+fi
 sender_fifo="${TMPWORK}/stateful_sender.fifo"
 mkfifo "${sender_fifo}"
 env HOME="${TMPB}" "${WEB4_BIN}" quic-send-secure --devtls --addr "127.0.0.1:${STATEFUL_PORT}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDA}" --stdin < "${sender_fifo}" >"${TMPWORK}/stateful_sender.log" 2>&1 &
@@ -440,8 +491,8 @@ quic_msg="${TMPWORK}/quic_open.json"
 run_b open --to "${PUBA}" --amount 5 --nonce 9900 --out "${quic_msg}" >/dev/null
 
 server_log="${TMPWORK}/quic_server.log"
-echo "Starting QUIC server: env HOME=${TMPA} ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORT}"
-env HOME="${TMPA}" "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORT}" >"${server_log}" 2>&1 &
+echo "Starting QUIC server: env HOME=${TMPA} WEB4_DISABLE_LIMITER=0 ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORT}"
+env HOME="${TMPA}" WEB4_DISABLE_LIMITER=0 "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORT}" >"${server_log}" 2>&1 &
 SERVER_PID=$!
 LISTENER_PIDS+=("${SERVER_PID}")
 
@@ -487,6 +538,8 @@ NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
 limiter_home="${client_dir}/limiter_home"
 mkdir -p "${limiter_home}"
 env HOME="${limiter_home}" "${WEB4_BIN}" keygen >/dev/null 2>&1 || true
+limiter_id="$(env HOME="${limiter_home}" "${WEB4_BIN}" node id | awk '/node_id:/ {print $2}')"
+run_checked "check 3 (QUIC limiter): node join (A<-limiter)" --quiet run_a node join --node-id "${limiter_id}"
 quic_msg_dir="${client_dir}/msgs"
 mkdir -p "${quic_msg_dir}"
 echo "QUIC client command: env HOME=${limiter_home} ${WEB4_BIN} quic-send-secure --devtls --addr 127.0.0.1:${PORT} --devtls-ca ${TMPA}/.web4mvp/devtls_ca.pem --to-id ${NODEIDA} --in <msg>"
@@ -906,7 +959,35 @@ pass "check 5 (QUIC peer exchange)"
 	run_checked "check 6 (gossip forward): node join (B<-A)" --quiet run_b node join --node-id "${NODEIDA}"
 	run_checked "check 6 (gossip forward): node join (B<-C)" --quiet run_b node join --node-id "${NODEIDC}"
 	run_checked "check 6 (gossip forward): node join (B<-B)" --quiet run_b node join --node-id "${NODEIDB}"
-	run_checked "check 6 (gossip forward): node join (C<-B)" --quiet run_c node join --node-id "${NODEIDB}"
+	invite_ab="${TMPWORK}/invite_ab.json"
+	run_checked "check 6 (gossip forward): invite cert (A->B)" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope gossip --pow-bits 18 --expires 3600 > '${invite_ab}'"
+	if [[ ! -s "${invite_ab}" ]]; then
+		check6_quic_fail "no_conn" "check 6 (gossip forward): invite payload missing"
+	fi
+	invite_send_log="${TMPWORK}/quic_invite_c_send.log"
+	if ! ( env HOME="${TMPA}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send --devtls --addr "${c_addr}" --devtls-ca "${CA_C}" --in "${invite_ab}" >"${invite_send_log}" 2>&1 ); then
+		echo "check 6 debug: invite quic-send failed"
+		tail -n 200 "${invite_send_log}" || true
+		check6_quic_fail "no_conn" "check 6 (gossip forward): invite send failed"
+	fi
+	found=0
+	for _ in $(seq 1 1200); do
+		if grep -q "RECV INVITE OK invitee=${NODEIDB}" "${server_log_c}" 2>/dev/null; then
+			found=1
+			break
+		fi
+		sleep 0.05
+	done
+	if [[ "${found}" -ne 1 ]]; then
+		echo "check 6 debug: invite not processed"
+		tail -n 200 "${server_log_c}" || true
+		tail -n 200 "${invite_send_log}" || true
+		echo "C members:"
+		run_c node members || true
+		echo "C peers:"
+		run_c node list || true
+		check6_quic_fail "no_conn" "check 6 (gossip forward): invite missing on C"
+	fi
 	run_checked "check 6 (gossip forward): node join (C<-C)" --quiet run_c node join --node-id "${NODEIDC}"
 
 	if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then

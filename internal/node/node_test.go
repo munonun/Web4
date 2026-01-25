@@ -10,7 +10,7 @@ import (
 func TestDeriveNodeID(t *testing.T) {
 	pub := []byte("test-pubkey")
 	got := DeriveNodeID(pub)
-	want := crypto.SHA3_256(append([]byte("web4:nodeid:v1"), pub...))
+	want := crypto.SHA3_256(pub)
 	if !bytes.Equal(got[:], want) {
 		t.Fatalf("unexpected node id")
 	}

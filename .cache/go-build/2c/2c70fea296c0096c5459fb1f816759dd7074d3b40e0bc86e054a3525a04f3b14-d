@@ -1,5 +1,0 @@
-./aad.go
-./crypto.go
-./session.go
-./crypto_test.go
-./session_aead_test.go

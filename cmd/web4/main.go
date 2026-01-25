@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	crand "crypto/rand"
 	stdsha256 "crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -422,10 +423,23 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		}
 	}
 	if !wasSecure && hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 && hdr.Type != proto.MsgTypeGossipPush {
-		return nil, false, reject("handshake required", fmt.Errorf("missing secure envelope"))
+		if hdr.Type != proto.MsgTypeInviteCert {
+			return nil, false, reject("handshake required", fmt.Errorf("missing secure envelope"))
+		}
 	}
 	if !wasSecure {
 		debugCount.incRecv(hdr.Type)
+	}
+
+	if wasSecure {
+		if scope, ok := requiredMemberScope(hdr.Type); ok {
+			if self.Members == nil || !self.Members.HasScope(secureFromID, scope) {
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "recv drop: membership_gate type=%s sender=%x scope=%d\n", hdr.Type, secureFromID[:], scope)
+				}
+				return nil, false, reject("membership_gate", fmt.Errorf("sender not member"))
+			}
+		}
 	}
 
 	switch hdr.Type {
@@ -548,6 +562,47 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		}
 		fmt.Println("RECV PEER EXCHANGE", added)
 		return nil, false, nil
+
+	case proto.MsgTypeInviteCert:
+		msg, err := proto.DecodeInviteCertMsg(data)
+		if err != nil {
+			return nil, false, reject("decode invite cert failed", err)
+		}
+		cert, err := proto.InviteCertFromMsg(msg)
+		if err != nil {
+			return nil, false, reject("invalid invite cert", err)
+		}
+		if self.Invites == nil {
+			return nil, false, reject("invite store unavailable", fmt.Errorf("missing invite store"))
+		}
+		if self.Members == nil {
+			return nil, false, reject("member store unavailable", fmt.Errorf("missing member store"))
+		}
+		inviterID, inviteeID, err := validateInviteCert(cert, self.Invites, time.Now())
+		if err != nil {
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "recv drop: invite_cert err=%v\n", err)
+			}
+			return nil, false, reject("invalid invite cert", err)
+		}
+		if cert.Scope == 0 {
+			return nil, false, reject("invalid invite cert", fmt.Errorf("missing scope"))
+		}
+		if self.Peers != nil {
+			_ = self.Peers.Upsert(peer.Peer{NodeID: inviterID, PubKey: cert.InviterPub}, true)
+			_ = self.Peers.Upsert(peer.Peer{NodeID: inviteeID, PubKey: cert.InviteePub}, true)
+		}
+		if err := self.Members.AddWithScope(inviterID, proto.InviteScopeAll, true); err != nil {
+			return nil, false, reject("store member failed", err)
+		}
+		if err := self.Members.AddWithScope(inviteeID, cert.Scope, true); err != nil {
+			return nil, false, reject("store member failed", err)
+		}
+		if err := self.Invites.Mark(inviterID, cert.InviteID, cert.ExpiresAt, true); err != nil {
+			return nil, false, reject("store invite failed", err)
+		}
+		fmt.Fprintf(os.Stderr, "RECV INVITE OK invitee=%x inviter=%x scope=%d\n", inviteeID[:], inviterID[:], cert.Scope)
+		return nil, true, nil
 
 	case proto.MsgTypeContractOpen:
 		m, err := proto.DecodeContractOpenMsg(data)
@@ -992,7 +1047,7 @@ func handleGossipPushInner(msg proto.GossipPushMsg, data []byte, st *store.Store
 	}
 	gossipDebugf("gossip_push forwarder node_id=%x addr=%s", fromID[:], senderAddr)
 	gossipDebugf("gossip_push recv msg.from_node_id=%x sender_pub_node_id=%s sender_pub_hash=%s", fromID[:], nodeIDHexFromPub(forwarder.PubKey), nodeIDHexFromPub(forwarder.PubKey))
-	if self.Members == nil || !self.Members.Has(fromID) {
+	if self.Members == nil || !self.Members.HasScope(fromID, proto.InviteScopeGossip) {
 		gossipDebugf("drop gossip_push: forwarder not member node_id=%x", fromID[:])
 		drop("membership_gate", msg.Type, fmt.Errorf("forwarder not member"))
 		check6Drop(msgID, "no_members", "forwarder not member")
@@ -1365,7 +1420,7 @@ func filterMemberPeers(peers []peer.Peer, members *peer.MemberStore) []peer.Peer
 	}
 	out := make([]peer.Peer, 0, len(peers))
 	for _, p := range peers {
-		if members.Has(p.NodeID) {
+		if members.HasScope(p.NodeID, proto.InviteScopeGossip) {
 			out = append(out, p)
 		}
 	}
@@ -1769,6 +1824,80 @@ func verifySigFrom(version, suite, msgType string, fromID [32]byte, payload []by
 	return true
 }
 
+func requiredMemberScope(msgType string) (uint32, bool) {
+	switch msgType {
+	case proto.MsgTypeContractOpen, proto.MsgTypeRepayReq, proto.MsgTypeAck:
+		return proto.InviteScopeContract, true
+	default:
+		return 0, false
+	}
+}
+
+func validateInviteCert(cert proto.InviteCert, invites *peer.InviteStore, now time.Time) ([32]byte, [32]byte, error) {
+	var zero [32]byte
+	if len(cert.InviteePub) == 0 {
+		return zero, zero, fmt.Errorf("missing invitee_pub")
+	}
+	if len(cert.InviterPub) == 0 {
+		return zero, zero, fmt.Errorf("missing inviter_pub")
+	}
+	if !crypto.IsRSAPublicKey(cert.InviteePub) {
+		return zero, zero, fmt.Errorf("invitee node_id mismatch")
+	}
+	if !crypto.IsRSAPublicKey(cert.InviterPub) {
+		return zero, zero, fmt.Errorf("inviter node_id mismatch")
+	}
+	if len(cert.InviteID) != 16 && len(cert.InviteID) != 32 {
+		return zero, zero, fmt.Errorf("bad invite_id length")
+	}
+	inviteeHash := crypto.SHA3_256(cert.InviteePub)
+	inviterHash := crypto.SHA3_256(cert.InviterPub)
+	var inviteeID [32]byte
+	var inviterID [32]byte
+	copy(inviteeID[:], inviteeHash)
+	copy(inviterID[:], inviterHash)
+	if isZeroNodeID(inviteeID) {
+		return zero, zero, fmt.Errorf("invitee node_id missing")
+	}
+	if isZeroNodeID(inviterID) {
+		return zero, zero, fmt.Errorf("inviter node_id missing")
+	}
+	if cert.ExpiresAt == 0 {
+		return zero, zero, fmt.Errorf("missing expires_at")
+	}
+	if cert.IssuedAt == 0 {
+		return zero, zero, fmt.Errorf("missing issued_at")
+	}
+	if cert.ExpiresAt < cert.IssuedAt {
+		return zero, zero, fmt.Errorf("expires before issued")
+	}
+	skew := 5 * time.Minute
+	nowUnix := uint64(now.Unix())
+	if cert.IssuedAt > nowUnix+uint64(skew.Seconds()) {
+		return zero, zero, fmt.Errorf("issued_at in future")
+	}
+	if cert.ExpiresAt < nowUnix {
+		return zero, zero, fmt.Errorf("invite expired")
+	}
+	if cert.PowBits != proto.InvitePoWaDBits {
+		return zero, zero, fmt.Errorf("pow bits mismatch")
+	}
+	signBytes, err := proto.EncodeInviteCertForSig(cert)
+	if err != nil {
+		return zero, zero, err
+	}
+	if !crypto.VerifyDigest(cert.InviterPub, crypto.SHA3_256(signBytes), cert.Sig) {
+		return zero, zero, fmt.Errorf("bad signature")
+	}
+	if !crypto.PoWaDCheck(cert.InviteID, inviteeID[:], cert.PowNonce, cert.PowBits) {
+		return zero, zero, fmt.Errorf("powad failed")
+	}
+	if invites != nil && invites.Seen(inviterID, cert.InviteID) {
+		return zero, zero, fmt.Errorf("invite replay")
+	}
+	return inviterID, inviteeID, nil
+}
+
 func decodeNodeIDHex(s string) ([32]byte, error) {
 	var id [32]byte
 	if s == "" {
@@ -1791,6 +1920,34 @@ func decodeSigHex(s string) ([]byte, error) {
 		return nil, fmt.Errorf("bad sig_from")
 	}
 	return b, nil
+}
+
+func parseInviteScope(s string) (uint32, error) {
+	if s == "" {
+		return proto.InviteScopeGossip, nil
+	}
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "all" {
+		return proto.InviteScopeAll, nil
+	}
+	parts := strings.Split(s, ",")
+	var scope uint32
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		switch p {
+		case "gossip":
+			scope |= proto.InviteScopeGossip
+		case "contract":
+			scope |= proto.InviteScopeContract
+		case "":
+		default:
+			return 0, fmt.Errorf("unknown scope: %s", p)
+		}
+	}
+	if scope == 0 {
+		return 0, fmt.Errorf("empty scope")
+	}
+	return scope, nil
 }
 
 func verifySignedMessage(data []byte, msgType string, self *node.Node) *recvError {
@@ -2305,7 +2462,7 @@ func main() {
 
 	case "node":
 		if len(os.Args) < 3 {
-			dieMsg("usage: web4 node <id|list|members|join|add|hello|exchange>")
+			dieMsg("usage: web4 node <id|list|members|join|add|hello|exchange|invite>")
 		}
 		switch os.Args[2] {
 		case "id":
@@ -2365,6 +2522,88 @@ func main() {
 				die("join failed", err)
 			}
 			fmt.Println("OK node joined")
+		case "invite":
+			fs := flag.NewFlagSet("node invite", flag.ExitOnError)
+			to := fs.String("to", "", "invitee pubkey hex or node id hex")
+			scopeStr := fs.String("scope", "gossip", "scope: gossip,contract,all")
+			powBits := fs.Uint("pow-bits", proto.InvitePoWaDBits, "PoWaD difficulty bits (fixed)")
+			expires := fs.Int("expires", 3600, "expires seconds from now")
+			_ = fs.Parse(os.Args[3:])
+			if *to == "" {
+				die("missing --to", fmt.Errorf("invitee pubkey or node id required"))
+			}
+			if *powBits != proto.InvitePoWaDBits {
+				die("invalid --pow-bits", fmt.Errorf("pow bits fixed at %d", proto.InvitePoWaDBits))
+			}
+			if *expires <= 0 {
+				die("invalid --expires", fmt.Errorf("expires must be > 0"))
+			}
+			scope, err := parseInviteScope(*scopeStr)
+			if err != nil {
+				die("invalid --scope", err)
+			}
+			self, err := node.NewNode(root, node.Options{})
+			if err != nil {
+				die("load node failed", err)
+			}
+			toBytes, err := hex.DecodeString(*to)
+			if err != nil {
+				die("invalid --to", fmt.Errorf("hex decode failed"))
+			}
+			var inviteePub []byte
+			var inviteeID [32]byte
+			if crypto.IsRSAPublicKey(toBytes) {
+				inviteePub = toBytes
+				inviteeID = node.DeriveNodeID(inviteePub)
+			} else if len(toBytes) == 32 {
+				copy(inviteeID[:], toBytes)
+				if self.Peers == nil {
+					die("missing peer store", fmt.Errorf("peer store unavailable"))
+				}
+				if p, ok := findPeerByNodeID(self.Peers.List(), inviteeID); ok && len(p.PubKey) > 0 {
+					inviteePub = p.PubKey
+				} else {
+					die("missing invitee pubkey", fmt.Errorf("unknown node id"))
+				}
+			} else {
+				die("invalid --to", fmt.Errorf("need pubkey hex or 32-byte node id"))
+			}
+			inviteID := make([]byte, 16)
+			if _, err := crand.Read(inviteID); err != nil {
+				die("invite id failed", err)
+			}
+			issuedAt := uint64(time.Now().Unix())
+			expiresAt := issuedAt + uint64(*expires)
+			cert := proto.InviteCert{
+				V:          1,
+				InviterPub: self.PubKey,
+				InviteePub: inviteePub,
+				InviteID:   inviteID,
+				IssuedAt:   issuedAt,
+				ExpiresAt:  expiresAt,
+				Scope:      scope,
+				PowBits:    proto.InvitePoWaDBits,
+			}
+			nonce, ok := crypto.PoWaDSolve(inviteID, inviteeID[:], cert.PowBits)
+			if !ok {
+				die("powad solve failed", fmt.Errorf("nonce search exhausted"))
+			}
+			cert.PowNonce = nonce
+			signBytes, err := proto.EncodeInviteCertForSig(cert)
+			if err != nil {
+				die("invite sign bytes failed", err)
+			}
+			sig, err := crypto.SignDigest(self.PrivKey, crypto.SHA3_256(signBytes))
+			if err != nil {
+				die("invite sign failed", err)
+			}
+			cert.Sig = sig
+			msg := proto.InviteCertMsgFromCert(cert)
+			out, err := proto.EncodeInviteCertMsg(msg)
+			if err != nil {
+				die("encode invite cert failed", err)
+			}
+			fmt.Println(string(out))
 		case "add":
 			fs := flag.NewFlagSet("node add", flag.ExitOnError)
 			addr := fs.String("addr", "", "peer addr (host:port)")
@@ -2584,7 +2823,7 @@ func main() {
 			}
 			fmt.Printf("OK node exchange (%d added)\n", added)
 		default:
-			dieMsg("usage: web4 node <id|list|add|hello|exchange>")
+			dieMsg("usage: web4 node <id|list|members|join|add|hello|exchange|invite>")
 		}
 
 	case "gossip":
