@@ -97,6 +97,17 @@ All communication uses QUIC as the underlying transport.
 - Scope bits gate gossip vs contract updates.
 - Non-members are ignored for state-changing operations.
 
+## Scopes, revocation, and approval bundles
+- Scope bits: gossip (1), contract (2). Admin (4) is reserved for future use.
+- Gossip and peer exchange require gossip scope; contract open/close/ack require contract scope.
+- Revocation is inviter-scoped: only the original inviter can revoke an invitee.
+  - Revocation is signed and replay-protected; it clears the target's scope to zero.
+  - CLI: `web4 node revoke --to <nodeid> --reason <text>`.
+- Optional 2-of-3 admission: set `WEB4_INVITE_THRESHOLD=2`.
+  - Use invite bundles with ≥ threshold approvals over canonical bytes:
+    `"web4:v0:invite_approve|" || invite_id || invitee_nodeid || expires_at || scope`.
+  - CLI helpers: `web4 node approve-invite ...` and `web4 node join --bundle <file>`.
+
 ---
 
 ## Project scope

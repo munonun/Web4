@@ -15,6 +15,7 @@ const (
 	InvitePoWaDBits     = 18
 	InviteScopeGossip   = uint32(1 << 0)
 	InviteScopeContract = uint32(1 << 1)
+	InviteScopeAdmin    = uint32(1 << 2)
 	InviteScopeAll      = InviteScopeGossip | InviteScopeContract
 )
 

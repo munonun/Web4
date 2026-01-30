@@ -16,6 +16,7 @@ type Node struct {
 	Peers      *peer.Store
 	Members    *peer.MemberStore
 	Invites    *peer.InviteStore
+	Revokes    *peer.RevokeStore
 	Candidates *peer.CandidatePool
 	Sessions   *SessionStore
 }
@@ -33,6 +34,10 @@ type Options struct {
 	InviteStoreCap  int
 	InviteStoreTTL  time.Duration
 	InviteStoreLoad int
+	RevokeStorePath string
+	RevokeStoreCap  int
+	RevokeStoreTTL  time.Duration
+	RevokeStoreLoad int
 	CandidateCap    int
 	CandidateTTL    time.Duration
 }
@@ -40,6 +45,7 @@ type Options struct {
 const defaultPeerBook = "peers.jsonl"
 const defaultMemberBook = "members.jsonl"
 const defaultInviteBook = "invites.jsonl"
+const defaultRevokeBook = "revokes.jsonl"
 
 func NewNode(home string, opts Options) (*Node, error) {
 	if err := os.MkdirAll(home, 0700); err != nil {
@@ -99,6 +105,18 @@ func NewNode(home string, opts Options) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
+	revokePath := opts.RevokeStorePath
+	if revokePath == "" {
+		revokePath = filepath.Join(home, defaultRevokeBook)
+	}
+	revokes, err := peer.NewRevokeStore(revokePath, peer.RevokeOptions{
+		Cap:       opts.RevokeStoreCap,
+		TTL:       opts.RevokeStoreTTL,
+		LoadLimit: opts.RevokeStoreLoad,
+	})
+	if err != nil {
+		return nil, err
+	}
 	candidates := peer.NewCandidatePool(opts.CandidateCap, opts.CandidateTTL)
 	return &Node{
 		ID:         id,
@@ -107,6 +125,7 @@ func NewNode(home string, opts Options) (*Node, error) {
 		Peers:      peers,
 		Members:    members,
 		Invites:    invites,
+		Revokes:    revokes,
 		Candidates: candidates,
 		Sessions:   NewSessionStore(),
 	}, nil

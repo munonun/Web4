@@ -1011,6 +1011,9 @@ func recvSecureToReceiver(sender, receiver *node.Node, st *store.Store, checker 
 
 func recvPlainToReceiver(receiver *node.Node, st *store.Store, checker math4.LocalChecker, payload []byte) error {
 	_, _, err := recvDataWithResponse(payload, st, receiver, checker, "test-sender")
+	if err == nil {
+		return nil
+	}
 	return err
 }
 
@@ -1067,6 +1070,48 @@ func buildInviteCert(t *testing.T, inviter *node.Node, inviteePub []byte, invite
 		t.Fatalf("encode invite cert failed: %v", err)
 	}
 	return data, cert
+}
+
+func buildRevokeMsg(t *testing.T, revoker *node.Node, targetID [32]byte, revokeID []byte, reason string, issuedAt uint64) []byte {
+	t.Helper()
+	if revokeID == nil {
+		revokeID = bytes.Repeat([]byte{0x22}, 16)
+	}
+	if issuedAt == 0 {
+		issuedAt = uint64(time.Now().Unix())
+	}
+	signBytes, err := proto.RevokeSignBytes(revoker.ID, targetID, revokeID, issuedAt, reason)
+	if err != nil {
+		t.Fatalf("revoke sign bytes failed: %v", err)
+	}
+	sig := crypto.Sign(revoker.PrivKey, crypto.SHA3_256(signBytes))
+	msg := proto.RevokeMsg{
+		Type:          proto.MsgTypeRevoke,
+		RevokerNodeID: hex.EncodeToString(revoker.ID[:]),
+		TargetNodeID:  hex.EncodeToString(targetID[:]),
+		Reason:        reason,
+		IssuedAt:      issuedAt,
+		RevokeID:      hex.EncodeToString(revokeID),
+		Sig:           hex.EncodeToString(sig),
+	}
+	out, err := proto.EncodeRevokeMsg(msg)
+	if err != nil {
+		t.Fatalf("encode revoke failed: %v", err)
+	}
+	return out
+}
+
+func buildInviteApproval(t *testing.T, approver *node.Node, inviteID []byte, inviteeID [32]byte, expiresAt uint64, scope uint32) proto.InviteApproval {
+	t.Helper()
+	signBytes, err := proto.InviteApproveSignBytes(inviteID, inviteeID, expiresAt, scope)
+	if err != nil {
+		t.Fatalf("approve sign bytes failed: %v", err)
+	}
+	sig := crypto.Sign(approver.PrivKey, crypto.SHA3_256(signBytes))
+	return proto.InviteApproval{
+		ApproverNodeID: hex.EncodeToString(approver.ID[:]),
+		Sig:            hex.EncodeToString(sig),
+	}
 }
 
 func TestInviteCertValidAddsMember(t *testing.T) {
@@ -1568,6 +1613,9 @@ func TestNodeExchange(t *testing.T) {
 	if err := self.Peers.Upsert(peerB, true); err != nil {
 		t.Fatalf("seed peer failed: %v", err)
 	}
+	if err := self.Members.AddWithScope(peerB.NodeID, proto.InviteScopeGossip, false); err != nil {
+		t.Fatalf("seed member failed: %v", err)
+	}
 	rootB := filepath.Join(homeB, ".web4mvp")
 	selfB, err := node.NewNode(rootB, node.Options{})
 	if err != nil {
@@ -1967,6 +2015,249 @@ func TestGossipForwardSendsGossipPush(t *testing.T) {
 	if hdr.Type != proto.MsgTypeGossipPush {
 		t.Fatalf("expected gossip_push, got %q", hdr.Type)
 	}
+}
+
+func TestRevokeInviterCanRevoke(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeR := t.TempDir()
+
+	pair := newSessionPair(t, homeA, homeR, nil, nil)
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+
+	now := uint64(time.Now().Unix())
+	inviteData, _ := buildInviteCert(t, pair.a, invitee.PubKey, nil, proto.InviteScopeContract, proto.InvitePoWaDBits, now, now+3600, nil)
+	if err := recvPlainToReceiver(pair.b, pair.stB, pair.checkerB, inviteData); err != nil {
+		t.Fatalf("invite recv failed: %v", err)
+	}
+
+	revokeMsg := buildRevokeMsg(t, pair.a, invitee.ID, nil, "misbehave", 0)
+	if err := recvSecureToReceiver(pair.a, pair.b, pair.stB, pair.checkerB, revokeMsg); err != nil {
+		t.Fatalf("revoke recv failed: %v", err)
+	}
+	if pair.b.Members.HasScope(invitee.ID, 0) {
+		t.Fatalf("expected invitee scope revoked")
+	}
+}
+
+func TestRevokeNonInviterRejected(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+	homeR := t.TempDir()
+
+	pair := newSessionPair(t, homeC, homeR, nil, nil)
+	inviter, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+
+	now := uint64(time.Now().Unix())
+	inviteData, _ := buildInviteCert(t, inviter, invitee.PubKey, nil, proto.InviteScopeContract, proto.InvitePoWaDBits, now, now+3600, nil)
+	if err := recvPlainToReceiver(pair.b, pair.stB, pair.checkerB, inviteData); err != nil {
+		t.Fatalf("invite recv failed: %v", err)
+	}
+
+	revokeMsg := buildRevokeMsg(t, pair.a, invitee.ID, nil, "unauthorized", 0)
+	if err := recvSecureToReceiver(pair.a, pair.b, pair.stB, pair.checkerB, revokeMsg); err == nil {
+		t.Fatalf("expected non-inviter revoke to be rejected")
+	}
+}
+
+func TestRevokeReplayRejected(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeR := t.TempDir()
+
+	pair := newSessionPair(t, homeA, homeR, nil, nil)
+	invitee, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load invitee failed: %v", err)
+	}
+
+	now := uint64(time.Now().Unix())
+	inviteData, _ := buildInviteCert(t, pair.a, invitee.PubKey, nil, proto.InviteScopeContract, proto.InvitePoWaDBits, now, now+3600, nil)
+	if err := recvPlainToReceiver(pair.b, pair.stB, pair.checkerB, inviteData); err != nil {
+		t.Fatalf("invite recv failed: %v", err)
+	}
+
+	revokeID := bytes.Repeat([]byte{0x33}, 16)
+	revokeMsg := buildRevokeMsg(t, pair.a, invitee.ID, revokeID, "replay", 0)
+	if err := recvSecureToReceiver(pair.a, pair.b, pair.stB, pair.checkerB, revokeMsg); err != nil {
+		t.Fatalf("revoke recv failed: %v", err)
+	}
+	if err := recvSecureToReceiver(pair.a, pair.b, pair.stB, pair.checkerB, revokeMsg); err == nil {
+		t.Fatalf("expected replay revoke to be rejected")
+	}
+}
+
+func TestInviteBundleThreshold(t *testing.T) {
+	t.Setenv("WEB4_INVITE_THRESHOLD", "2")
+
+	setup := func() (*node.Node, *store.Store, math4.LocalChecker, *node.Node, *node.Node, *node.Node) {
+		homeR := t.TempDir()
+		homeA := t.TempDir()
+		homeC := t.TempDir()
+		homeI := t.TempDir()
+		receiver, err := node.NewNode(filepath.Join(homeR, ".web4mvp"), node.Options{})
+		if err != nil {
+			t.Fatalf("load receiver failed: %v", err)
+		}
+		approverA, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+		if err != nil {
+			t.Fatalf("load approver A failed: %v", err)
+		}
+		approverC, err := node.NewNode(filepath.Join(homeC, ".web4mvp"), node.Options{})
+		if err != nil {
+			t.Fatalf("load approver C failed: %v", err)
+		}
+		invitee, err := node.NewNode(filepath.Join(homeI, ".web4mvp"), node.Options{})
+		if err != nil {
+			t.Fatalf("load invitee failed: %v", err)
+		}
+		if receiver.Peers != nil {
+			_ = receiver.Peers.Upsert(peer.Peer{NodeID: approverA.ID, PubKey: approverA.PubKey}, true)
+			_ = receiver.Peers.Upsert(peer.Peer{NodeID: approverC.ID, PubKey: approverC.PubKey}, true)
+		}
+		if receiver.Members != nil {
+			_ = receiver.Members.AddWithScope(approverA.ID, proto.InviteScopeAll, false)
+			_ = receiver.Members.AddWithScope(approverC.ID, proto.InviteScopeAll, false)
+		}
+		st := store.New(filepath.Join(homeR, ".web4mvp", "contracts.jsonl"), filepath.Join(homeR, ".web4mvp", "acks.jsonl"), filepath.Join(homeR, ".web4mvp", "repayreqs.jsonl"))
+		checker := math4.NewLocalChecker(math4.Options{})
+		return receiver, st, checker, approverA, approverC, invitee
+	}
+
+	t.Run("one approval rejected", func(t *testing.T) {
+		receiver, st, checker, approverA, _, invitee := setup()
+		inviteID := bytes.Repeat([]byte{0x44}, 16)
+		expiresAt := uint64(time.Now().Unix() + 3600)
+		scope := proto.InviteScopeGossip
+		approvalA := buildInviteApproval(t, approverA, inviteID, invitee.ID, expiresAt, scope)
+		msg := proto.InviteBundleMsg{
+			InviteePub:    hex.EncodeToString(invitee.PubKey),
+			InviteeNodeID: hex.EncodeToString(invitee.ID[:]),
+			InviteID:      hex.EncodeToString(inviteID),
+			ExpiresAt:     expiresAt,
+			Scope:         scope,
+			Approvals:     []proto.InviteApproval{approvalA},
+		}
+		data, err := proto.EncodeInviteBundleMsg(msg)
+		if err != nil {
+			t.Fatalf("encode invite bundle failed: %v", err)
+		}
+		if err := recvPlainToReceiver(receiver, st, checker, data); err == nil {
+			t.Fatalf("expected insufficient approvals rejection")
+		}
+	})
+
+	t.Run("two approvals accepted", func(t *testing.T) {
+		receiver, st, checker, approverA, approverC, invitee := setup()
+		inviteID := bytes.Repeat([]byte{0x45}, 16)
+		expiresAt := uint64(time.Now().Unix() + 3600)
+		scope := proto.InviteScopeGossip
+		approvalA := buildInviteApproval(t, approverA, inviteID, invitee.ID, expiresAt, scope)
+		approvalC := buildInviteApproval(t, approverC, inviteID, invitee.ID, expiresAt, scope)
+		msg := proto.InviteBundleMsg{
+			InviteePub:    hex.EncodeToString(invitee.PubKey),
+			InviteeNodeID: hex.EncodeToString(invitee.ID[:]),
+			InviteID:      hex.EncodeToString(inviteID),
+			ExpiresAt:     expiresAt,
+			Scope:         scope,
+			Approvals:     []proto.InviteApproval{approvalA, approvalC},
+		}
+		data, err := proto.EncodeInviteBundleMsg(msg)
+		if err != nil {
+			t.Fatalf("encode invite bundle failed: %v", err)
+		}
+		if err := recvPlainToReceiver(receiver, st, checker, data); err != nil {
+			t.Fatalf("invite bundle recv failed: %v", err)
+		}
+		if !receiver.Members.HasScope(invitee.ID, scope) {
+			t.Fatalf("expected invitee added with scope")
+		}
+	})
+
+	t.Run("duplicate approvals rejected", func(t *testing.T) {
+		receiver, st, checker, approverA, _, invitee := setup()
+		inviteID := bytes.Repeat([]byte{0x46}, 16)
+		expiresAt := uint64(time.Now().Unix() + 3600)
+		scope := proto.InviteScopeGossip
+		approvalA := buildInviteApproval(t, approverA, inviteID, invitee.ID, expiresAt, scope)
+		msg := proto.InviteBundleMsg{
+			InviteePub:    hex.EncodeToString(invitee.PubKey),
+			InviteeNodeID: hex.EncodeToString(invitee.ID[:]),
+			InviteID:      hex.EncodeToString(inviteID),
+			ExpiresAt:     expiresAt,
+			Scope:         scope,
+			Approvals:     []proto.InviteApproval{approvalA, approvalA},
+		}
+		data, err := proto.EncodeInviteBundleMsg(msg)
+		if err != nil {
+			t.Fatalf("encode invite bundle failed: %v", err)
+		}
+		if err := recvPlainToReceiver(receiver, st, checker, data); err == nil {
+			t.Fatalf("expected duplicate approvals rejection")
+		}
+	})
+
+	t.Run("expired bundle rejected", func(t *testing.T) {
+		receiver, st, checker, approverA, approverC, invitee := setup()
+		inviteID := bytes.Repeat([]byte{0x47}, 16)
+		expiresAt := uint64(time.Now().Unix() - 1)
+		scope := proto.InviteScopeGossip
+		approvalA := buildInviteApproval(t, approverA, inviteID, invitee.ID, expiresAt, scope)
+		approvalC := buildInviteApproval(t, approverC, inviteID, invitee.ID, expiresAt, scope)
+		msg := proto.InviteBundleMsg{
+			InviteePub:    hex.EncodeToString(invitee.PubKey),
+			InviteeNodeID: hex.EncodeToString(invitee.ID[:]),
+			InviteID:      hex.EncodeToString(inviteID),
+			ExpiresAt:     expiresAt,
+			Scope:         scope,
+			Approvals:     []proto.InviteApproval{approvalA, approvalC},
+		}
+		data, err := proto.EncodeInviteBundleMsg(msg)
+		if err != nil {
+			t.Fatalf("encode invite bundle failed: %v", err)
+		}
+		if err := recvPlainToReceiver(receiver, st, checker, data); err == nil {
+			t.Fatalf("expected expired bundle rejection")
+		}
+	})
+
+	t.Run("replay rejected", func(t *testing.T) {
+		receiver, st, checker, approverA, approverC, invitee := setup()
+		inviteID := bytes.Repeat([]byte{0x48}, 16)
+		expiresAt := uint64(time.Now().Unix() + 3600)
+		scope := proto.InviteScopeGossip
+		approvalA := buildInviteApproval(t, approverA, inviteID, invitee.ID, expiresAt, scope)
+		approvalC := buildInviteApproval(t, approverC, inviteID, invitee.ID, expiresAt, scope)
+		msg := proto.InviteBundleMsg{
+			InviteePub:    hex.EncodeToString(invitee.PubKey),
+			InviteeNodeID: hex.EncodeToString(invitee.ID[:]),
+			InviteID:      hex.EncodeToString(inviteID),
+			ExpiresAt:     expiresAt,
+			Scope:         scope,
+			Approvals:     []proto.InviteApproval{approvalA, approvalC},
+		}
+		data, err := proto.EncodeInviteBundleMsg(msg)
+		if err != nil {
+			t.Fatalf("encode invite bundle failed: %v", err)
+		}
+		if err := recvPlainToReceiver(receiver, st, checker, data); err != nil {
+			t.Fatalf("invite bundle recv failed: %v", err)
+		}
+		if err := recvPlainToReceiver(receiver, st, checker, data); err == nil {
+			t.Fatalf("expected invite bundle replay rejection")
+		}
+	})
 }
 
 func waitForContract(t *testing.T, home, cidHex string, timeout time.Duration) {

@@ -735,6 +735,235 @@ wait "${SERVER_PID}" 2>/dev/null || true
 SERVER_PID=""
 pass "check 5 (QUIC peer exchange)"
 
+PORT_SCOPE="$(pick_unique_port 42431)"
+
+rm -f "${TMPA}/.web4mvp/members.jsonl"* "${TMPB}/.web4mvp/members.jsonl"* 2>/dev/null || true
+
+server_log_scope_a="${TMPWORK}/quic_scope_server_a.log"
+server_log_scope_b="${TMPWORK}/quic_scope_server_b.log"
+gossip_push_log="${TMPWORK}/scope_gossip_push.log"
+echo "Starting QUIC server (scope+revoke): env HOME=${TMPA} WEB4_DEBUG=1 WEB4_CHECK6_ACK=1 ${WEB4_BIN} quic-listen --devtls --addr 127.0.0.1:${PORT_SCOPE}"
+env HOME="${TMPA}" WEB4_DEBUG=1 WEB4_CHECK6_ACK=1 "${WEB4_BIN}" quic-listen --devtls --addr "127.0.0.1:${PORT_SCOPE}" >"${server_log_scope_a}" 2>&1 &
+SERVER_PID_SCOPE=$!
+LISTENER_PIDS+=("${SERVER_PID_SCOPE}")
+server_log="${server_log_scope_a}"
+scope_debug_dump() {
+	local reason="$1"
+	echo "check 6b debug: ${reason}"
+	if [[ -f "${server_log_scope_a}" ]]; then
+		echo "scope server A log tail:"
+		tail -n 200 "${server_log_scope_a}" || true
+	fi
+	if [[ -f "${server_log_scope_b}" ]]; then
+		echo "scope server B log tail:"
+		tail -n 200 "${server_log_scope_b}" || true
+	fi
+	if [[ -f "${gossip_push_log}" ]]; then
+		echo "gossip push client log tail:"
+		tail -n 200 "${gossip_push_log}" || true
+	fi
+	echo "A members:"
+	run_a node members || true
+	echo "A peers:"
+	run_a node list || true
+	echo "B members:"
+	run_b node members || true
+	echo "B peers:"
+	run_b node list || true
+	echo "A peers.jsonl tail:"
+	tail -n 50 "${TMPA}/.web4mvp/peers.jsonl" 2>/dev/null || true
+	echo "B peers.jsonl tail:"
+	tail -n 50 "${TMPB}/.web4mvp/peers.jsonl" 2>/dev/null || true
+	echo "scope log grep (scope/missing scope/unknown sender/peer resolve):"
+	grep -nE "scope|missing scope|unknown sender|peer resolve" "${server_log_scope_a}" "${server_log_scope_b}" 2>/dev/null || true
+}
+
+wait_quic_ready "${server_log_scope_a}" "check 6b (scope+revoke): server did not start"
+
+for _ in $(seq 1 20); do
+	if [[ -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+if [[ ! -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
+	scope_debug_dump "missing devtls CA"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): missing devtls CA"
+fi
+
+NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
+NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
+PUBA="$(cat "${TMPA}/.web4mvp/pub.hex")"
+PUBB="$(cat "${TMPB}/.web4mvp/pub.hex")"
+
+run_checked "check 6b (scope+revoke): node hello (B->A)" --log "${server_log_scope_a}" --quiet run_b node hello --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDA}"
+printf '{"node_id":"%s","pubkey":"%s","addr":"%s"}\n' "${NODEIDA}" "${PUBA}" "127.0.0.1:${PORT_SCOPE}" >> "${TMPB}/.web4mvp/peers.jsonl"
+peer_seeded=0
+for _ in $(seq 1 40); do
+	if grep -q "127.0.0.1:${PORT_SCOPE}" "${TMPB}/.web4mvp/peers.jsonl" 2>/dev/null; then
+		peer_seeded=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${peer_seeded}" -ne 1 ]]; then
+	scope_debug_dump "B missing A addr mapping"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): peer seed missing on B"
+fi
+
+invite_ab_gossip="${TMPWORK}/invite_ab_gossip.json"
+run_checked "check 6b (scope+revoke): invite gossip scope" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope gossip --pow-bits 18 --expires 3600 > '${invite_ab_gossip}'"
+invite_send_log="${TMPWORK}/scope_invite_gossip_send.log"
+if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${invite_ab_gossip}" >"${invite_send_log}" 2>&1 ); then
+	tail -n 200 "${invite_send_log}" || true
+	scope_debug_dump "invite gossip send failed"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): invite gossip send failed"
+fi
+invite_gossip_ok=0
+for _ in $(seq 1 80); do
+	if grep -q "RECV INVITE OK invitee=${NODEIDB}.*scope=1" "${server_log_scope_a}" 2>/dev/null; then
+		invite_gossip_ok=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${invite_gossip_ok}" -ne 1 ]]; then
+	scope_debug_dump "invite gossip not accepted"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): invite gossip not accepted"
+fi
+
+gossip_hello_scope="${TMPWORK}/gossip_hello_scope.json"
+run_checked "check 6b (scope+revoke): hello payload for gossip" --quiet run_b node hello --to-id "${NODEIDA}" --out "${gossip_hello_scope}"
+set +e
+gossip_out="$(WEB4_CHECK6_ACK=1 run_b gossip push --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${gossip_hello_scope}" 2>&1)"
+gossip_status=$?
+set -e
+printf '%s\n' "${gossip_out}" > "${gossip_push_log}"
+if [[ "${gossip_status}" -ne 0 ]]; then
+	scope_debug_dump "gossip push failed"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): gossip push failed"
+fi
+if ! grep -q "GOSSIP_ACK status=ok" "${gossip_push_log}" 2>/dev/null; then
+	scope_debug_dump "gossip push not accepted"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): gossip push not accepted"
+fi
+
+open1="${TMPWORK}/scope_open1.json"
+run_checked "check 6b (scope+revoke): open (gossip-only)" --quiet run_b open --to "${PUBA}" --amount 7 --nonce 9001 --out "${open1}"
+CID1="$(run_b list | awk 'END{print $2}')"
+open1_send_log="${TMPWORK}/scope_open1_send.log"
+if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send-secure --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDA}" --in "${open1}" >"${open1_send_log}" 2>&1 ); then
+	tail -n 200 "${open1_send_log}" || true
+	scope_debug_dump "secure send failed (open1)"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): secure send failed"
+fi
+found=0
+for _ in $(seq 1 40); do
+	if run_a list | grep -q "${CID1}"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -eq 1 ]]; then
+	scope_debug_dump "contract accepted without contract scope"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): contract accepted without contract scope"
+fi
+
+invite_ab_contract="${TMPWORK}/invite_ab_contract.json"
+run_checked "check 6b (scope+revoke): invite contract scope" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope contract --pow-bits 18 --expires 3600 > '${invite_ab_contract}'"
+invite_contract_send_log="${TMPWORK}/scope_invite_contract_send.log"
+if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${invite_ab_contract}" >"${invite_contract_send_log}" 2>&1 ); then
+	tail -n 200 "${invite_contract_send_log}" || true
+	scope_debug_dump "invite contract send failed"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): invite contract send failed"
+fi
+invite_contract_ok=0
+for _ in $(seq 1 80); do
+	if grep -q "RECV INVITE OK invitee=${NODEIDB}.*scope=2" "${server_log_scope_a}" 2>/dev/null; then
+		invite_contract_ok=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${invite_contract_ok}" -ne 1 ]]; then
+	scope_debug_dump "invite contract not accepted"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): invite contract not accepted"
+fi
+
+open2="${TMPWORK}/scope_open2.json"
+run_checked "check 6b (scope+revoke): open (contract scope)" --quiet run_b open --to "${PUBA}" --amount 9 --nonce 9002 --out "${open2}"
+CID2="$(run_b list | awk 'END{print $2}')"
+open2_send_log="${TMPWORK}/scope_open2_send.log"
+if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send-secure --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDA}" --in "${open2}" >"${open2_send_log}" 2>&1 ); then
+	tail -n 200 "${open2_send_log}" || true
+	scope_debug_dump "secure send failed (open2)"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): secure send failed"
+fi
+accepted=0
+for _ in $(seq 1 80); do
+	if run_a list | grep -q "${CID2}"; then
+		accepted=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${accepted}" -ne 1 ]]; then
+	scope_debug_dump "contract not accepted after upgrade"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): contract not accepted after upgrade"
+fi
+
+revoke_ab="${TMPWORK}/revoke_ab.json"
+run_checked "check 6b (scope+revoke): revoke" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node revoke --to '${NODEIDB}' --reason 'smoke' > '${revoke_ab}'"
+revoke_send_log="${TMPWORK}/scope_revoke_send.log"
+if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${revoke_ab}" >"${revoke_send_log}" 2>&1 ); then
+	tail -n 200 "${revoke_send_log}" || true
+	scope_debug_dump "revoke send failed"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): revoke send failed"
+fi
+
+open3="${TMPWORK}/scope_open3.json"
+run_checked "check 6b (scope+revoke): open (revoked)" --quiet run_b open --to "${PUBA}" --amount 11 --nonce 9003 --out "${open3}"
+CID3="$(run_b list | awk 'END{print $2}')"
+open3_send_log="${TMPWORK}/scope_open3_send.log"
+if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send-secure --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDA}" --in "${open3}" >"${open3_send_log}" 2>&1 ); then
+	tail -n 200 "${open3_send_log}" || true
+	scope_debug_dump "secure send failed (open3)"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): secure send failed"
+fi
+found=0
+for _ in $(seq 1 40); do
+	if run_a list | grep -q "${CID3}"; then
+		found=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${found}" -eq 1 ]]; then
+	scope_debug_dump "contract accepted after revoke"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): contract accepted after revoke"
+fi
+
+kill "${SERVER_PID_SCOPE}" 2>/dev/null || true
+wait "${SERVER_PID_SCOPE}" 2>/dev/null || true
+SERVER_PID_SCOPE=""
+pass "check 6b (scope + revoke)"
+
 (
 	check6_apply_env_defaults
 	CHECK6_FAIL_EXIT=0

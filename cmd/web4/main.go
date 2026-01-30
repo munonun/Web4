@@ -423,7 +423,7 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		}
 	}
 	if !wasSecure && hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 && hdr.Type != proto.MsgTypeGossipPush {
-		if hdr.Type != proto.MsgTypeInviteCert {
+		if hdr.Type != proto.MsgTypeInviteCert && hdr.Type != proto.MsgTypeInviteBundle && hdr.Type != proto.MsgTypeRevoke {
 			return nil, false, reject("handshake required", fmt.Errorf("missing secure envelope"))
 		}
 	}
@@ -564,6 +564,9 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		return nil, false, nil
 
 	case proto.MsgTypeInviteCert:
+		if inviteThreshold() > 1 {
+			return nil, false, reject("invalid invite cert", fmt.Errorf("invite threshold requires invite bundle"))
+		}
 		msg, err := proto.DecodeInviteCertMsg(data)
 		if err != nil {
 			return nil, false, reject("decode invite cert failed", err)
@@ -595,13 +598,198 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err := self.Members.AddWithScope(inviterID, proto.InviteScopeAll, true); err != nil {
 			return nil, false, reject("store member failed", err)
 		}
-		if err := self.Members.AddWithScope(inviteeID, cert.Scope, true); err != nil {
+		if err := self.Members.AddInvitedWithScope(inviteeID, cert.Scope, inviterID, true); err != nil {
 			return nil, false, reject("store member failed", err)
 		}
 		if err := self.Invites.Mark(inviterID, cert.InviteID, cert.ExpiresAt, true); err != nil {
 			return nil, false, reject("store invite failed", err)
 		}
 		fmt.Fprintf(os.Stderr, "RECV INVITE OK invitee=%x inviter=%x scope=%d\n", inviteeID[:], inviterID[:], cert.Scope)
+		return nil, true, nil
+
+	case proto.MsgTypeInviteBundle:
+		msg, err := proto.DecodeInviteBundleMsg(data)
+		if err != nil {
+			return nil, false, reject("decode invite bundle failed", err)
+		}
+		if self.Invites == nil {
+			return nil, false, reject("invite store unavailable", fmt.Errorf("missing invite store"))
+		}
+		if self.Members == nil {
+			return nil, false, reject("member store unavailable", fmt.Errorf("missing member store"))
+		}
+		inviteID, err := proto.DecodeInviteIDHex(msg.InviteID)
+		if err != nil {
+			return nil, false, reject("invalid invite bundle", err)
+		}
+		inviteePub, err := hex.DecodeString(msg.InviteePub)
+		if err != nil || !crypto.IsRSAPublicKey(inviteePub) {
+			return nil, false, reject("invalid invite bundle", fmt.Errorf("bad invitee pubkey"))
+		}
+		inviteeID := node.DeriveNodeID(inviteePub)
+		if msg.InviteeNodeID != "" {
+			expected, err := decodeNodeIDHex(msg.InviteeNodeID)
+			if err != nil {
+				return nil, false, reject("invalid invite bundle", err)
+			}
+			if expected != inviteeID {
+				return nil, false, reject("invalid invite bundle", fmt.Errorf("invitee node_id mismatch"))
+			}
+		}
+		if msg.ExpiresAt == 0 {
+			return nil, false, reject("invalid invite bundle", fmt.Errorf("missing expires_at"))
+		}
+		if msg.Scope == 0 {
+			return nil, false, reject("invalid invite bundle", fmt.Errorf("missing scope"))
+		}
+		nowUnix := uint64(time.Now().Unix())
+		if msg.ExpiresAt < nowUnix {
+			return nil, false, reject("invalid invite bundle", fmt.Errorf("invite expired"))
+		}
+		if len(msg.Approvals) == 0 {
+			return nil, false, reject("invalid invite bundle", fmt.Errorf("missing approvals"))
+		}
+		signBytes, err := proto.InviteApproveSignBytes(inviteID, inviteeID, msg.ExpiresAt, msg.Scope)
+		if err != nil {
+			return nil, false, reject("invalid invite bundle", err)
+		}
+		sigDigest := crypto.SHA3_256(signBytes)
+		distinct := make(map[string]struct{}, len(msg.Approvals))
+		approvals := 0
+		var inviterID [32]byte
+		inviterSet := false
+		for _, approval := range msg.Approvals {
+			approverID, err := decodeNodeIDHex(approval.ApproverNodeID)
+			if err != nil {
+				return nil, false, reject("invalid invite bundle", err)
+			}
+			key := hex.EncodeToString(approverID[:])
+			if _, seen := distinct[key]; seen {
+				continue
+			}
+			if !self.Members.HasScope(approverID, 0) {
+				return nil, false, reject("invalid invite bundle", fmt.Errorf("approver not member"))
+			}
+			sig, err := decodeSigHex(approval.Sig)
+			if err != nil || len(sig) == 0 {
+				return nil, false, reject("invalid invite bundle", fmt.Errorf("bad approval signature"))
+			}
+			pub := []byte(nil)
+			if approverID == self.ID {
+				pub = self.PubKey
+			} else if self.Peers != nil {
+				if p, ok := findPeerByNodeID(self.Peers.List(), approverID); ok && len(p.PubKey) > 0 {
+					pub = p.PubKey
+				}
+			}
+			if len(pub) == 0 || !crypto.VerifyDigest(pub, sigDigest, sig) {
+				return nil, false, reject("invalid invite bundle", fmt.Errorf("approval verify failed"))
+			}
+			distinct[key] = struct{}{}
+			approvals++
+			if !inviterSet {
+				inviterID = approverID
+				inviterSet = true
+			}
+		}
+		threshold := inviteThreshold()
+		if approvals < threshold {
+			return nil, false, reject("invalid invite bundle", fmt.Errorf("insufficient approvals"))
+		}
+		if self.Invites.Seen(inviteeID, inviteID) {
+			return nil, false, reject("invalid invite bundle", fmt.Errorf("invite replay"))
+		}
+		if self.Peers != nil {
+			_ = self.Peers.Upsert(peer.Peer{NodeID: inviteeID, PubKey: inviteePub}, true)
+		}
+		if inviterSet {
+			if err := self.Members.AddInvitedWithScope(inviteeID, msg.Scope, inviterID, true); err != nil {
+				return nil, false, reject("store member failed", err)
+			}
+		} else {
+			if err := self.Members.AddWithScope(inviteeID, msg.Scope, true); err != nil {
+				return nil, false, reject("store member failed", err)
+			}
+		}
+		if err := self.Invites.Mark(inviteeID, inviteID, msg.ExpiresAt, true); err != nil {
+			return nil, false, reject("store invite failed", err)
+		}
+		fmt.Fprintf(os.Stderr, "RECV INVITE BUNDLE OK invitee=%x approvals=%d scope=%d\n", inviteeID[:], approvals, msg.Scope)
+		return nil, true, nil
+
+	case proto.MsgTypeRevoke:
+		msg, err := proto.DecodeRevokeMsg(data)
+		if err != nil {
+			return nil, false, reject("decode revoke failed", err)
+		}
+		if self.Members == nil {
+			return nil, false, reject("member store unavailable", fmt.Errorf("missing member store"))
+		}
+		if self.Revokes == nil {
+			return nil, false, reject("revoke store unavailable", fmt.Errorf("missing revoke store"))
+		}
+		revokerID, err := decodeNodeIDHex(msg.RevokerNodeID)
+		if err != nil {
+			return nil, false, reject("invalid revoke", err)
+		}
+		targetID, err := decodeNodeIDHex(msg.TargetNodeID)
+		if err != nil {
+			return nil, false, reject("invalid revoke", err)
+		}
+		revokeID, err := proto.DecodeRevokeIDHex(msg.RevokeID)
+		if err != nil {
+			return nil, false, reject("invalid revoke", err)
+		}
+		sig, err := decodeSigHex(msg.Sig)
+		if err != nil || len(sig) == 0 {
+			return nil, false, reject("invalid revoke", fmt.Errorf("bad sig"))
+		}
+		if msg.IssuedAt == 0 {
+			return nil, false, reject("invalid revoke", fmt.Errorf("missing issued_at"))
+		}
+		skew := 5 * time.Minute
+		nowUnix := uint64(time.Now().Unix())
+		if msg.IssuedAt > nowUnix+uint64(skew.Seconds()) {
+			return nil, false, reject("invalid revoke", fmt.Errorf("issued_at in future"))
+		}
+		if !self.Members.HasScope(revokerID, 0) {
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "recv drop: membership_gate type=%s sender=%x scope=0\n", hdr.Type, revokerID[:])
+			}
+			return nil, false, reject("membership_gate", fmt.Errorf("revoker not member"))
+		}
+		if inviterID, ok := self.Members.InviterFor(targetID); !ok || inviterID != revokerID {
+			return nil, false, reject("invalid revoke", fmt.Errorf("revoker not inviter"))
+		}
+		pub := []byte(nil)
+		if revokerID == self.ID {
+			pub = self.PubKey
+		} else if self.Peers != nil {
+			if p, ok := findPeerByNodeID(self.Peers.List(), revokerID); ok && len(p.PubKey) > 0 {
+				pub = p.PubKey
+			}
+		}
+		if len(pub) == 0 {
+			return nil, false, reject("invalid revoke", fmt.Errorf("revoker pubkey missing"))
+		}
+		signBytes, err := proto.RevokeSignBytes(revokerID, targetID, revokeID, msg.IssuedAt, msg.Reason)
+		if err != nil {
+			return nil, false, reject("invalid revoke", err)
+		}
+		if !crypto.VerifyDigest(pub, crypto.SHA3_256(signBytes), sig) {
+			debugCount.incVerify("revoke")
+			return nil, false, reject("invalid revoke", fmt.Errorf("signature check failed"))
+		}
+		if self.Revokes.Seen(revokerID, revokeID) {
+			return nil, false, reject("invalid revoke", fmt.Errorf("revoke replay"))
+		}
+		if err := self.Members.SetScope(targetID, 0, true); err != nil {
+			return nil, false, reject("store member failed", err)
+		}
+		if err := self.Revokes.Mark(revokerID, revokeID, targetID, msg.IssuedAt, true); err != nil {
+			return nil, false, reject("store revoke failed", err)
+		}
+		fmt.Fprintf(os.Stderr, "RECV REVOKE OK target=%x revoker=%x reason=%s\n", targetID[:], revokerID[:], msg.Reason)
 		return nil, true, nil
 
 	case proto.MsgTypeContractOpen:
@@ -1828,6 +2016,8 @@ func requiredMemberScope(msgType string) (uint32, bool) {
 	switch msgType {
 	case proto.MsgTypeContractOpen, proto.MsgTypeRepayReq, proto.MsgTypeAck:
 		return proto.InviteScopeContract, true
+	case proto.MsgTypePeerExchangeReq, proto.MsgTypePeerExchangeResp:
+		return proto.InviteScopeGossip, true
 	default:
 		return 0, false
 	}
@@ -1948,6 +2138,18 @@ func parseInviteScope(s string) (uint32, error) {
 		return 0, fmt.Errorf("empty scope")
 	}
 	return scope, nil
+}
+
+func inviteThreshold() int {
+	raw := strings.TrimSpace(os.Getenv("WEB4_INVITE_THRESHOLD"))
+	if raw == "" {
+		return 1
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		return 1
+	}
+	return n
 }
 
 func verifySignedMessage(data []byte, msgType string, self *node.Node) *recvError {
@@ -2462,7 +2664,7 @@ func main() {
 
 	case "node":
 		if len(os.Args) < 3 {
-			dieMsg("usage: web4 node <id|list|members|join|add|hello|exchange|invite>")
+			dieMsg("usage: web4 node <id|list|members|join|add|hello|exchange|invite|revoke|approve-invite>")
 		}
 		switch os.Args[2] {
 		case "id":
@@ -2496,13 +2698,31 @@ func main() {
 			fs := flag.NewFlagSet("node join", flag.ExitOnError)
 			nodeIDHex := fs.String("node-id", "", "target node id hex")
 			addr := fs.String("addr", "", "target addr (host:port)")
+			bundlePath := fs.String("bundle", "", "invite bundle file to process")
 			_ = fs.Parse(os.Args[3:])
-			if *nodeIDHex == "" && *addr == "" {
-				die("missing --node-id", fmt.Errorf("node id or addr required"))
-			}
 			self, err := node.NewNode(root, node.Options{})
 			if err != nil {
 				die("load node failed", err)
+			}
+			if *bundlePath != "" {
+				data, err := os.ReadFile(*bundlePath)
+				if err != nil {
+					die("read bundle failed", err)
+				}
+				st := store.New(
+					filepath.Join(root, "contracts.jsonl"),
+					filepath.Join(root, "acks.jsonl"),
+					filepath.Join(root, "repayreqs.jsonl"),
+				)
+				checker := math4.NewLocalChecker(math4.Options{})
+				if err := recvData(data, st, self, checker); err != nil {
+					die("join failed", err)
+				}
+				fmt.Println("OK join bundle")
+				return
+			}
+			if *nodeIDHex == "" && *addr == "" {
+				die("missing --node-id", fmt.Errorf("node id or addr required"))
 			}
 			var id [32]byte
 			if *nodeIDHex != "" {
@@ -2604,6 +2824,123 @@ func main() {
 				die("encode invite cert failed", err)
 			}
 			fmt.Println(string(out))
+		case "revoke":
+			fs := flag.NewFlagSet("node revoke", flag.ExitOnError)
+			to := fs.String("to", "", "target node id hex")
+			reason := fs.String("reason", "", "revocation reason")
+			revokeIDHex := fs.String("revoke-id", "", "revoke id hex (optional)")
+			_ = fs.Parse(os.Args[3:])
+			if *to == "" {
+				die("missing --to", fmt.Errorf("target node id required"))
+			}
+			self, err := node.NewNode(root, node.Options{})
+			if err != nil {
+				die("load node failed", err)
+			}
+			toBytes, err := hex.DecodeString(*to)
+			if err != nil || len(toBytes) != 32 {
+				die("invalid --to", fmt.Errorf("need 32 bytes hex"))
+			}
+			var targetID [32]byte
+			copy(targetID[:], toBytes)
+			var revokeID []byte
+			if *revokeIDHex != "" {
+				revokeID, err = hex.DecodeString(*revokeIDHex)
+				if err != nil || (len(revokeID) != 16 && len(revokeID) != 32) {
+					die("invalid --revoke-id", fmt.Errorf("need 16 or 32 bytes hex"))
+				}
+			} else {
+				revokeID = make([]byte, 16)
+				if _, err := crand.Read(revokeID); err != nil {
+					die("revoke id failed", err)
+				}
+			}
+			issuedAt := uint64(time.Now().Unix())
+			signBytes, err := proto.RevokeSignBytes(self.ID, targetID, revokeID, issuedAt, *reason)
+			if err != nil {
+				die("revoke sign bytes failed", err)
+			}
+			sig := crypto.Sign(self.PrivKey, crypto.SHA3_256(signBytes))
+			msg := proto.RevokeMsg{
+				Type:          proto.MsgTypeRevoke,
+				RevokerNodeID: hex.EncodeToString(self.ID[:]),
+				TargetNodeID:  hex.EncodeToString(targetID[:]),
+				Reason:        *reason,
+				IssuedAt:      issuedAt,
+				RevokeID:      hex.EncodeToString(revokeID),
+				Sig:           hex.EncodeToString(sig),
+			}
+			out, err := proto.EncodeRevokeMsg(msg)
+			if err != nil {
+				die("encode revoke failed", err)
+			}
+			fmt.Println(string(out))
+		case "approve-invite":
+			fs := flag.NewFlagSet("node approve-invite", flag.ExitOnError)
+			inviteIDHex := fs.String("invite-id", "", "invite id hex")
+			to := fs.String("to", "", "invitee pubkey hex or node id hex")
+			scopeStr := fs.String("scope", "gossip", "scope: gossip,contract,all")
+			expires := fs.Int("expires", 3600, "expires seconds from now")
+			_ = fs.Parse(os.Args[3:])
+			if *inviteIDHex == "" {
+				die("missing --invite-id", fmt.Errorf("invite id required"))
+			}
+			if *to == "" {
+				die("missing --to", fmt.Errorf("invitee pubkey or node id required"))
+			}
+			if *expires <= 0 {
+				die("invalid --expires", fmt.Errorf("expires must be > 0"))
+			}
+			scope, err := parseInviteScope(*scopeStr)
+			if err != nil {
+				die("invalid --scope", err)
+			}
+			inviteID, err := hex.DecodeString(*inviteIDHex)
+			if err != nil || (len(inviteID) != 16 && len(inviteID) != 32) {
+				die("invalid --invite-id", fmt.Errorf("need 16 or 32 bytes hex"))
+			}
+			self, err := node.NewNode(root, node.Options{})
+			if err != nil {
+				die("load node failed", err)
+			}
+			toBytes, err := hex.DecodeString(*to)
+			if err != nil {
+				die("invalid --to", fmt.Errorf("need pubkey or node id hex"))
+			}
+			var inviteeID [32]byte
+			if len(toBytes) == 32 {
+				copy(inviteeID[:], toBytes)
+			} else if crypto.IsRSAPublicKey(toBytes) {
+				inviteeID = node.DeriveNodeID(toBytes)
+			} else {
+				die("invalid --to", fmt.Errorf("need pubkey or node id hex"))
+			}
+			expiresAt := uint64(time.Now().Unix() + int64(*expires))
+			signBytes, err := proto.InviteApproveSignBytes(inviteID, inviteeID, expiresAt, scope)
+			if err != nil {
+				die("approval sign bytes failed", err)
+			}
+			sig := crypto.Sign(self.PrivKey, crypto.SHA3_256(signBytes))
+			out := struct {
+				InviteID       string `json:"invite_id"`
+				InviteeNodeID  string `json:"invitee_node_id"`
+				ExpiresAt      uint64 `json:"expires_at"`
+				Scope          uint32 `json:"scope"`
+				ApproverNodeID string `json:"approver_node_id"`
+				Sig            string `json:"sig"`
+			}{
+				InviteID:       hex.EncodeToString(inviteID),
+				InviteeNodeID:  hex.EncodeToString(inviteeID[:]),
+				ExpiresAt:      expiresAt,
+				Scope:          scope,
+				ApproverNodeID: hex.EncodeToString(self.ID[:]),
+				Sig:            hex.EncodeToString(sig),
+			}
+			encoded, err := json.Marshal(out)
+			if err != nil {
+				die("encode approval failed", err)
+			}
+			fmt.Println(string(encoded))
 		case "add":
 			fs := flag.NewFlagSet("node add", flag.ExitOnError)
 			addr := fs.String("addr", "", "peer addr (host:port)")
@@ -2823,7 +3160,7 @@ func main() {
 			}
 			fmt.Printf("OK node exchange (%d added)\n", added)
 		default:
-			dieMsg("usage: web4 node <id|list|members|join|add|hello|exchange|invite>")
+			dieMsg("usage: web4 node <id|list|members|join|add|hello|exchange|invite|revoke|approve-invite>")
 		}
 
 	case "gossip":
