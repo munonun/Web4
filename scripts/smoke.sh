@@ -8,6 +8,7 @@ set -euo pipefail
 : "${WEB4_QUIC_ACCEPT_TIMEOUT_SEC:=30}"
 : "${WEB4_QUIC_ACQUIRE_TIMEOUT_MS:=500}"
 : "${WEB4_DISABLE_LIMITER:=1}"
+: "${WEB4_ZK_SMOKE:=0}"
 export WEB4_QUIC_IDLE_TIMEOUT_SEC WEB4_QUIC_HANDSHAKE_TIMEOUT_SEC WEB4_QUIC_STREAM_TIMEOUT_SEC WEB4_QUIC_ACCEPT_TIMEOUT_SEC WEB4_QUIC_ACQUIRE_TIMEOUT_MS WEB4_DISABLE_LIMITER
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=check6_lib.sh
@@ -192,6 +193,12 @@ run_c() {
 run_d() {
 	HOME="${TMPD}" "${WEB4_BIN}" "$@"
 }
+
+if [[ "${WEB4_ZK_SMOKE}" == "1" ]]; then
+	if ! go test ./internal/zk/linear -run '^TestProveVerifyLinearNullspace$' -count=1; then
+		fail "zk smoke failed"
+	fi
+fi
 
 declare -A DEBUG_PEER_SEEN
 debug_peer_seen_once() {
