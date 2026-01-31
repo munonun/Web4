@@ -19,7 +19,7 @@ func TestProveVerifyLinearNullspace(t *testing.T) {
 	}
 	ctx := []byte("ctx-valid")
 
-	C, bundle, err := ProveLinearNullspace(L, x, ctx)
+	C, _, bundle, err := CommitAndProveLinearNullspace(L, x, ctx)
 	if err != nil {
 		t.Fatalf("prove failed: %v", err)
 	}
@@ -37,7 +37,7 @@ func TestVerifyWrongContextFails(t *testing.T) {
 	L := [][]int64{{1, -1}}
 	ctx := []byte("ctx-a")
 
-	C, bundle, err := ProveLinearNullspace(L, x, ctx)
+	C, _, bundle, err := CommitAndProveLinearNullspace(L, x, ctx)
 	if err != nil {
 		t.Fatalf("prove failed: %v", err)
 	}
@@ -55,7 +55,7 @@ func TestTamperCommitmentFails(t *testing.T) {
 	L := [][]int64{{1, -1}}
 	ctx := []byte("ctx-tamper")
 
-	C, bundle, err := ProveLinearNullspace(L, x, ctx)
+	C, _, bundle, err := CommitAndProveLinearNullspace(L, x, ctx)
 	if err != nil {
 		t.Fatalf("prove failed: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestWrongMatrixFails(t *testing.T) {
 	L := [][]int64{{1, -1}}
 	ctx := []byte("ctx-matrix")
 
-	C, bundle, err := ProveLinearNullspace(L, x, ctx)
+	C, _, bundle, err := CommitAndProveLinearNullspace(L, x, ctx)
 	if err != nil {
 		t.Fatalf("prove failed: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestSignedCoefficients(t *testing.T) {
 	L := [][]int64{{2, -1}}
 	ctx := []byte("ctx-signed")
 
-	C, bundle, err := ProveLinearNullspace(L, x, ctx)
+	C, _, bundle, err := CommitAndProveLinearNullspace(L, x, ctx)
 	if err != nil {
 		t.Fatalf("prove failed: %v", err)
 	}

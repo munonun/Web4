@@ -21,31 +21,58 @@ const (
 	proofLabel = "web4/zk/linear/proof/v0"
 )
 
-func ProveLinearNullspace(L [][]int64, x []pedersen.Scalar, ctx []byte) ([]pedersen.Element, *ProofBundle, error) {
+// ProveLinearNullspace proves that commitments C open to a hidden vector x
+// satisfying Lx = 0, using the corresponding randomness r.
+func ProveLinearNullspace(L [][]int64, C []pedersen.Element, r []pedersen.Scalar, ctx []byte) (*ProofBundle, error) {
 	if len(L) == 0 {
-		return nil, nil, fmt.Errorf("empty matrix")
+		return nil, fmt.Errorf("empty matrix")
 	}
-	if len(x) == 0 {
-		return nil, nil, fmt.Errorf("empty vector")
+	if len(C) == 0 || len(r) == 0 {
+		return nil, fmt.Errorf("empty commitments")
 	}
 	rowLen := len(L[0])
-	if rowLen != len(x) {
-		return nil, nil, fmt.Errorf("dimension mismatch")
+	if rowLen != len(C) || rowLen != len(r) {
+		return nil, fmt.Errorf("dimension mismatch")
 	}
 	for i := 1; i < len(L); i++ {
 		if len(L[i]) != rowLen {
-			return nil, nil, fmt.Errorf("ragged matrix")
+			return nil, fmt.Errorf("ragged matrix")
+		}
+	}
+	proofs, err := proveRows(L, C, r, ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &ProofBundle{Proofs: proofs}, nil
+}
+
+// CommitAndProveLinearNullspace commits to x and proves Lx = 0.
+// Returns commitments and randomness for caller-side bookkeeping/tests.
+func CommitAndProveLinearNullspace(L [][]int64, x []pedersen.Scalar, ctx []byte) ([]pedersen.Element, []pedersen.Scalar, *ProofBundle, error) {
+	if len(L) == 0 {
+		return nil, nil, nil, fmt.Errorf("empty matrix")
+	}
+	if len(x) == 0 {
+		return nil, nil, nil, fmt.Errorf("empty vector")
+	}
+	rowLen := len(L[0])
+	if rowLen != len(x) {
+		return nil, nil, nil, fmt.Errorf("dimension mismatch")
+	}
+	for i := 1; i < len(L); i++ {
+		if len(L[i]) != rowLen {
+			return nil, nil, nil, fmt.Errorf("ragged matrix")
 		}
 	}
 	C, r, err := pedersen.CommitVector(x, ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	proofs, err := proveRows(L, C, r, ctx)
+	bundle, err := ProveLinearNullspace(L, C, r, ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return C, &ProofBundle{Proofs: proofs}, nil
+	return C, r, bundle, nil
 }
 
 func VerifyLinearNullspace(L [][]int64, C []pedersen.Element, bundle *ProofBundle, ctx []byte) bool {
@@ -173,6 +200,19 @@ func scalarFromInt64(g group.Group, v int64) group.Scalar {
 	abs.Abs(abs)
 	s.SetBigInt(abs)
 	return s.Neg(s)
+}
+
+// ScalarsFromInt64 converts signed int64 values into group scalars.
+func ScalarsFromInt64(vals []int64) ([]pedersen.Scalar, error) {
+	if len(vals) == 0 {
+		return nil, fmt.Errorf("empty values")
+	}
+	g := pedersen.Group()
+	out := make([]pedersen.Scalar, len(vals))
+	for i, v := range vals {
+		out[i] = scalarFromInt64(g, v)
+	}
+	return out, nil
 }
 
 func hashMatrix(L [][]int64) []byte {

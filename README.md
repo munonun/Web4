@@ -172,10 +172,12 @@ go test ./...
 
 ### Integration smoke tests
 ```bash
-WEB4_STORE_MAX_BYTES=65536 ./scripts/smoke.sh
+  WEB4_ZK_MODE=1 WEB4_ZK_SMOKE=1 WEB4_STORE_MAX_BYTES=65536 ./scripts/smoke.sh
 ```
 These tests exercise:
-
+(개발자만 읽어도 되는거: 
+  - WEB4_ZK_MODE=1 → 실제 recv 경로에서 ZK 검증 강제
+  - WEB4_ZK_SMOKE=1 → ZK 모듈 단독 테스트 실행)
 - real multi-node interaction
 
 - gossip propagation paths

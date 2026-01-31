@@ -31,6 +31,8 @@ import (
 	"web4mvp/internal/peer"
 	"web4mvp/internal/proto"
 	"web4mvp/internal/store"
+	"web4mvp/internal/zk/linear"
+	"web4mvp/internal/zk/pedersen"
 )
 
 func die(msg string, err error) {
@@ -824,6 +826,18 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			p.Nonce != m.Nonce {
 			return nil, false, reject("open payload mismatch", fmt.Errorf("payload/header mismatch"))
 		}
+		if zkMode() {
+			ctx, err := openPayloadContext(p)
+			if err != nil {
+				return nil, false, reject("invalid zk context", err)
+			}
+			if err := verifyDeltaProof(c.IOU.Amount, ctx, p.ZK); err != nil {
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "recv drop: zk invalid (open) err=%v\n", err)
+				}
+				return nil, false, reject("invalid zk proof", err)
+			}
+		}
 		if existing, _ := findContractByID(st, id); existing != nil {
 			if existing.Status == "CLOSED" {
 				return nil, false, reject("contract already closed", fmt.Errorf("cannot reopen closed contract"))
@@ -967,6 +981,18 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			p.Decision != m.Decision ||
 			p.Close != m.Close {
 			return nil, false, reject("ack payload mismatch", fmt.Errorf("payload/header mismatch"))
+		}
+		if zkMode() && p.Decision == 1 {
+			ctx, err := ackPayloadContext(p)
+			if err != nil {
+				return nil, false, reject("invalid zk context", err)
+			}
+			if err := verifyDeltaProof(c.IOU.Amount, ctx, p.ZK); err != nil {
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "recv drop: zk invalid (ack) err=%v\n", err)
+				}
+				return nil, false, reject("invalid zk proof", err)
+			}
 		}
 		a.ReqNonce = maxNonce
 		if exists, err := st.HasAck(m.ContractID, maxNonce); err == nil && exists {
@@ -1667,6 +1693,75 @@ func envInt(name string) (int, bool) {
 	return v, true
 }
 
+func zkMode() bool {
+	return os.Getenv("WEB4_ZK_MODE") == "1"
+}
+
+func deltaConstraintMatrix() [][]int64 {
+	return [][]int64{{1, 1}}
+}
+
+func deltaScalars(amount uint64) ([]pedersen.Scalar, error) {
+	if amount > math.MaxInt64 {
+		return nil, fmt.Errorf("amount too large")
+	}
+	v := int64(amount)
+	return linear.ScalarsFromInt64([]int64{-v, v})
+}
+
+func openPayloadContext(p proto.OpenPayload) ([]byte, error) {
+	p.ZK = nil
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	sum := crypto.SHA3_256(raw)
+	return sum[:], nil
+}
+
+func ackPayloadContext(p proto.AckPayload) ([]byte, error) {
+	p.ZK = nil
+	raw, err := json.Marshal(p)
+	if err != nil {
+		return nil, err
+	}
+	sum := crypto.SHA3_256(raw)
+	return sum[:], nil
+}
+
+func buildDeltaProof(amount uint64, ctx []byte) (*proto.ZKLinearProof, error) {
+	x, err := deltaScalars(amount)
+	if err != nil {
+		return nil, err
+	}
+	C, r, err := pedersen.CommitVector(x, ctx)
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := linear.ProveLinearNullspace(deltaConstraintMatrix(), C, r, ctx)
+	if err != nil {
+		return nil, err
+	}
+	return linear.EncodeLinearProof(C, bundle)
+}
+
+func verifyDeltaProof(amount uint64, ctx []byte, zk *proto.ZKLinearProof) error {
+	if zk == nil {
+		return fmt.Errorf("missing proof")
+	}
+	if _, err := deltaScalars(amount); err != nil {
+		return err
+	}
+	C, bundle, err := linear.DecodeLinearProof(zk)
+	if err != nil {
+		return err
+	}
+	if !linear.VerifyLinearNullspace(deltaConstraintMatrix(), C, bundle, ctx) {
+		return fmt.Errorf("zk verify failed")
+	}
+	return nil
+}
+
 func openGossipEnvelope(self *node.Node, msg proto.GossipPushMsg) ([]byte, error) {
 	if self == nil {
 		return nil, fmt.Errorf("missing node")
@@ -2216,7 +2311,25 @@ func main() {
 		cid := proto.ContractID(iou)
 		credHex := hex.EncodeToString(to)
 		debtHex := hex.EncodeToString(pub)
-		payload, err := proto.EncodeOpenPayload(credHex, debtHex, *amount, *nonce)
+		openPayload := proto.OpenPayload{
+			Type:     proto.MsgTypeContractOpen,
+			Creditor: credHex,
+			Debtor:   debtHex,
+			Amount:   *amount,
+			Nonce:    *nonce,
+		}
+		if zkMode() {
+			ctx, err := openPayloadContext(openPayload)
+			if err != nil {
+				die("encode open payload failed", err)
+			}
+			zk, err := buildDeltaProof(*amount, ctx)
+			if err != nil {
+				die("build zk proof failed", err)
+			}
+			openPayload.ZK = zk
+		}
+		payload, err := json.Marshal(openPayload)
 		if err != nil {
 			die("encode open payload failed", err)
 		}
@@ -2422,11 +2535,28 @@ func main() {
 			Decision:   uint8(*decision),
 			Close:      *decision == 1,
 		}
-		ackPayload, err := proto.EncodeAckPayload(*idHex, ack.Decision, ack.Close)
+		ackPayload := proto.AckPayload{
+			Type:       proto.MsgTypeAck,
+			ContractID: *idHex,
+			Decision:   ack.Decision,
+			Close:      ack.Close,
+		}
+		if zkMode() && ack.Decision == 1 {
+			ctx, err := ackPayloadContext(ackPayload)
+			if err != nil {
+				die("encode ack payload failed", err)
+			}
+			zk, err := buildDeltaProof(c.IOU.Amount, ctx)
+			if err != nil {
+				die("build zk proof failed", err)
+			}
+			ackPayload.ZK = zk
+		}
+		payloadBytes, err := json.Marshal(ackPayload)
 		if err != nil {
 			die("encode ack payload failed", err)
 		}
-		ackEph, ackSealed, err := e2eSeal(proto.MsgTypeAck, cid, *reqNonce, c.IOU.Debtor, ackPayload)
+		ackEph, ackSealed, err := e2eSeal(proto.MsgTypeAck, cid, *reqNonce, c.IOU.Debtor, payloadBytes)
 		if err != nil {
 			die("e2e seal failed", err)
 		}

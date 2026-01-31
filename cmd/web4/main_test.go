@@ -452,6 +452,102 @@ func TestRecvRejectsMismatchedOpenPayload(t *testing.T) {
 	}
 }
 
+func TestZKModeRejectsMissingProofOpen(t *testing.T) {
+	t.Setenv("WEB4_ZK_MODE", "1")
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA, _ := loadKeypair(t, homeA)
+	pubB, privB := loadKeypair(t, homeB)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 5, Nonce: 1}
+	cid := proto.ContractID(iou)
+	payload, err := proto.EncodeOpenPayload(hex.EncodeToString(pubA), hex.EncodeToString(pubB), 5, 1)
+	if err != nil {
+		t.Fatalf("encode open payload failed: %v", err)
+	}
+	ephPub, sealed, err := e2eSeal(proto.MsgTypeContractOpen, cid, 0, pubA, payload)
+	if err != nil {
+		t.Fatalf("e2e seal failed: %v", err)
+	}
+	signBytes := proto.OpenSignBytes(iou, ephPub, sealed)
+	sigB := crypto.Sign(privB, crypto.SHA3_256(signBytes))
+	msg := proto.ContractOpenMsgFromContract(proto.Contract{
+		IOU:          iou,
+		SigDebt:      sigB,
+		EphemeralPub: ephPub,
+		Sealed:       sealed,
+		Status:       "OPEN",
+	})
+	data, err := proto.EncodeContractOpenMsg(msg)
+	if err != nil {
+		t.Fatalf("encode open msg failed: %v", err)
+	}
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected zk rejection")
+	}
+}
+
+func TestZKModeAcceptsProofOpen(t *testing.T) {
+	t.Setenv("WEB4_ZK_MODE", "1")
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA, _ := loadKeypair(t, homeA)
+	pubB, privB := loadKeypair(t, homeB)
+
+	iou := proto.IOU{Creditor: pubA, Debtor: pubB, Amount: 5, Nonce: 1}
+	cid := proto.ContractID(iou)
+	openPayload := proto.OpenPayload{
+		Type:     proto.MsgTypeContractOpen,
+		Creditor: hex.EncodeToString(pubA),
+		Debtor:   hex.EncodeToString(pubB),
+		Amount:   5,
+		Nonce:    1,
+	}
+	ctx, err := openPayloadContext(openPayload)
+	if err != nil {
+		t.Fatalf("payload ctx failed: %v", err)
+	}
+	zk, err := buildDeltaProof(5, ctx)
+	if err != nil {
+		t.Fatalf("build zk failed: %v", err)
+	}
+	openPayload.ZK = zk
+	payload, err := json.Marshal(openPayload)
+	if err != nil {
+		t.Fatalf("encode open payload failed: %v", err)
+	}
+	ephPub, sealed, err := e2eSeal(proto.MsgTypeContractOpen, cid, 0, pubA, payload)
+	if err != nil {
+		t.Fatalf("e2e seal failed: %v", err)
+	}
+	signBytes := proto.OpenSignBytes(iou, ephPub, sealed)
+	sigB := crypto.Sign(privB, crypto.SHA3_256(signBytes))
+	msg := proto.ContractOpenMsgFromContract(proto.Contract{
+		IOU:          iou,
+		SigDebt:      sigB,
+		EphemeralPub: ephPub,
+		Sealed:       sealed,
+		Status:       "OPEN",
+	})
+	data, err := proto.EncodeContractOpenMsg(msg)
+	if err != nil {
+		t.Fatalf("encode open msg failed: %v", err)
+	}
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	if err := pair.recvToA(data); err != nil {
+		t.Fatalf("expected zk accept, got %v", err)
+	}
+}
+
 func TestRecvRejectsAckWithoutRepayReq(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()

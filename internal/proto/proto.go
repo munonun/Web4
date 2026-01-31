@@ -402,11 +402,12 @@ func AckFromMsg(m AckMsg) (Ack, []byte, error) {
 }
 
 type OpenPayload struct {
-	Type     string `json:"type"`
-	Creditor string `json:"creditor"`
-	Debtor   string `json:"debtor"`
-	Amount   uint64 `json:"amount"`
-	Nonce    uint64 `json:"nonce"`
+	Type     string         `json:"type"`
+	Creditor string         `json:"creditor"`
+	Debtor   string         `json:"debtor"`
+	Amount   uint64         `json:"amount"`
+	Nonce    uint64         `json:"nonce"`
+	ZK       *ZKLinearProof `json:"zk,omitempty"`
 }
 
 type RepayPayload struct {
@@ -417,10 +418,11 @@ type RepayPayload struct {
 }
 
 type AckPayload struct {
-	Type       string `json:"type"`
-	ContractID string `json:"contract_id"`
-	Decision   uint8  `json:"decision"`
-	Close      bool   `json:"close"`
+	Type       string         `json:"type"`
+	ContractID string         `json:"contract_id"`
+	Decision   uint8          `json:"decision"`
+	Close      bool           `json:"close"`
+	ZK         *ZKLinearProof `json:"zk,omitempty"`
 }
 
 func EncodeOpenPayload(credHex, debtHex string, amount, nonce uint64) ([]byte, error) {
@@ -430,6 +432,18 @@ func EncodeOpenPayload(credHex, debtHex string, amount, nonce uint64) ([]byte, e
 		Debtor:   debtHex,
 		Amount:   amount,
 		Nonce:    nonce,
+	}
+	return json.Marshal(p)
+}
+
+func EncodeOpenPayloadWithZK(credHex, debtHex string, amount, nonce uint64, zk *ZKLinearProof) ([]byte, error) {
+	p := OpenPayload{
+		Type:     MsgTypeContractOpen,
+		Creditor: credHex,
+		Debtor:   debtHex,
+		Amount:   amount,
+		Nonce:    nonce,
+		ZK:       zk,
 	}
 	return json.Marshal(p)
 }
@@ -450,6 +464,17 @@ func EncodeAckPayload(contractID string, decision uint8, close bool) ([]byte, er
 		ContractID: contractID,
 		Decision:   decision,
 		Close:      close,
+	}
+	return json.Marshal(p)
+}
+
+func EncodeAckPayloadWithZK(contractID string, decision uint8, close bool, zk *ZKLinearProof) ([]byte, error) {
+	p := AckPayload{
+		Type:       MsgTypeAck,
+		ContractID: contractID,
+		Decision:   decision,
+		Close:      close,
+		ZK:         zk,
 	}
 	return json.Marshal(p)
 }
