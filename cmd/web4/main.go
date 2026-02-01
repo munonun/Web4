@@ -9,6 +9,7 @@ import (
 	crand "crypto/rand"
 	stdsha256 "crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +32,7 @@ import (
 	"web4mvp/internal/node"
 	"web4mvp/internal/peer"
 	"web4mvp/internal/proto"
+	"web4mvp/internal/state"
 	"web4mvp/internal/store"
 	"web4mvp/internal/zk/linear"
 	"web4mvp/internal/zk/pedersen"
@@ -1019,6 +1022,35 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		fmt.Println("RECV ACK", m.ContractID)
 		return nil, true, nil
 
+	case proto.MsgTypeDeltaB:
+		if deltaMode() != "deltab" {
+			return nil, false, reject("delta_b disabled", fmt.Errorf("delta mode not enabled"))
+		}
+		m, err := proto.DecodeDeltaBMsg(data)
+		if err != nil {
+			return nil, false, reject("decode delta_b failed", err)
+		}
+		if err := proto.ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
+			return nil, false, reject("invalid wire metadata", err)
+		}
+		deltas, members, err := verifyDeltaB(m, self)
+		if err != nil {
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "recv drop: delta_b invalid err=%v\n", err)
+			}
+			return nil, false, reject("invalid delta_b", err)
+		}
+		if self.Field == nil {
+			self.Field = state.NewField()
+		}
+		if err := self.Field.ApplyDelta(members, deltas, deltaRelaxIters()); err != nil {
+			return nil, false, reject("apply delta_b failed", err)
+		}
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(os.Stderr, "RECV DELTA_B entries=%d\n", len(m.Entries))
+		}
+		return nil, true, nil
+
 	default:
 		return nil, false, reject("unknown message type", fmt.Errorf("%s", hdr.Type))
 	}
@@ -1058,6 +1090,13 @@ func sha256Hex(data []byte) string {
 	}
 	sum := stdsha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func abs64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func msgIDFor(data []byte) string {
@@ -1697,6 +1736,14 @@ func zkMode() bool {
 	return os.Getenv("WEB4_ZK_MODE") == "1"
 }
 
+func deltaMode() string {
+	mode := strings.TrimSpace(os.Getenv("WEB4_DELTA_MODE"))
+	if mode == "" {
+		return "legacy"
+	}
+	return mode
+}
+
 func deltaConstraintMatrix() [][]int64 {
 	return [][]int64{{1, 1}}
 }
@@ -1760,6 +1807,217 @@ func verifyDeltaProof(amount uint64, ctx []byte, zk *proto.ZKLinearProof) error 
 		return fmt.Errorf("zk verify failed")
 	}
 	return nil
+}
+
+func membersViewID(members [][32]byte) [32]byte {
+	out := make([][32]byte, len(members))
+	copy(out, members)
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i][:], out[j][:]) < 0
+	})
+	buf := make([]byte, 0, 32*len(out)+8)
+	tmp := make([]byte, 8)
+	binary.BigEndian.PutUint64(tmp, uint64(len(out)))
+	buf = append(buf, tmp...)
+	for _, id := range out {
+		buf = append(buf, id[:]...)
+	}
+	sum := crypto.SHA3_256(append([]byte("web4/deltab/view/v0"), buf...))
+	var id [32]byte
+	copy(id[:], sum[:])
+	return id
+}
+
+func deltaBContext(msg proto.DeltaBMsg, viewID [32]byte) ([]byte, error) {
+	msg.ZK = nil
+	raw, err := proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		return nil, err
+	}
+	deltaHash := crypto.SHA3_256(raw)
+	scopeHash, err := deltaBScopeHash(msg.Entries)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, 0, 32*3+len("web4/deltab/v0"))
+	buf = append(buf, []byte("web4/deltab/v0")...)
+	buf = append(buf, viewID[:]...)
+	buf = append(buf, scopeHash[:]...)
+	buf = append(buf, deltaHash[:]...)
+	sum := crypto.SHA3_256(buf)
+	return sum[:], nil
+}
+
+func deltaBScopeHash(entries []proto.DeltaBEntry) ([32]byte, error) {
+	out := make([]proto.DeltaBEntry, len(entries))
+	copy(out, entries)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].NodeID < out[j].NodeID
+	})
+	buf := make([]byte, 0, len(out)*32+8)
+	tmp := make([]byte, 8)
+	binary.BigEndian.PutUint64(tmp, uint64(len(out)))
+	buf = append(buf, tmp...)
+	for _, e := range out {
+		id, err := decodeNodeIDHex(e.NodeID)
+		if err != nil {
+			return [32]byte{}, err
+		}
+		buf = append(buf, id[:]...)
+	}
+	sum := crypto.SHA3_256(append([]byte("web4/deltab/scope/v0"), buf...))
+	var outSum [32]byte
+	copy(outSum[:], sum[:])
+	return outSum, nil
+}
+
+func deltaMaxAbs() (int64, bool) {
+	raw := strings.TrimSpace(os.Getenv("WEB4_DELTA_MAX_ABS"))
+	if raw == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+func deltaRelaxIters() int {
+	raw := strings.TrimSpace(os.Getenv("WEB4_DELTA_RELAX_ITERS"))
+	if raw == "" {
+		return 2
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return v
+}
+
+func verifyDeltaB(msg proto.DeltaBMsg, self *node.Node) (map[[32]byte]int64, [][32]byte, error) {
+	if self == nil || self.Members == nil {
+		return nil, nil, fmt.Errorf("missing member store")
+	}
+	if len(msg.Entries) == 0 {
+		return nil, nil, fmt.Errorf("empty delta entries")
+	}
+	viewIDBytes, err := hex.DecodeString(msg.ViewID)
+	if err != nil || len(viewIDBytes) != 32 {
+		return nil, nil, fmt.Errorf("invalid view_id")
+	}
+	var viewID [32]byte
+	copy(viewID[:], viewIDBytes)
+
+	members := self.Members.List()
+	if len(members) == 0 {
+		return nil, nil, fmt.Errorf("empty member set")
+	}
+	expectedView := membersViewID(members)
+	if !bytes.Equal(expectedView[:], viewID[:]) {
+		return nil, nil, fmt.Errorf("view_id mismatch")
+	}
+	memberSet := make(map[string]struct{}, len(members))
+	for _, id := range members {
+		memberSet[hex.EncodeToString(id[:])] = struct{}{}
+	}
+
+	deltas := make(map[[32]byte]int64, len(msg.Entries))
+	seen := make(map[string]struct{}, len(msg.Entries))
+	var sum int64
+	maxAbs, bound := deltaMaxAbs()
+	for _, e := range msg.Entries {
+		id, err := decodeNodeIDHex(e.NodeID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("bad node_id")
+		}
+		key := hex.EncodeToString(id[:])
+		if _, ok := memberSet[key]; !ok {
+			return nil, nil, fmt.Errorf("node_id not member")
+		}
+		if _, ok := seen[key]; ok {
+			return nil, nil, fmt.Errorf("duplicate node_id")
+		}
+		seen[key] = struct{}{}
+		if bound && abs64(e.Delta) > maxAbs {
+			return nil, nil, fmt.Errorf("delta exceeds max abs")
+		}
+		sum += e.Delta
+		deltas[id] = e.Delta
+	}
+	if sum != 0 {
+		return nil, nil, fmt.Errorf("sum delta != 0")
+	}
+
+	if zkMode() {
+		ctx, err := deltaBContext(msg, viewID)
+		if err != nil {
+			return nil, nil, fmt.Errorf("zk context failed")
+		}
+		if msg.ZK == nil {
+			return nil, nil, fmt.Errorf("missing zk proof")
+		}
+		entries := make([]proto.DeltaBEntry, len(msg.Entries))
+		copy(entries, msg.Entries)
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].NodeID < entries[j].NodeID
+		})
+		values := make([]int64, len(entries))
+		for i, e := range entries {
+			values[i] = e.Delta
+		}
+		if _, err := linear.ScalarsFromInt64(values); err != nil {
+			return nil, nil, fmt.Errorf("zk scalars failed")
+		}
+		C, bundle, err := linear.DecodeLinearProof(msg.ZK)
+		if err != nil {
+			return nil, nil, fmt.Errorf("zk decode failed")
+		}
+		L := [][]int64{make([]int64, len(values))}
+		for i := range values {
+			L[0][i] = 1
+		}
+		if len(C) != len(values) {
+			return nil, nil, fmt.Errorf("zk commitment length mismatch")
+		}
+		if !linear.VerifyLinearNullspace(L, C, bundle, ctx) {
+			return nil, nil, fmt.Errorf("zk verify failed")
+		}
+	}
+	return deltas, members, nil
+}
+
+func buildDeltaBProof(msg proto.DeltaBMsg, viewID [32]byte) (*proto.ZKLinearProof, error) {
+	entries := make([]proto.DeltaBEntry, len(msg.Entries))
+	copy(entries, msg.Entries)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].NodeID < entries[j].NodeID
+	})
+	values := make([]int64, len(entries))
+	for i, e := range entries {
+		values[i] = e.Delta
+	}
+	x, err := linear.ScalarsFromInt64(values)
+	if err != nil {
+		return nil, err
+	}
+	ctx, err := deltaBContext(msg, viewID)
+	if err != nil {
+		return nil, err
+	}
+	L := [][]int64{make([]int64, len(values))}
+	for i := range values {
+		L[0][i] = 1
+	}
+	C, r, err := pedersen.CommitVector(x, ctx)
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := linear.ProveLinearNullspace(L, C, r, ctx)
+	if err != nil {
+		return nil, err
+	}
+	return linear.EncodeLinearProof(C, bundle)
 }
 
 func openGossipEnvelope(self *node.Node, msg proto.GossipPushMsg) ([]byte, error) {
@@ -2109,7 +2367,7 @@ func verifySigFrom(version, suite, msgType string, fromID [32]byte, payload []by
 
 func requiredMemberScope(msgType string) (uint32, bool) {
 	switch msgType {
-	case proto.MsgTypeContractOpen, proto.MsgTypeRepayReq, proto.MsgTypeAck:
+	case proto.MsgTypeContractOpen, proto.MsgTypeRepayReq, proto.MsgTypeAck, proto.MsgTypeDeltaB:
 		return proto.InviteScopeContract, true
 	case proto.MsgTypePeerExchangeReq, proto.MsgTypePeerExchangeResp:
 		return proto.InviteScopeGossip, true

@@ -7,6 +7,7 @@ import (
 
 	"web4mvp/internal/crypto"
 	"web4mvp/internal/peer"
+	"web4mvp/internal/state"
 )
 
 type Node struct {
@@ -19,6 +20,7 @@ type Node struct {
 	Revokes    *peer.RevokeStore
 	Candidates *peer.CandidatePool
 	Sessions   *SessionStore
+	Field      *state.Field
 }
 
 type Options struct {
@@ -128,6 +130,7 @@ func NewNode(home string, opts Options) (*Node, error) {
 		Revokes:    revokes,
 		Candidates: candidates,
 		Sessions:   NewSessionStore(),
+		Field:      state.NewField(),
 	}, nil
 }
 

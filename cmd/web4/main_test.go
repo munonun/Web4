@@ -548,6 +548,119 @@ func TestZKModeAcceptsProofOpen(t *testing.T) {
 	}
 }
 
+func TestDeltaBRejectsSumMismatch(t *testing.T) {
+	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	members := pair.a.Members.List()
+	if len(members) < 2 {
+		t.Fatalf("need at least 2 members")
+	}
+	view := membersViewID(members)
+	msg := proto.DeltaBMsg{
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		ViewID:       hex.EncodeToString(view[:]),
+		Entries: []proto.DeltaBEntry{
+			{NodeID: hex.EncodeToString(members[0][:]), Delta: 5},
+			{NodeID: hex.EncodeToString(members[1][:]), Delta: -3},
+		},
+	}
+	data, err := proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		t.Fatalf("encode delta_b failed: %v", err)
+	}
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected sum mismatch rejection")
+	}
+}
+
+func TestDeltaBZKMissingRejected(t *testing.T) {
+	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	t.Setenv("WEB4_ZK_MODE", "1")
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	members := pair.a.Members.List()
+	if len(members) < 2 {
+		t.Fatalf("need at least 2 members")
+	}
+	view := membersViewID(members)
+	msg := proto.DeltaBMsg{
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		ViewID:       hex.EncodeToString(view[:]),
+		Entries: []proto.DeltaBEntry{
+			{NodeID: hex.EncodeToString(members[0][:]), Delta: 5},
+			{NodeID: hex.EncodeToString(members[1][:]), Delta: -5},
+		},
+	}
+	data, err := proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		t.Fatalf("encode delta_b failed: %v", err)
+	}
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected missing zk rejection")
+	}
+}
+
+func TestDeltaBZKAcceptsAndTamperFails(t *testing.T) {
+	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	t.Setenv("WEB4_ZK_MODE", "1")
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	members := pair.a.Members.List()
+	if len(members) < 2 {
+		t.Fatalf("need at least 2 members")
+	}
+	view := membersViewID(members)
+	msg := proto.DeltaBMsg{
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		ViewID:       hex.EncodeToString(view[:]),
+		Entries: []proto.DeltaBEntry{
+			{NodeID: hex.EncodeToString(members[0][:]), Delta: 5},
+			{NodeID: hex.EncodeToString(members[1][:]), Delta: -5},
+		},
+	}
+	zk, err := buildDeltaBProof(msg, view)
+	if err != nil {
+		t.Fatalf("build zk failed: %v", err)
+	}
+	msg.ZK = zk
+	data, err := proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		t.Fatalf("encode delta_b failed: %v", err)
+	}
+	if err := pair.recvToA(data); err != nil {
+		t.Fatalf("expected delta_b accept, got %v", err)
+	}
+
+	msg.Entries[0].Delta = 6
+	msg.Entries[1].Delta = -6
+	data, err = proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		t.Fatalf("encode delta_b failed: %v", err)
+	}
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected zk tamper rejection")
+	}
+}
+
 func TestRecvRejectsAckWithoutRepayReq(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()

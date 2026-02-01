@@ -56,6 +56,7 @@ const (
 	MaxContractOpenSize = 32 << 10
 	MaxRepayReqSize     = 8 << 10
 	MaxAckSize          = 8 << 10
+	MaxDeltaBSize       = 32 << 10
 )
 
 func MaxSizeForType(t string) int {
@@ -88,6 +89,8 @@ func MaxSizeForType(t string) int {
 		return MaxInviteBundleSize
 	case MsgTypeRevoke:
 		return MaxRevokeSize
+	case MsgTypeDeltaB:
+		return MaxDeltaBSize
 	default:
 		return MaxFrameSize
 	}

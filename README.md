@@ -218,7 +218,7 @@ Falsifiability is valued over completeness.
 This project is developed independently.
 
 If you wish to support continued research and experimentation, donations are welcome.
-(Monero: 42tRSXZRK4bNV18dqXcEsuDpb8UbrYu8oViosk1M5b6PFSYL1PxDhfW7d2xLFQaunaMwuH1jRMrPjbtk7niZDN9UMSmkum4)
+(Monero: 48NwwMKku48fKLYu7YN2S3hZM6iWX5WpRAoyC85AaUe8FZyTCHMRbJqGDNRdm3QdBDF8h71V9xJAJ1UUZKsnpyCRKXqQbiE)
 (Bitcoin: bc1qaz5dz2cze0me979j9prhxr6dc5x9j7esyhcxzp)
 
 No promises. No roadmap tied to donations.
