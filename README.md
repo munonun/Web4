@@ -10,6 +10,13 @@ No blockchain.
 No validators.
 No global consensus.
 
+`web4-node` is a peer relay/verifier CLI (no chain, no sync, no balances).
+It reports local observation only and never claims global state.
+Example commands:
+`web4-node run --addr 127.0.0.1:7000 --devtls`
+`web4-node status`
+`web4-node peers`
+
 State correctness is enforced locally through structural constraints,
 and validated through deterministic tests rather than social agreement.
 
@@ -51,6 +58,23 @@ If a state update cannot be balanced by another update,
 it is rejected.
 
 State correctness is local, not emergent.
+
+---
+
+## DeltaB fused field (phi, b)
+
+Web4’s DeltaB path transmits only **Δb** (local imbalance deltas), not phi.
+Each DeltaB message is a sparse update over the local **members** scope:
+entries are canonicalized, zero entries are dropped, and `sum(Δb) = 0` must hold.
+
+If enabled, ZK proofs bind to canonical delta bytes and the membership view.
+They prove conservation/binding only — **not** global history or circuits.
+
+Phi is a **local-only** potential field estimated via relaxation;
+it is never transmitted and never stored as global history.
+
+Deduplication uses a **bounded, TTL cache** (not a ledger) to drop retries.
+There is no chain, no global ordering, and no replayable history.
 
 ---
 

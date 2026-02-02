@@ -1,9 +1,11 @@
 package proto
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 const (
@@ -26,14 +28,11 @@ type DeltaBMsg struct {
 
 func EncodeDeltaBMsg(m DeltaBMsg) ([]byte, error) {
 	m.Type = MsgTypeDeltaB
-	if len(m.Entries) > 1 {
-		entries := make([]DeltaBEntry, len(m.Entries))
-		copy(entries, m.Entries)
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].NodeID < entries[j].NodeID
-		})
-		m.Entries = entries
+	entries, err := CanonicalizeDeltaBEntries(m.Entries)
+	if err != nil {
+		return nil, err
 	}
+	m.Entries = entries
 	return json.Marshal(m)
 }
 
@@ -46,4 +45,38 @@ func DecodeDeltaBMsg(data []byte) (DeltaBMsg, error) {
 		return DeltaBMsg{}, fmt.Errorf("unexpected msg type: %s", m.Type)
 	}
 	return m, nil
+}
+
+func CanonicalizeDeltaBEntries(entries []DeltaBEntry) ([]DeltaBEntry, error) {
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("empty entries")
+	}
+	out := make([]DeltaBEntry, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		if e.Delta == 0 {
+			continue
+		}
+		id := strings.TrimSpace(e.NodeID)
+		if id == "" {
+			return nil, fmt.Errorf("missing node_id")
+		}
+		raw, err := hex.DecodeString(id)
+		if err != nil || len(raw) != 32 {
+			return nil, fmt.Errorf("bad node_id")
+		}
+		key := hex.EncodeToString(raw)
+		if _, ok := seen[key]; ok {
+			return nil, fmt.Errorf("duplicate node_id")
+		}
+		seen[key] = struct{}{}
+		out = append(out, DeltaBEntry{NodeID: key, Delta: e.Delta})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty entries")
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].NodeID < out[j].NodeID
+	})
+	return out, nil
 }

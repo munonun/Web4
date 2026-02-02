@@ -257,7 +257,9 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 		readyAddr = listener.Addr().String()
 	}
 	logInfo("quic listen ready: %s", readyAddr)
-	logInfo("READY addr=%s", readyAddr)
+	if os.Getenv("WEB4_SUPPRESS_READY") != "1" {
+		logInfo("READY addr=%s", readyAddr)
+	}
 	if ready != nil {
 		close(ready)
 	}

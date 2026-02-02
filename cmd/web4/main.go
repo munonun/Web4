@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"web4mvp/internal/crypto"
+	"web4mvp/internal/daemon"
 	"web4mvp/internal/math4"
 	"web4mvp/internal/network"
 	"web4mvp/internal/node"
@@ -1033,12 +1034,52 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err := proto.ValidateWireMeta(m.ProtoVersion, m.Suite); err != nil {
 			return nil, false, reject("invalid wire metadata", err)
 		}
-		deltas, members, err := verifyDeltaB(m, self)
+		canonMsg, _, deltaID, err := canonicalDeltaB(m)
+		if err != nil {
+			return nil, false, reject("invalid delta_b", err)
+		}
+		canonMsgZK := canonMsg
+		canonMsgZK.ZK = m.ZK
+		if deltabSeen.Seen(deltaID) {
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "drop deltab duplicate id=%x\n", deltaID[:])
+			}
+			return nil, false, reject("duplicate delta_b", fmt.Errorf("duplicate delta_id"))
+		}
+		deltas, members, viewID, scopeHash, err := verifyDeltaBBasic(canonMsg, self)
 		if err != nil {
 			if os.Getenv("WEB4_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "recv drop: delta_b invalid err=%v\n", err)
+				if strings.Contains(err.Error(), "node_id not member") {
+					fmt.Fprintf(os.Stderr, "recv drop: delta_b non_member\n")
+				}
+				if strings.Contains(err.Error(), "view_id mismatch") {
+					fmt.Fprintf(os.Stderr, "recv drop: delta_b view_mismatch\n")
+				}
 			}
 			return nil, false, reject("invalid delta_b", err)
+		}
+		scopeHex := hex.EncodeToString(scopeHash[:])
+		senderKey := ""
+		if wasSecure {
+			senderKey = hex.EncodeToString(secureFromID[:])
+		} else if senderAddr != "" {
+			senderKey = senderAddr
+		}
+		rateKey := senderKey + ":" + scopeHex
+		if !deltabLimiter.Allow(rateKey) {
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "drop deltab rate_limited key=%s\n", rateKey)
+			}
+			return nil, false, reject("rate_limited", fmt.Errorf("delta_b rate limited"))
+		}
+		if zkMode() {
+			if err := verifyDeltaBZK(canonMsgZK, viewID); err != nil {
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "recv drop: delta_b zk invalid err=%v\n", err)
+				}
+				return nil, false, reject("invalid delta_b zk", err)
+			}
 		}
 		if self.Field == nil {
 			self.Field = state.NewField()
@@ -1046,6 +1087,7 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err := self.Field.ApplyDelta(members, deltas, deltaRelaxIters()); err != nil {
 			return nil, false, reject("apply delta_b failed", err)
 		}
+		deltabSeen.Add(deltaID)
 		if os.Getenv("WEB4_DEBUG") == "1" {
 			fmt.Fprintf(os.Stderr, "RECV DELTA_B entries=%d\n", len(m.Entries))
 		}
@@ -1061,6 +1103,14 @@ var gossipRand = mrand.New(mrand.NewSource(time.Now().UnixNano()))
 var gossipRandMu sync.Mutex
 var sendFunc = network.Send
 var exchangeFn = network.ExchangeWithContext
+
+const (
+	deltabCacheCap = 4096
+	deltabCacheTTL = 10 * time.Minute
+)
+
+var deltabSeen = newDeltabCache(deltabCacheCap, deltabCacheTTL)
+var deltabLimiter = newDeltabRateLimiter(10, 20, 10*time.Minute)
 
 func gossipDebugf(format string, args ...any) {
 	if os.Getenv("WEB4_DEBUG") == "1" {
@@ -1139,6 +1189,161 @@ type gossipCache struct {
 	cap     int
 	order   *list.List
 	entries map[[32]byte]*list.Element
+}
+
+type deltabCache struct {
+	mu      sync.Mutex
+	ttl     time.Duration
+	cap     int
+	order   *list.List
+	entries map[[32]byte]*list.Element
+}
+
+type deltabEntry struct {
+	hash    [32]byte
+	expires time.Time
+}
+
+func newDeltabCache(capacity int, ttl time.Duration) *deltabCache {
+	if capacity <= 0 {
+		capacity = deltabCacheCap
+	}
+	if ttl <= 0 {
+		ttl = deltabCacheTTL
+	}
+	if v, ok := envInt("WEB4_DELTA_CACHE_CAP"); ok && v > 0 {
+		capacity = v
+	}
+	if v, ok := envInt("WEB4_DELTA_CACHE_TTL_SEC"); ok && v > 0 {
+		ttl = time.Duration(v) * time.Second
+	}
+	return &deltabCache{
+		ttl:     ttl,
+		cap:     capacity,
+		order:   list.New(),
+		entries: make(map[[32]byte]*list.Element),
+	}
+}
+
+func (c *deltabCache) Seen(hash [32]byte) bool {
+	now := time.Now()
+	c.mu.Lock()
+	c.pruneLocked(now)
+	if el, ok := c.entries[hash]; ok {
+		ent := el.Value.(*deltabEntry)
+		if ent.expires.After(now) {
+			c.order.MoveToFront(el)
+			c.mu.Unlock()
+			return true
+		}
+		delete(c.entries, hash)
+		c.order.Remove(el)
+	}
+	c.mu.Unlock()
+	return false
+}
+
+func (c *deltabCache) Add(hash [32]byte) {
+	now := time.Now()
+	c.mu.Lock()
+	c.pruneLocked(now)
+	if el, ok := c.entries[hash]; ok {
+		ent := el.Value.(*deltabEntry)
+		ent.expires = now.Add(c.ttl)
+		c.order.MoveToFront(el)
+		c.mu.Unlock()
+		return
+	}
+	ent := &deltabEntry{hash: hash, expires: now.Add(c.ttl)}
+	el := c.order.PushFront(ent)
+	c.entries[hash] = el
+	for c.cap > 0 && len(c.entries) > c.cap {
+		back := c.order.Back()
+		if back == nil {
+			break
+		}
+		old := back.Value.(*deltabEntry)
+		delete(c.entries, old.hash)
+		c.order.Remove(back)
+	}
+	c.mu.Unlock()
+}
+
+func (c *deltabCache) pruneLocked(now time.Time) {
+	for el := c.order.Back(); el != nil; {
+		prev := el.Prev()
+		ent := el.Value.(*deltabEntry)
+		if ent.expires.After(now) {
+			el = prev
+			continue
+		}
+		delete(c.entries, ent.hash)
+		c.order.Remove(el)
+		el = prev
+	}
+}
+
+type deltabRateLimiter struct {
+	mu      sync.Mutex
+	rate    float64
+	burst   float64
+	ttl     time.Duration
+	entries map[string]*rateEntry
+}
+
+type rateEntry struct {
+	tokens float64
+	last   time.Time
+}
+
+func newDeltabRateLimiter(rate float64, burst float64, ttl time.Duration) *deltabRateLimiter {
+	if v, ok := envInt("WEB4_DELTA_RATE"); ok && v >= 0 {
+		rate = float64(v)
+	}
+	if v, ok := envInt("WEB4_DELTA_BURST"); ok && v >= 0 {
+		burst = float64(v)
+	}
+	if v, ok := envInt("WEB4_DELTA_RATE_TTL_SEC"); ok && v > 0 {
+		ttl = time.Duration(v) * time.Second
+	}
+	return &deltabRateLimiter{
+		rate:    rate,
+		burst:   burst,
+		ttl:     ttl,
+		entries: make(map[string]*rateEntry),
+	}
+}
+
+func (l *deltabRateLimiter) Allow(key string) bool {
+	if key == "" || l.rate <= 0 || l.burst <= 0 {
+		return true
+	}
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if ent, ok := l.entries[key]; ok {
+		if now.Sub(ent.last) > l.ttl {
+			delete(l.entries, key)
+		}
+	}
+	ent := l.entries[key]
+	if ent == nil {
+		ent = &rateEntry{tokens: l.burst, last: now}
+		l.entries[key] = ent
+	}
+	elapsed := now.Sub(ent.last).Seconds()
+	if elapsed > 0 {
+		ent.tokens += elapsed * l.rate
+		if ent.tokens > l.burst {
+			ent.tokens = l.burst
+		}
+		ent.last = now
+	}
+	if ent.tokens < 1 {
+		return false
+	}
+	ent.tokens -= 1
+	return true
 }
 
 type gossipEntry struct {
@@ -1830,12 +2035,17 @@ func membersViewID(members [][32]byte) [32]byte {
 
 func deltaBContext(msg proto.DeltaBMsg, viewID [32]byte) ([]byte, error) {
 	msg.ZK = nil
+	canonEntries, err := proto.CanonicalizeDeltaBEntries(msg.Entries)
+	if err != nil {
+		return nil, err
+	}
+	msg.Entries = canonEntries
 	raw, err := proto.EncodeDeltaBMsg(msg)
 	if err != nil {
 		return nil, err
 	}
 	deltaHash := crypto.SHA3_256(raw)
-	scopeHash, err := deltaBScopeHash(msg.Entries)
+	scopeHash, err := deltaBScopeHash(canonEntries)
 	if err != nil {
 		return nil, err
 	}
@@ -1871,6 +2081,25 @@ func deltaBScopeHash(entries []proto.DeltaBEntry) ([32]byte, error) {
 	return outSum, nil
 }
 
+func canonicalDeltaB(msg proto.DeltaBMsg) (proto.DeltaBMsg, []byte, [32]byte, error) {
+	entries, err := proto.CanonicalizeDeltaBEntries(msg.Entries)
+	if err != nil {
+		return proto.DeltaBMsg{}, nil, [32]byte{}, err
+	}
+	out := msg
+	out.Type = proto.MsgTypeDeltaB
+	out.ZK = nil
+	out.Entries = entries
+	data, err := proto.EncodeDeltaBMsg(out)
+	if err != nil {
+		return proto.DeltaBMsg{}, nil, [32]byte{}, err
+	}
+	sum := crypto.SHA3_256(data)
+	var id [32]byte
+	copy(id[:], sum[:])
+	return out, data, id, nil
+}
+
 func deltaMaxAbs() (int64, bool) {
 	raw := strings.TrimSpace(os.Getenv("WEB4_DELTA_MAX_ABS"))
 	if raw == "" {
@@ -1895,27 +2124,24 @@ func deltaRelaxIters() int {
 	return v
 }
 
-func verifyDeltaB(msg proto.DeltaBMsg, self *node.Node) (map[[32]byte]int64, [][32]byte, error) {
+func verifyDeltaBBasic(msg proto.DeltaBMsg, self *node.Node) (map[[32]byte]int64, [][32]byte, [32]byte, [32]byte, error) {
 	if self == nil || self.Members == nil {
-		return nil, nil, fmt.Errorf("missing member store")
-	}
-	if len(msg.Entries) == 0 {
-		return nil, nil, fmt.Errorf("empty delta entries")
+		return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("missing member store")
 	}
 	viewIDBytes, err := hex.DecodeString(msg.ViewID)
 	if err != nil || len(viewIDBytes) != 32 {
-		return nil, nil, fmt.Errorf("invalid view_id")
+		return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("invalid view_id")
 	}
 	var viewID [32]byte
 	copy(viewID[:], viewIDBytes)
 
 	members := self.Members.List()
 	if len(members) == 0 {
-		return nil, nil, fmt.Errorf("empty member set")
+		return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("empty member set")
 	}
 	expectedView := membersViewID(members)
 	if !bytes.Equal(expectedView[:], viewID[:]) {
-		return nil, nil, fmt.Errorf("view_id mismatch")
+		return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("view_id mismatch")
 	}
 	memberSet := make(map[string]struct{}, len(members))
 	for _, id := range members {
@@ -1929,70 +2155,38 @@ func verifyDeltaB(msg proto.DeltaBMsg, self *node.Node) (map[[32]byte]int64, [][
 	for _, e := range msg.Entries {
 		id, err := decodeNodeIDHex(e.NodeID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("bad node_id")
+			return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("bad node_id")
 		}
 		key := hex.EncodeToString(id[:])
 		if _, ok := memberSet[key]; !ok {
-			return nil, nil, fmt.Errorf("node_id not member")
+			return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("node_id not member")
 		}
 		if _, ok := seen[key]; ok {
-			return nil, nil, fmt.Errorf("duplicate node_id")
+			return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("duplicate node_id")
 		}
 		seen[key] = struct{}{}
 		if bound && abs64(e.Delta) > maxAbs {
-			return nil, nil, fmt.Errorf("delta exceeds max abs")
+			return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("delta exceeds max abs")
 		}
 		sum += e.Delta
 		deltas[id] = e.Delta
 	}
 	if sum != 0 {
-		return nil, nil, fmt.Errorf("sum delta != 0")
+		return nil, nil, [32]byte{}, [32]byte{}, fmt.Errorf("sum delta != 0")
 	}
 
-	if zkMode() {
-		ctx, err := deltaBContext(msg, viewID)
-		if err != nil {
-			return nil, nil, fmt.Errorf("zk context failed")
-		}
-		if msg.ZK == nil {
-			return nil, nil, fmt.Errorf("missing zk proof")
-		}
-		entries := make([]proto.DeltaBEntry, len(msg.Entries))
-		copy(entries, msg.Entries)
-		sort.Slice(entries, func(i, j int) bool {
-			return entries[i].NodeID < entries[j].NodeID
-		})
-		values := make([]int64, len(entries))
-		for i, e := range entries {
-			values[i] = e.Delta
-		}
-		if _, err := linear.ScalarsFromInt64(values); err != nil {
-			return nil, nil, fmt.Errorf("zk scalars failed")
-		}
-		C, bundle, err := linear.DecodeLinearProof(msg.ZK)
-		if err != nil {
-			return nil, nil, fmt.Errorf("zk decode failed")
-		}
-		L := [][]int64{make([]int64, len(values))}
-		for i := range values {
-			L[0][i] = 1
-		}
-		if len(C) != len(values) {
-			return nil, nil, fmt.Errorf("zk commitment length mismatch")
-		}
-		if !linear.VerifyLinearNullspace(L, C, bundle, ctx) {
-			return nil, nil, fmt.Errorf("zk verify failed")
-		}
+	scopeHash, err := deltaBScopeHash(msg.Entries)
+	if err != nil {
+		return nil, nil, [32]byte{}, [32]byte{}, err
 	}
-	return deltas, members, nil
+	return deltas, members, viewID, scopeHash, nil
 }
 
 func buildDeltaBProof(msg proto.DeltaBMsg, viewID [32]byte) (*proto.ZKLinearProof, error) {
-	entries := make([]proto.DeltaBEntry, len(msg.Entries))
-	copy(entries, msg.Entries)
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].NodeID < entries[j].NodeID
-	})
+	entries, err := proto.CanonicalizeDeltaBEntries(msg.Entries)
+	if err != nil {
+		return nil, err
+	}
 	values := make([]int64, len(entries))
 	for i, e := range entries {
 		values[i] = e.Delta
@@ -2001,6 +2195,7 @@ func buildDeltaBProof(msg proto.DeltaBMsg, viewID [32]byte) (*proto.ZKLinearProo
 	if err != nil {
 		return nil, err
 	}
+	msg.Entries = entries
 	ctx, err := deltaBContext(msg, viewID)
 	if err != nil {
 		return nil, err
@@ -2018,6 +2213,48 @@ func buildDeltaBProof(msg proto.DeltaBMsg, viewID [32]byte) (*proto.ZKLinearProo
 		return nil, err
 	}
 	return linear.EncodeLinearProof(C, bundle)
+}
+
+func verifyDeltaBZK(msg proto.DeltaBMsg, viewID [32]byte) error {
+	entries, err := proto.CanonicalizeDeltaBEntries(msg.Entries)
+	if err != nil {
+		return err
+	}
+	msg.Entries = entries
+	ctx, err := deltaBContext(msg, viewID)
+	if err != nil {
+		return fmt.Errorf("zk context failed")
+	}
+	if msg.ZK == nil {
+		return fmt.Errorf("missing zk proof")
+	}
+	entries = make([]proto.DeltaBEntry, len(msg.Entries))
+	copy(entries, msg.Entries)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].NodeID < entries[j].NodeID
+	})
+	values := make([]int64, len(entries))
+	for i, e := range entries {
+		values[i] = e.Delta
+	}
+	if _, err := linear.ScalarsFromInt64(values); err != nil {
+		return fmt.Errorf("zk scalars failed")
+	}
+	C, bundle, err := linear.DecodeLinearProof(msg.ZK)
+	if err != nil {
+		return fmt.Errorf("zk decode failed")
+	}
+	L := [][]int64{make([]int64, len(values))}
+	for i := range values {
+		L[0][i] = 1
+	}
+	if len(C) != len(values) {
+		return fmt.Errorf("zk commitment length mismatch")
+	}
+	if !linear.VerifyLinearNullspace(L, C, bundle, ctx) {
+		return fmt.Errorf("zk verify failed")
+	}
+	return nil
 }
 
 func openGossipEnvelope(self *node.Node, msg proto.GossipPushMsg) ([]byte, error) {
@@ -2871,17 +3108,17 @@ func main() {
 		if *inPath == "" {
 			die("missing --in", fmt.Errorf("path required"))
 		}
-		self, err := node.NewNode(root, node.Options{})
-		if err != nil {
-			die("load keys failed", err)
-		}
 		data, err := os.ReadFile(*inPath)
 		if err != nil {
 			die("read message failed", err)
 		}
+		runner, err := daemon.NewRunner(root, daemon.Options{Store: st, Checker: checker})
+		if err != nil {
+			die("load node failed", err)
+		}
 		payload, err := proto.ReadFrameWithTypeCap(bytes.NewReader(data), proto.SoftMaxFrameSize, proto.MaxSizeForType)
 		if err == nil {
-			if err := recvData(payload, st, self, checker); err != nil {
+			if err := runner.HandleRaw(payload); err != nil {
 				if os.Getenv("WEB4_DEBUG") == "1" {
 					fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
 				}
@@ -2889,7 +3126,7 @@ func main() {
 			}
 			return
 		}
-		if err := recvData(data, st, self, checker); err != nil {
+		if err := runner.HandleRaw(data); err != nil {
 			if os.Getenv("WEB4_DEBUG") == "1" {
 				fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
 			}
@@ -2910,20 +3147,11 @@ func main() {
 		}
 		fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 		fmt.Println("QUIC LISTEN", *addr)
-		self, err := node.NewNode(root, node.Options{})
+		runner, err := daemon.NewRunner(root, daemon.Options{Store: st, Checker: checker})
 		if err != nil {
 			die("load keys failed", err)
 		}
-		if err := network.ListenAndServeWithResponderFrom(*addr, nil, *devTLS, func(senderAddr string, data []byte) ([]byte, error) {
-			resp, _, err := recvDataWithResponse(data, st, self, checker, senderAddr)
-			if err != nil {
-				if os.Getenv("WEB4_DEBUG") == "1" {
-					fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
-				}
-				return nil, err
-			}
-			return resp, nil
-		}); err != nil {
+		if err := runner.Run(*addr, *devTLS); err != nil {
 			die("quic listen failed", err)
 		}
 
@@ -3097,13 +3325,11 @@ func main() {
 				if err != nil {
 					die("read bundle failed", err)
 				}
-				st := store.New(
-					filepath.Join(root, "contracts.jsonl"),
-					filepath.Join(root, "acks.jsonl"),
-					filepath.Join(root, "repayreqs.jsonl"),
-				)
-				checker := math4.NewLocalChecker(math4.Options{})
-				if err := recvData(data, st, self, checker); err != nil {
+				runner, err := daemon.NewRunner(root, daemon.Options{Store: st, Checker: checker})
+				if err != nil {
+					die("load node failed", err)
+				}
+				if err := runner.HandleRaw(data); err != nil {
 					die("join failed", err)
 				}
 				fmt.Println("OK join bundle")

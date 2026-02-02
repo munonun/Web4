@@ -550,6 +550,7 @@ func TestZKModeAcceptsProofOpen(t *testing.T) {
 
 func TestDeltaBRejectsSumMismatch(t *testing.T) {
 	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	resetDeltaBState()
 	homeA := t.TempDir()
 	homeB := t.TempDir()
 
@@ -583,6 +584,7 @@ func TestDeltaBRejectsSumMismatch(t *testing.T) {
 func TestDeltaBZKMissingRejected(t *testing.T) {
 	t.Setenv("WEB4_DELTA_MODE", "deltab")
 	t.Setenv("WEB4_ZK_MODE", "1")
+	resetDeltaBState()
 	homeA := t.TempDir()
 	homeB := t.TempDir()
 
@@ -616,6 +618,7 @@ func TestDeltaBZKMissingRejected(t *testing.T) {
 func TestDeltaBZKAcceptsAndTamperFails(t *testing.T) {
 	t.Setenv("WEB4_DELTA_MODE", "deltab")
 	t.Setenv("WEB4_ZK_MODE", "1")
+	resetDeltaBState()
 	homeA := t.TempDir()
 	homeB := t.TempDir()
 
@@ -658,6 +661,256 @@ func TestDeltaBZKAcceptsAndTamperFails(t *testing.T) {
 	}
 	if err := pair.recvToA(data); err == nil {
 		t.Fatalf("expected zk tamper rejection")
+	}
+}
+
+func TestDeltaBDedupExactAndSemantic(t *testing.T) {
+	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	resetDeltaBState()
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+	runOK(t, homeC, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	pubC := loadPub(t, homeC)
+	nodeC := node.DeriveNodeID(pubC)
+	if err := pair.a.Members.AddWithScope(nodeC, proto.InviteScopeAll, false); err != nil {
+		t.Fatalf("seed member C failed: %v", err)
+	}
+	members := pair.a.Members.List()
+	if len(members) < 3 {
+		t.Fatalf("need at least 3 members")
+	}
+	view := membersViewID(members)
+	msg := proto.DeltaBMsg{
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		ViewID:       hex.EncodeToString(view[:]),
+		Entries: []proto.DeltaBEntry{
+			{NodeID: hex.EncodeToString(members[0][:]), Delta: 7},
+			{NodeID: hex.EncodeToString(members[1][:]), Delta: -7},
+		},
+	}
+	data, err := proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		t.Fatalf("encode delta_b failed: %v", err)
+	}
+	if err := pair.recvToA(data); err != nil {
+		t.Fatalf("expected delta_b accept, got %v", err)
+	}
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected exact duplicate drop")
+	}
+
+	var extra [32]byte
+	copy(extra[:], nodeC[:])
+	semantic := proto.DeltaBMsg{
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		ViewID:       hex.EncodeToString(view[:]),
+		Entries: []proto.DeltaBEntry{
+			{NodeID: hex.EncodeToString(extra[:]), Delta: 0},
+			{NodeID: hex.EncodeToString(members[1][:]), Delta: -7},
+			{NodeID: hex.EncodeToString(members[0][:]), Delta: 7},
+		},
+	}
+	data2, err := proto.EncodeDeltaBMsg(semantic)
+	if err != nil {
+		t.Fatalf("encode delta_b failed: %v", err)
+	}
+	if err := pair.recvToA(data2); err == nil {
+		t.Fatalf("expected semantic duplicate drop")
+	}
+}
+
+func TestDeltaBViewMismatchRejected(t *testing.T) {
+	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	resetDeltaBState()
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	members := pair.a.Members.List()
+	if len(members) < 2 {
+		t.Fatalf("need at least 2 members")
+	}
+	var badView [32]byte
+	copy(badView[:], bytes.Repeat([]byte{0x42}, 32))
+	msg := proto.DeltaBMsg{
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		ViewID:       hex.EncodeToString(badView[:]),
+		Entries: []proto.DeltaBEntry{
+			{NodeID: hex.EncodeToString(members[0][:]), Delta: 5},
+			{NodeID: hex.EncodeToString(members[1][:]), Delta: -5},
+		},
+	}
+	data, err := proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		t.Fatalf("encode delta_b failed: %v", err)
+	}
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected view mismatch rejection")
+	}
+}
+
+func TestDeltaBNonMemberRejected(t *testing.T) {
+	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	resetDeltaBState()
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+	runOK(t, homeC, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	pubC := loadPub(t, homeC)
+	nodeC := node.DeriveNodeID(pubC)
+
+	members := pair.a.Members.List()
+	if len(members) < 2 {
+		t.Fatalf("need at least 2 members")
+	}
+	view := membersViewID(members)
+	msg := proto.DeltaBMsg{
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		ViewID:       hex.EncodeToString(view[:]),
+		Entries: []proto.DeltaBEntry{
+			{NodeID: hex.EncodeToString(members[0][:]), Delta: 5},
+			{NodeID: hex.EncodeToString(nodeC[:]), Delta: -5},
+		},
+	}
+	data, err := proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		t.Fatalf("encode delta_b failed: %v", err)
+	}
+	if err := pair.recvToA(data); err == nil {
+		t.Fatalf("expected non-member rejection")
+	}
+}
+
+func TestDeltaBRateLimit(t *testing.T) {
+	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	t.Setenv("WEB4_DELTA_RATE", "1")
+	t.Setenv("WEB4_DELTA_BURST", "1")
+	resetDeltaBState()
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	members := pair.a.Members.List()
+	if len(members) < 2 {
+		t.Fatalf("need at least 2 members")
+	}
+	view := membersViewID(members)
+	makeMsg := func(v int64) []byte {
+		msg := proto.DeltaBMsg{
+			ProtoVersion: proto.ProtoVersion,
+			Suite:        proto.Suite,
+			ViewID:       hex.EncodeToString(view[:]),
+			Entries: []proto.DeltaBEntry{
+				{NodeID: hex.EncodeToString(members[0][:]), Delta: v},
+				{NodeID: hex.EncodeToString(members[1][:]), Delta: -v},
+			},
+		}
+		data, err := proto.EncodeDeltaBMsg(msg)
+		if err != nil {
+			t.Fatalf("encode delta_b failed: %v", err)
+		}
+		return data
+	}
+	if err := pair.recvToA(makeMsg(1)); err != nil {
+		t.Fatalf("expected first delta_b accept, got %v", err)
+	}
+	if err := pair.recvToA(makeMsg(2)); err == nil {
+		t.Fatalf("expected rate limit drop")
+	}
+}
+
+func TestDeltaBDifferentSendersWithinLimit(t *testing.T) {
+	t.Setenv("WEB4_DELTA_MODE", "deltab")
+	t.Setenv("WEB4_DELTA_RATE", "1")
+	t.Setenv("WEB4_DELTA_BURST", "1")
+	resetDeltaBState()
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	homeC := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+	runOK(t, homeC, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	rootC := filepath.Join(homeC, ".web4mvp")
+	nodeC, err := node.NewNode(rootC, node.Options{})
+	if err != nil {
+		t.Fatalf("load node C failed: %v", err)
+	}
+	if err := pair.a.Peers.Upsert(peer.Peer{NodeID: nodeC.ID, PubKey: nodeC.PubKey}, true); err != nil {
+		t.Fatalf("seed peer C failed: %v", err)
+	}
+	if err := nodeC.Peers.Upsert(peer.Peer{NodeID: pair.a.ID, PubKey: pair.a.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+	if err := pair.a.Members.AddWithScope(nodeC.ID, proto.InviteScopeAll, false); err != nil {
+		t.Fatalf("seed member C failed: %v", err)
+	}
+	if err := nodeC.Members.AddWithScope(pair.a.ID, proto.InviteScopeAll, false); err != nil {
+		t.Fatalf("seed member A in C failed: %v", err)
+	}
+	hello1, err := nodeC.BuildHello1(pair.a.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	hello2, err := pair.a.HandleHello1(hello1)
+	if err != nil {
+		t.Fatalf("handle hello1 failed: %v", err)
+	}
+	if err := nodeC.HandleHello2(hello2); err != nil {
+		t.Fatalf("handle hello2 failed: %v", err)
+	}
+
+	members := pair.a.Members.List()
+	if len(members) < 2 {
+		t.Fatalf("need at least 2 members")
+	}
+	view := membersViewID(members)
+	makeMsg := func(v int64) []byte {
+		msg := proto.DeltaBMsg{
+			ProtoVersion: proto.ProtoVersion,
+			Suite:        proto.Suite,
+			ViewID:       hex.EncodeToString(view[:]),
+			Entries: []proto.DeltaBEntry{
+				{NodeID: hex.EncodeToString(members[0][:]), Delta: v},
+				{NodeID: hex.EncodeToString(members[1][:]), Delta: -v},
+			},
+		}
+		data, err := proto.EncodeDeltaBMsg(msg)
+		if err != nil {
+			t.Fatalf("encode delta_b failed: %v", err)
+		}
+		return data
+	}
+	msg1 := makeMsg(3)
+	msg2 := makeMsg(4)
+	if err := recvSecureToReceiver(pair.b, pair.a, pair.stA, pair.checkerA, msg1); err != nil {
+		t.Fatalf("expected sender B accept, got %v", err)
+	}
+	if err := recvSecureToReceiver(nodeC, pair.a, pair.stA, pair.checkerA, msg2); err != nil {
+		t.Fatalf("expected sender C accept, got %v", err)
 	}
 }
 
@@ -1129,6 +1382,11 @@ func loadPriv(t *testing.T, home string) []byte {
 	t.Helper()
 	_, priv := loadKeypair(t, home)
 	return priv
+}
+
+func resetDeltaBState() {
+	deltabSeen = newDeltabCache(deltabCacheCap, deltabCacheTTL)
+	deltabLimiter = newDeltabRateLimiter(10, 20, 10*time.Minute)
 }
 
 func partyID(label string) string {

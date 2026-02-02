@@ -49,3 +49,107 @@ The following are explicitly forbidden:
 
 - Nodes enforce only invariants and transport hygiene.
 - Nodes do not retain history or use reputation for validity.
+
+---
+
+**Additional Notes**
+Interpretation and Extension of Δ **(Non-Normative)**
+
+
+This section is non-normative.
+
+It does not introduce new protocol rules, constraints, or consensus
+mechanisms. All core invariants defined above remain unchanged.
+
+The purpose of this section is to describe how Δ events MAY be
+interpreted by implementations and users, without violating
+the core invariants of Web4.
+
+---
+
+A Δ event is not a balance update, a transaction, or a state transition.
+
+A Δ event represents a locally conserved change in obligations and
+entitlements between participants.
+
+Formally, Δ is a sparse vector Δb ∈ ℤⁿ such that:
+
+    Σ Δb = 0
+
+This expresses conservation of relations, not conservation of balances.
+
+---
+
+Δ is NOT:
+
+- a global ledger entry
+- a transfer of stored value
+- a record of historical truth
+- an object that requires global agreement
+
+Web4 nodes do not agree on balances.
+They only verify that a Δ event satisfies local conservation
+at the moment it is received.
+
+---
+
+## Examples are illustrative; implementations MAY choose any interpretation consistent with invariants.
+
+**Example 1: Bilateral relation**
+
+    Δb = { A: -v, B: +v }
+
+This MAY be interpreted as:
+- A transferring an entitlement of size v to B, or
+- A shifting an obligation of size v toward B.
+
+The protocol does not distinguish between these interpretations.
+
+---
+
+**Example 2: Multi-party relation**
+
+    Δb = { A: -10, B: +6, C: +4 }
+
+This MAY represent a decomposition of a relation held by A
+into relations held by B and C.
+
+No balances are created or destroyed.
+Only the structure of relations changes.
+
+**Example 3: Reversal or revocation**
+
+    Δb = { A: +5, B: -5 }
+
+This MAY be interpreted as a partial reversal of a prior relation.
+Such reversals are local interpretations and do not require
+global history.
+
+---
+
+**The field φ is not part of the protocol.**
+
+φ is a local observable derived from received Δ events.
+Different nodes MAY compute different φ values.
+
+φ is not transmitted, agreed upon, or verified.
+Only Δ events are exchanged on the network.
+
+---
+
+Zero-knowledge proofs in Web4 are used solely to prove that
+a Δ event satisfies the conservation constraints.
+
+They do not prove ownership, intent, balance, or history.
+They only prove validity of the relation at the time of interaction.
+
+---
+
+Future implementations MAY introduce additional interpretations
+of Δ events, provided that:
+
+- Δ remains locally conserved (ΣΔ = 0)
+- No global history or ledger is introduced
+- Verification remains local and bounded
+
+Any such extensions are interpretations, not protocol changes.

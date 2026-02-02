@@ -74,6 +74,25 @@ func (f *Field) ApplyDelta(members [][32]byte, deltas map[[32]byte]int64, iters 
 	return nil
 }
 
+func (f *Field) Snapshot(members [][32]byte) (map[[32]byte]int64, map[[32]byte]float64) {
+	outB := make(map[[32]byte]int64)
+	outPhi := make(map[[32]byte]float64)
+	if f == nil {
+		return outB, outPhi
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, id := range members {
+		if v, ok := f.b[id]; ok {
+			outB[id] = v
+		}
+		if v, ok := f.phi[id]; ok {
+			outPhi[id] = v
+		}
+	}
+	return outB, outPhi
+}
+
 func lessNodeID(a, b [32]byte) bool {
 	for i := 0; i < len(a); i++ {
 		if a[i] == b[i] {
