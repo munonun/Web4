@@ -391,6 +391,179 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 	}
 }
 
+func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, ready chan<- string, devTLS bool, handle func(string, []byte) ([]byte, error)) error {
+	if devTLS {
+		if err := ensureDevTLSCA(); err != nil {
+			return err
+		}
+	}
+	tlsConf, err := serverTLSConfig(devTLS)
+	if err != nil {
+		return err
+	}
+	quicConf := &quic.Config{
+		MaxIncomingStreams:    maxIncomingStreams,
+		MaxIncomingUniStreams: maxIncomingUniStreams,
+		MaxIdleTimeout:        maxIdleTimeout,
+		KeepAlivePeriod:       keepAlivePeriod,
+		HandshakeIdleTimeout:  handshakeIdleTimeout,
+	}
+	listener, err := quic.ListenAddr(addr, tlsConf, quicConf)
+	if err != nil {
+		logInfo("quic listen error: %v", err)
+		return err
+	}
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			_ = listener.Close()
+		}()
+	}
+	readyAddr := addr
+	if listener != nil && listener.Addr() != nil {
+		readyAddr = listener.Addr().String()
+	}
+	logInfo("quic listen ready: %s", readyAddr)
+	if os.Getenv("WEB4_SUPPRESS_READY") != "1" {
+		logInfo("READY addr=%s", readyAddr)
+	}
+	if ready != nil {
+		select {
+		case ready <- readyAddr:
+		default:
+		}
+	}
+	connSem := NewSemaphore(maxConnHandlers)
+	streamSem := NewSemaphore(maxStreamHandlers)
+	ipLimits := newIPLimiter(maxConnsPerIPEnv, maxStreamsPerIPEnv)
+	for {
+		conn, err := listener.Accept(context.Background())
+		if err != nil {
+			if ctx != nil && ctx.Err() != nil {
+				return nil
+			}
+			logInfo("quic accept error: %v", err)
+			return err
+		}
+		remoteAddr := conn.RemoteAddr().String()
+		connToken := fmt.Sprintf("%p", conn)
+		connID := atomic.AddUint64(&connSeq, 1)
+		ip := remoteIP(conn.RemoteAddr())
+		if !ipLimits.acquireConn(ip) {
+			_ = conn.CloseWithError(0, "too many connections")
+			logInfo("DROP reason=per_ip_limit from=%s type=conn err=too_many_connections", remoteAddr)
+			continue
+		}
+		acceptCtx, cancel := context.WithTimeout(context.Background(), acquireTimeout)
+		if err := connSem.Acquire(acceptCtx); err != nil {
+			cancel()
+			ipLimits.releaseConn(ip)
+			_ = conn.CloseWithError(0, "server busy")
+			logInfo("quic connection rejected: %v", err)
+			continue
+		}
+		cancel()
+		logInfo("accepted connection addr=%s conn_id=%d conn=%s", remoteAddr, connID, connToken)
+		go func(connID uint64, remoteAddr string, connToken string) {
+			defer connSem.Release()
+			defer ipLimits.releaseConn(ip)
+			c := conn
+			lastStreamAt := time.Now()
+			for {
+				acceptCtx, cancel := context.WithTimeout(context.Background(), streamAcceptTimeout)
+				stream, err := c.AcceptStream(acceptCtx)
+				cancel()
+				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) {
+						logInfo("quic accept stream timeout conn_id=%d since_last_stream=%s", connID, time.Since(lastStreamAt))
+						continue
+					}
+					if isBenignAcceptErr(err) {
+						logInfo("quic accept stream closed: %v", err)
+						return
+					}
+					logInfo("quic accept stream error: %v", err)
+					return
+				}
+				lastStreamAt = time.Now()
+				streamID := atomic.AddUint64(&streamSeq, 1)
+				logInfo("accepted stream addr=%s conn_id=%d stream_id=%d conn=%s stream=%s", remoteAddr, connID, streamID, connToken, streamIDString(stream))
+				debugLog("DEBUG stream accepted addr=%s conn_id=%d stream_id=%d", remoteAddr, connID, streamID)
+				if !ipLimits.acquireStream(ip) {
+					closeStreamWithError(stream, streamBusyErrCode, "per-ip stream limit")
+					logInfo("DROP reason=per_ip_stream_limit from=%s type=stream err=per_ip_stream_limit", remoteAddr)
+					continue
+				}
+				streamCtx, streamCancel := context.WithTimeout(context.Background(), acquireTimeout)
+				if err := streamSem.Acquire(streamCtx); err != nil {
+					streamCancel()
+					ipLimits.releaseStream(ip)
+					closeStreamWithError(stream, streamBusyErrCode, "server busy")
+					logInfo("quic stream rejected: %v", err)
+					continue
+				}
+				streamCancel()
+				go func(s *quic.Stream, sender string, connID uint64, streamID uint64) {
+					defer streamSem.Release()
+					defer ipLimits.releaseStream(ip)
+					defer s.Close()
+					logInfo("read start conn_id=%d stream_id=%d", connID, streamID)
+					data, err := readFrameWithTimeout(s, streamRWTimeout)
+					if err != nil {
+						if errors.Is(err, io.EOF) {
+							logInfo("quic read error: EOF")
+						} else {
+							if errors.Is(err, context.DeadlineExceeded) {
+								logInfo("DROP message: read timeout before full frame")
+							} else if te, ok := err.(interface{ Timeout() bool }); ok && te.Timeout() {
+								logInfo("DROP message: read timeout before full frame")
+							}
+							logInfo("quic read error: %v", err)
+						}
+						return
+					}
+					logInfo("read conn_id=%d stream_id=%d addr=%s raw_len=%d sha256=%s", connID, streamID, sender, len(data), hashHex(data))
+					debugLog("DEBUG read bytes addr=%s conn_id=%d stream_id=%d bytes=%d", sender, connID, streamID, len(data))
+					if os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+						logInfo("WIRE RECV addr=%s conn_id=%d stream_id=%d conn=%s stream=%s raw_len=%d sha256=%s preview=%s", sender, connID, streamID, connToken, streamIDString(s), len(data), hashHex(data), previewBytes(data, 80))
+					}
+					msgType := "unknown"
+					var hdr struct {
+						Type string `json:"type"`
+					}
+					if err := json.Unmarshal(data, &hdr); err == nil && hdr.Type != "" {
+						msgType = hdr.Type
+					} else if err != nil && os.Getenv("WEB4_WIRE_DEBUG") == "1" {
+						logInfo("quic read type parse error: %v", err)
+					}
+					logInfo("read %d bytes, type=%s, calling recv conn_id=%d stream_id=%d", len(data), msgType, connID, streamID)
+					resp, err := handle(sender, data)
+					if err != nil {
+						logInfo("quic handler error: %v", err)
+						return
+					}
+					if resp != nil {
+						respType := ""
+						var respHdr struct {
+							Type string `json:"type"`
+						}
+						if err := json.Unmarshal(resp, &respHdr); err == nil && respHdr.Type != "" {
+							respType = respHdr.Type
+						}
+						if err := writeFrameWithTimeout(s, streamRWTimeout, resp); err != nil {
+							logInfo("quic write error: %v", err)
+							return
+						}
+						if respType == proto.MsgTypeHello2 {
+							logInfo("sent hello2")
+						}
+					}
+				}(stream, remoteAddr, connID, streamID)
+			}
+		}(connID, remoteAddr, connToken)
+	}
+}
+
 func ensureDevTLSCA() error {
 	_, der, err := devTLSCert()
 	if err != nil {

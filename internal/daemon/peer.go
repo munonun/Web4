@@ -190,6 +190,25 @@ func (r *Runner) Run(addr string, devTLS bool) error {
 	return err
 }
 
+func (r *Runner) RunWithContext(ctx context.Context, addr string, devTLS bool, ready chan<- string) error {
+	if r == nil {
+		return fmt.Errorf("missing runner")
+	}
+	r.StartSnapshotWriter(time.Second)
+	err := network.ListenAndServeWithResponderFromContext(ctx, addr, ready, devTLS, func(senderAddr string, data []byte) ([]byte, error) {
+		resp, _, err := r.recvDataWithResponse(data, senderAddr)
+		if err != nil {
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
+			}
+			return nil, err
+		}
+		return resp, nil
+	})
+	r.StopSnapshotWriter()
+	return err
+}
+
 func ensureKeypair(root string) error {
 	_, _, err := crypto.LoadKeypair(root)
 	if err == nil {
@@ -504,6 +523,42 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 
 	case proto.MsgTypeGossipPush:
 		return handleGossipPush(data, r.Store, r.Self, r.Checker, senderAddr)
+
+	case proto.MsgTypePeerExchangeReq:
+		req, err := proto.DecodePeerExchangeReq(data)
+		if err != nil {
+			return nil, false, reject("decode peer exchange req failed", err)
+		}
+		resp, err := buildPeerExchangeResp(r.Self, req.K)
+		if err != nil {
+			return nil, false, reject("peer exchange failed", err)
+		}
+		respData, err := proto.EncodePeerExchangeResp(resp)
+		if err != nil {
+			return nil, false, reject("encode peer exchange resp failed", err)
+		}
+		if err := enforceTypeMax(proto.MsgTypePeerExchangeResp, len(respData)); err != nil {
+			return nil, false, reject("peer exchange resp too large", err)
+		}
+		if wasSecure {
+			respData, err = sealSecureEnvelope(r.Self, secureFromID, proto.MsgTypePeerExchangeResp, "", respData)
+			if err != nil {
+				return nil, false, reject("encode secure peer exchange resp failed", err)
+			}
+		}
+		return respData, false, nil
+
+	case proto.MsgTypePeerExchangeResp:
+		resp, err := proto.DecodePeerExchangeResp(data)
+		if err != nil {
+			return nil, false, reject("decode peer exchange resp failed", err)
+		}
+		added, err := applyPeerExchangeResp(r.Self, resp)
+		if err != nil {
+			return nil, false, reject("apply peer exchange resp failed", err)
+		}
+		fmt.Println("RECV PEER EXCHANGE", added)
+		return nil, false, nil
 
 	case proto.MsgTypeInviteCert:
 		msg, err := proto.DecodeInviteCertMsg(data)
@@ -2734,6 +2789,111 @@ func buildDeltaZK(entries []proto.DeltaBEntry, ctx []byte) (*proto.ZKLinearProof
 		return nil, err
 	}
 	return linear.EncodeLinearProof(C, proof)
+}
+
+func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, error) {
+	if self == nil || self.Peers == nil {
+		return proto.PeerExchangeRespMsg{}, fmt.Errorf("peer store unavailable")
+	}
+	if k <= 0 {
+		k = defaultPeerExchangeK
+	}
+	if k > maxPeerExchangeK {
+		k = maxPeerExchangeK
+	}
+	peers := self.Peers.List()
+	respPeers := make([]proto.PeerExchangePeer, 0, k)
+	for _, p := range peers {
+		if len(respPeers) >= k {
+			break
+		}
+		if p.Addr == "" || len(p.PubKey) == 0 {
+			continue
+		}
+		id := p.NodeID
+		if isZeroNodeID(id) {
+			id = node.DeriveNodeID(p.PubKey)
+		}
+		peerMsg := proto.PeerExchangePeer{
+			Addr:   p.Addr,
+			NodeID: hex.EncodeToString(id[:]),
+			PubKey: hex.EncodeToString(p.PubKey),
+		}
+		respPeers = append(respPeers, peerMsg)
+	}
+	msg := proto.PeerExchangeRespMsg{
+		Type:         proto.MsgTypePeerExchangeResp,
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		Peers:        respPeers,
+	}
+	fromID := self.ID
+	msg.FromNodeID = hex.EncodeToString(fromID[:])
+	payloadMsg := msg
+	payloadMsg.SigFrom = ""
+	payload, err := proto.EncodePeerExchangeResp(payloadMsg)
+	if err != nil {
+		return proto.PeerExchangeRespMsg{}, err
+	}
+	sig := sigFromBytes(msg.ProtoVersion, msg.Suite, msg.Type, fromID, payload, self.PrivKey)
+	msg.SigFrom = hex.EncodeToString(sig)
+	return msg, nil
+}
+
+func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int, error) {
+	if self == nil || self.Peers == nil {
+		return 0, fmt.Errorf("peer store unavailable")
+	}
+	added := 0
+	limit := len(resp.Peers)
+	if limit > maxPeerExchangeK {
+		limit = maxPeerExchangeK
+	}
+	for i := 0; i < limit; i++ {
+		p, err := decodePeerExchangePeer(resp.Peers[i])
+		if err != nil {
+			return added, err
+		}
+		if p.Addr != "" && self.Candidates != nil {
+			self.Candidates.Add(p.Addr)
+		}
+		if p.Addr != "" && self.Peers != nil {
+			_, _ = self.Peers.SetAddrUnverified(p, p.Addr, true)
+		}
+		p.Addr = ""
+		persist := len(p.PubKey) > 0
+		if err := self.Peers.Upsert(p, persist); err != nil {
+			return added, err
+		}
+		added++
+	}
+	return added, nil
+}
+
+func decodePeerExchangePeer(w proto.PeerExchangePeer) (peer.Peer, error) {
+	id, err := decodeNodeIDHex(w.NodeID)
+	if err != nil {
+		return peer.Peer{}, err
+	}
+	var pub []byte
+	if w.PubKey != "" {
+		pub, err = hex.DecodeString(w.PubKey)
+		if err != nil {
+			return peer.Peer{}, fmt.Errorf("bad pubkey")
+		}
+	}
+	p := peer.Peer{
+		NodeID: id,
+		PubKey: pub,
+		Addr:   w.Addr,
+	}
+	if len(pub) > 0 {
+		derived := node.DeriveNodeID(pub)
+		if derived != id {
+			return peer.Peer{}, fmt.Errorf("node_id mismatch")
+		}
+	}
+	return p, nil
 }
 
 func decodeSigFromBytes(s string) ([]byte, error) {
