@@ -125,10 +125,15 @@ var (
 	keepAlivePeriod      = 10 * time.Second
 	maxConnsPerIPEnv     = maxConnsPerIP
 	maxStreamsPerIPEnv   = maxStreamsPerIP
+	maxConnHandlersEnv   = maxConnHandlers
+	maxStreamHandlersEnv = maxStreamHandlers
+	maxStreamsPerConnEnv = maxIncomingStreams
 )
 var (
-	connSeq   uint64
-	streamSeq uint64
+	connSeq     uint64
+	streamSeq   uint64
+	connCount   atomic.Uint64
+	streamCount atomic.Uint64
 )
 
 type Semaphore struct {
@@ -146,8 +151,15 @@ func init() {
 	streamAcceptTimeout = envDurationSeconds("WEB4_QUIC_ACCEPT_TIMEOUT_SEC", streamRWTimeout)
 	acquireTimeout = envDurationMillis("WEB4_QUIC_ACQUIRE_TIMEOUT_MS", acquireTimeout)
 	keepAlivePeriod = envDurationSeconds("WEB4_QUIC_KEEPALIVE_SEC", keepAlivePeriod)
+	refreshLimits()
+}
+
+func refreshLimits() {
 	maxConnsPerIPEnv = envLimiter("WEB4_LIMITER_MAX_CONNS_PER_IP", "WEB4_LIMITER_MULTIPLIER", maxConnsPerIP)
 	maxStreamsPerIPEnv = envLimiter("WEB4_LIMITER_MAX_STREAMS_PER_IP", "WEB4_LIMITER_MULTIPLIER", maxStreamsPerIP)
+	maxConnHandlersEnv = envInt("WEB4_MAX_CONNS", maxConnHandlers)
+	maxStreamsPerConnEnv = envInt("WEB4_MAX_STREAMS_PER_CONN", maxIncomingStreams)
+	maxStreamHandlersEnv = envInt("WEB4_MAX_STREAMS", maxStreamHandlers)
 	if os.Getenv("WEB4_DISABLE_LIMITER") == "1" {
 		maxConnsPerIPEnv = 0
 		maxStreamsPerIPEnv = 0
@@ -176,6 +188,18 @@ func envDurationMillis(name string, def time.Duration) time.Duration {
 		return def
 	}
 	return time.Duration(v) * time.Millisecond
+}
+
+func envInt(name string, def int) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
 }
 
 func envLimiter(baseVar string, multVar string, def int) int {
@@ -235,12 +259,17 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 			return err
 		}
 	}
+	refreshLimits()
 	tlsConf, err := serverTLSConfig(devTLS)
 	if err != nil {
 		return err
 	}
+	incomingStreams := maxIncomingStreams
+	if maxStreamsPerConnEnv > 0 && maxStreamsPerConnEnv < incomingStreams {
+		incomingStreams = maxStreamsPerConnEnv
+	}
 	quicConf := &quic.Config{
-		MaxIncomingStreams:    maxIncomingStreams,
+		MaxIncomingStreams:    int64(incomingStreams),
 		MaxIncomingUniStreams: maxIncomingUniStreams,
 		MaxIdleTimeout:        maxIdleTimeout,
 		KeepAlivePeriod:       keepAlivePeriod,
@@ -263,8 +292,8 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 	if ready != nil {
 		close(ready)
 	}
-	connSem := NewSemaphore(maxConnHandlers)
-	streamSem := NewSemaphore(maxStreamHandlers)
+	connSem := NewSemaphore(maxConnHandlersEnv)
+	streamSem := NewSemaphore(maxStreamHandlersEnv)
 	ipLimits := newIPLimiter(maxConnsPerIPEnv, maxStreamsPerIPEnv)
 	for {
 		conn, err := listener.Accept(context.Background())
@@ -281,10 +310,12 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 			logInfo("DROP reason=per_ip_limit from=%s type=conn err=too_many_connections", remoteAddr)
 			continue
 		}
+		connCount.Add(1)
 		acceptCtx, cancel := context.WithTimeout(context.Background(), acquireTimeout)
 		if err := connSem.Acquire(acceptCtx); err != nil {
 			cancel()
 			ipLimits.releaseConn(ip)
+			connCount.Add(^uint64(0))
 			_ = conn.CloseWithError(0, "server busy")
 			logInfo("quic connection rejected: %v", err)
 			continue
@@ -293,9 +324,11 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 		logInfo("accepted connection addr=%s conn_id=%d conn=%s", remoteAddr, connID, connToken)
 		go func(connID uint64, remoteAddr string, connToken string) {
 			defer connSem.Release()
+			defer connCount.Add(^uint64(0))
 			defer ipLimits.releaseConn(ip)
 			c := conn
 			lastStreamAt := time.Now()
+			var streamsInConn int32
 			for {
 				acceptCtx, cancel := context.WithTimeout(context.Background(), streamAcceptTimeout)
 				stream, err := c.AcceptStream(acceptCtx)
@@ -316,6 +349,11 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 				streamID := atomic.AddUint64(&streamSeq, 1)
 				logInfo("accepted stream addr=%s conn_id=%d stream_id=%d conn=%s stream=%s", remoteAddr, connID, streamID, connToken, streamIDString(stream))
 				debugLog("DEBUG stream accepted addr=%s conn_id=%d stream_id=%d", remoteAddr, connID, streamID)
+				if maxStreamsPerConnEnv > 0 && atomic.LoadInt32(&streamsInConn) >= int32(maxStreamsPerConnEnv) {
+					closeStreamWithError(stream, streamBusyErrCode, "per-conn stream limit")
+					logInfo("DROP reason=per_conn_stream_limit from=%s type=stream err=per_conn_stream_limit", remoteAddr)
+					continue
+				}
 				if !ipLimits.acquireStream(ip) {
 					closeStreamWithError(stream, streamBusyErrCode, "per-ip stream limit")
 					logInfo("DROP reason=per_ip_stream_limit from=%s type=stream err=per_ip_stream_limit", remoteAddr)
@@ -331,7 +369,11 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 				}
 				streamCancel()
 				go func(s *quic.Stream, sender string, connID uint64, streamID uint64) {
+					atomic.AddInt32(&streamsInConn, 1)
+					streamCount.Add(1)
 					defer streamSem.Release()
+					defer atomic.AddInt32(&streamsInConn, -1)
+					defer streamCount.Add(^uint64(0))
 					defer ipLimits.releaseStream(ip)
 					defer s.Close()
 					logInfo("read start conn_id=%d stream_id=%d", connID, streamID)
@@ -397,12 +439,17 @@ func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, re
 			return err
 		}
 	}
+	refreshLimits()
 	tlsConf, err := serverTLSConfig(devTLS)
 	if err != nil {
 		return err
 	}
+	incomingStreams := maxIncomingStreams
+	if maxStreamsPerConnEnv > 0 && maxStreamsPerConnEnv < incomingStreams {
+		incomingStreams = maxStreamsPerConnEnv
+	}
 	quicConf := &quic.Config{
-		MaxIncomingStreams:    maxIncomingStreams,
+		MaxIncomingStreams:    int64(incomingStreams),
 		MaxIncomingUniStreams: maxIncomingUniStreams,
 		MaxIdleTimeout:        maxIdleTimeout,
 		KeepAlivePeriod:       keepAlivePeriod,
@@ -433,8 +480,8 @@ func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, re
 		default:
 		}
 	}
-	connSem := NewSemaphore(maxConnHandlers)
-	streamSem := NewSemaphore(maxStreamHandlers)
+	connSem := NewSemaphore(maxConnHandlersEnv)
+	streamSem := NewSemaphore(maxStreamHandlersEnv)
 	ipLimits := newIPLimiter(maxConnsPerIPEnv, maxStreamsPerIPEnv)
 	for {
 		conn, err := listener.Accept(context.Background())
@@ -454,10 +501,12 @@ func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, re
 			logInfo("DROP reason=per_ip_limit from=%s type=conn err=too_many_connections", remoteAddr)
 			continue
 		}
+		connCount.Add(1)
 		acceptCtx, cancel := context.WithTimeout(context.Background(), acquireTimeout)
 		if err := connSem.Acquire(acceptCtx); err != nil {
 			cancel()
 			ipLimits.releaseConn(ip)
+			connCount.Add(^uint64(0))
 			_ = conn.CloseWithError(0, "server busy")
 			logInfo("quic connection rejected: %v", err)
 			continue
@@ -466,9 +515,11 @@ func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, re
 		logInfo("accepted connection addr=%s conn_id=%d conn=%s", remoteAddr, connID, connToken)
 		go func(connID uint64, remoteAddr string, connToken string) {
 			defer connSem.Release()
+			defer connCount.Add(^uint64(0))
 			defer ipLimits.releaseConn(ip)
 			c := conn
 			lastStreamAt := time.Now()
+			var streamsInConn int32
 			for {
 				acceptCtx, cancel := context.WithTimeout(context.Background(), streamAcceptTimeout)
 				stream, err := c.AcceptStream(acceptCtx)
@@ -489,6 +540,11 @@ func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, re
 				streamID := atomic.AddUint64(&streamSeq, 1)
 				logInfo("accepted stream addr=%s conn_id=%d stream_id=%d conn=%s stream=%s", remoteAddr, connID, streamID, connToken, streamIDString(stream))
 				debugLog("DEBUG stream accepted addr=%s conn_id=%d stream_id=%d", remoteAddr, connID, streamID)
+				if maxStreamsPerConnEnv > 0 && atomic.LoadInt32(&streamsInConn) >= int32(maxStreamsPerConnEnv) {
+					closeStreamWithError(stream, streamBusyErrCode, "per-conn stream limit")
+					logInfo("DROP reason=per_conn_stream_limit from=%s type=stream err=per_conn_stream_limit", remoteAddr)
+					continue
+				}
 				if !ipLimits.acquireStream(ip) {
 					closeStreamWithError(stream, streamBusyErrCode, "per-ip stream limit")
 					logInfo("DROP reason=per_ip_stream_limit from=%s type=stream err=per_ip_stream_limit", remoteAddr)
@@ -504,7 +560,11 @@ func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, re
 				}
 				streamCancel()
 				go func(s *quic.Stream, sender string, connID uint64, streamID uint64) {
+					atomic.AddInt32(&streamsInConn, 1)
+					streamCount.Add(1)
 					defer streamSem.Release()
+					defer atomic.AddInt32(&streamsInConn, -1)
+					defer streamCount.Add(^uint64(0))
 					defer ipLimits.releaseStream(ip)
 					defer s.Close()
 					logInfo("read start conn_id=%d stream_id=%d", connID, streamID)
@@ -574,6 +634,14 @@ func ensureDevTLSCA() error {
 
 func Send(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) error {
 	return SendWithContext(context.Background(), addr, data, insecure, devTLS, devTLSCAPath)
+}
+
+func CurrentConns() uint64 {
+	return connCount.Load()
+}
+
+func CurrentStreams() uint64 {
+	return streamCount.Load()
 }
 
 func Exchange(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) ([]byte, error) {

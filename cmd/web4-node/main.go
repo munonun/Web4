@@ -20,6 +20,7 @@ import (
 
 	"web4mvp/internal/daemon"
 	"web4mvp/internal/metrics"
+	"web4mvp/internal/network"
 	"web4mvp/internal/node"
 	"web4mvp/internal/peer"
 	"web4mvp/internal/proto"
@@ -63,7 +64,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: web4-node [run|status|peers|members|delta|field] [args]")
 	fmt.Fprintln(w, "  (no args) starts interactive peer mode")
-	fmt.Fprintln(w, "  run    --addr <ip:port> [--devtls] [--debug] (interactive if TTY)")
+	fmt.Fprintln(w, "  run    --addr <ip:port> [--devtls] [--debug] [--bootstrap] (interactive if TTY)")
 	fmt.Fprintln(w, "  status")
 	fmt.Fprintln(w, "  peers")
 	fmt.Fprintln(w, "  members")
@@ -82,8 +83,12 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	addr := fs.String("addr", "", "listen addr (host:port)")
 	devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
 	debug := fs.Bool("debug", false, "enable debug logging")
+	bootstrap := fs.Bool("bootstrap", false, "run in bootstrap mode (stricter limits)")
 	if err := fs.Parse(args); err != nil {
 		return 1
+	}
+	if *bootstrap && os.Getenv("WEB4_NODE_MODE") == "" {
+		_ = os.Setenv("WEB4_NODE_MODE", "bootstrap")
 	}
 	if *addr == "" {
 		fmt.Fprintln(stderr, "missing --addr")
@@ -105,7 +110,9 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "load node failed: %v\n", err)
 		return 1
 	}
+	printModeSummary(stderr, runner.Mode)
 	fmt.Fprintf(stdout, "READY addr=%s node_id=%s\n", readyAddr, hex.EncodeToString(runner.Self.ID[:]))
+	startBootstrapConnections(context.Background(), runner.Self, *devTLS)
 	if err := <-errCh; err != nil {
 		fmt.Fprintf(stderr, "run failed: %v\n", err)
 		return 1
@@ -137,11 +144,34 @@ func runStatus(args []string, stdout, _ io.Writer) int {
 	viewCount := countViews(snap.Recent)
 	color.New(color.FgGreen).Fprintln(stdout, "Local observation summary (not consensus):")
 	color.New(color.FgHiBlack).Fprintf(stdout, "  connected peers: %d\n", connected)
+	color.New(color.FgHiBlack).Fprintf(stdout, "  current conns: %d streams: %d\n", snap.CurrentConns, snap.CurrentStreams)
 	color.New(color.FgHiBlack).Fprintf(stdout, "  members: %d (gossip=%d contract=%d admin=%d)\n", len(members), scopeCounts.gossip, scopeCounts.contract, scopeCounts.admin)
 	color.New(color.FgHiBlack).Fprintf(stdout, "  Δ verified: %d\n", snap.Delta.Verified)
 	color.New(color.FgHiBlack).Fprintf(stdout, "  Δ relayed: %d\n", snap.Delta.Relayed)
 	color.New(color.FgHiBlack).Fprintf(stdout, "  Δ dropped: duplicate=%d rate_limited=%d non_member=%d zk_failed=%d\n",
 		snap.Delta.DropDuplicate, snap.Delta.DropRate, snap.Delta.DropNonMember, snap.Delta.DropZKFail)
+	if len(snap.DropByReason) > 0 {
+		color.New(color.FgHiBlack).Fprintln(stdout, "  drops by reason:")
+		keys := make([]string, 0, len(snap.DropByReason))
+		for k := range snap.DropByReason {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			color.New(color.FgHiBlack).Fprintf(stdout, "    %s: %d\n", k, snap.DropByReason[k])
+		}
+	}
+	if len(snap.RecvByType) > 0 {
+		color.New(color.FgHiBlack).Fprintln(stdout, "  recv by type:")
+		keys := make([]string, 0, len(snap.RecvByType))
+		for k := range snap.RecvByType {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			color.New(color.FgHiBlack).Fprintf(stdout, "    %s: %d\n", k, snap.RecvByType[k])
+		}
+	}
 	color.New(color.FgHiBlack).Fprintf(stdout, "  local views: %d\n", viewCount)
 	return 0
 }
@@ -262,12 +292,13 @@ func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool) 
 	color.New(color.FgYellow).Fprintln(stderr, "WARNING: using deterministic dev TLS certificates")
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	_, _, errCh, err := startRunner(ctx, addr, devTLS)
+	runner, _, errCh, err := startRunner(ctx, addr, devTLS)
 	if err != nil {
 		fmt.Fprintf(stderr, "load node failed: %v\n", err)
 		return 1
 	}
-	banner(stdout, homeDir())
+	banner(stdout, homeDir(), runner.Mode)
+	startBootstrapConnections(ctx, runner.Self, devTLS)
 	handlers := replHandlers{
 		help: func(w io.Writer) {
 			color.New(color.FgHiBlack).Fprintln(w, "Commands:")
@@ -330,13 +361,47 @@ func startRunner(ctx context.Context, addr string, devTLS bool) (*daemon.Runner,
 	return runner, readyAddr, errCh, nil
 }
 
-func banner(w io.Writer, root string) {
+func banner(w io.Writer, root string, mode string) {
 	peers, scopes := bannerCounts(root)
 	color.New(color.FgGreen).Fprintln(w, "Web4 Node running.")
+	printModeSummary(w, mode)
 	color.New(color.FgHiBlack).Fprintf(w, "Peers: %d\n", peers)
 	color.New(color.FgHiBlack).Fprintf(w, "Scopes: %d\n", scopes)
-	color.New(color.FgHiBlack).Fprintln(w, "Role: peer (relay + verifier)")
 	color.New(color.FgHiBlack).Fprintln(w, "Type 'help' for commands.")
+}
+
+func printModeSummary(w io.Writer, mode string) {
+	role := mode
+	if role == "" {
+		role = "peer"
+	}
+	maxConns := getenvInt("WEB4_MAX_CONNS", 0)
+	maxStreams := getenvInt("WEB4_MAX_STREAMS_PER_CONN", 0)
+	peerCap := getenvInt("WEB4_PEER_EXCHANGE_MAX", 0)
+	color.New(color.FgHiBlack).Fprintf(w, "Mode: %s\n", role)
+	color.New(color.FgHiBlack).Fprintf(w, "Role: %s\n", roleForMode(role))
+	color.New(color.FgHiBlack).Fprintf(w, "Limits: max_conns=%d streams/conn=%d peer_exchange_max=%d\n", maxConns, maxStreams, peerCap)
+}
+
+func getenvInt(key string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+func roleForMode(mode string) string {
+	switch mode {
+	case "bootstrap":
+		return "bootstrap (peer discovery / exchange only)"
+	default:
+		return "peer (relay + verifier)"
+	}
 }
 
 func isInteractive() bool {
@@ -360,6 +425,85 @@ func bannerCounts(root string) (int, int) {
 	}
 	scopes := len(self.Members.List())
 	return peers, scopes
+}
+
+type bootstrapPeer struct {
+	addr string
+	id   [32]byte
+}
+
+func parseBootstrapPeers() []bootstrapPeer {
+	rawAddrs := strings.TrimSpace(os.Getenv("WEB4_BOOTSTRAP_ADDRS"))
+	rawIDs := strings.TrimSpace(os.Getenv("WEB4_BOOTSTRAP_IDS"))
+	if rawAddrs == "" || rawIDs == "" {
+		return nil
+	}
+	addrs := strings.Split(rawAddrs, ",")
+	ids := strings.Split(rawIDs, ",")
+	if len(addrs) != len(ids) {
+		return nil
+	}
+	out := make([]bootstrapPeer, 0, len(addrs))
+	for i := range addrs {
+		addr := strings.TrimSpace(addrs[i])
+		idHex := strings.TrimSpace(ids[i])
+		if addr == "" || idHex == "" {
+			continue
+		}
+		raw, err := hex.DecodeString(idHex)
+		if err != nil || len(raw) != 32 {
+			continue
+		}
+		var id [32]byte
+		copy(id[:], raw)
+		out = append(out, bootstrapPeer{addr: addr, id: id})
+	}
+	return out
+}
+
+func startBootstrapConnections(ctx context.Context, self *node.Node, devTLS bool) {
+	peers := parseBootstrapPeers()
+	if len(peers) == 0 || self == nil {
+		return
+	}
+	go func() {
+		for _, p := range peers {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := handshakeWithPeer(ctx, self, p.id, p.addr, devTLS); err != nil {
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					color.New(color.FgYellow).Fprintf(os.Stderr, "bootstrap connect failed addr=%s err=%v\n", p.addr, err)
+				}
+			}
+		}
+	}()
+}
+
+func handshakeWithPeer(ctx context.Context, self *node.Node, peerID [32]byte, addr string, devTLS bool) error {
+	if self == nil {
+		return fmt.Errorf("missing node")
+	}
+	hello1, err := self.BuildHello1(peerID)
+	if err != nil {
+		return err
+	}
+	data, err := proto.EncodeHello1Msg(hello1)
+	if err != nil {
+		return err
+	}
+	devTLSCAPath := filepath.Join(homeDir(), "devtls_ca.pem")
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	respData, err := network.ExchangeWithContext(ctx, addr, data, false, devTLS, devTLSCAPath)
+	if err != nil {
+		return err
+	}
+	hello2, err := proto.DecodeHello2Msg(respData)
+	if err != nil {
+		return err
+	}
+	return self.HandleHello2(hello2)
 }
 
 type replHandlers struct {

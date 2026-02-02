@@ -17,10 +17,14 @@ type DeltaHeader struct {
 }
 
 type Snapshot struct {
-	GeneratedAt time.Time     `json:"generated_at"`
-	Delta       DeltaMetrics  `json:"delta"`
-	Gossip      GossipMetrics `json:"gossip"`
-	Recent      []DeltaHeader `json:"recent"`
+	GeneratedAt    time.Time         `json:"generated_at"`
+	Delta          DeltaMetrics      `json:"delta"`
+	Gossip         GossipMetrics     `json:"gossip"`
+	Recent         []DeltaHeader     `json:"recent"`
+	RecvByType     map[string]uint64 `json:"recv_by_type,omitempty"`
+	DropByReason   map[string]uint64 `json:"drop_by_reason,omitempty"`
+	CurrentConns   uint64            `json:"current_conns"`
+	CurrentStreams uint64            `json:"current_streams"`
 }
 
 type DeltaMetrics struct {
@@ -45,10 +49,19 @@ type Metrics struct {
 	deltaDropZKFail    atomic.Uint64
 	gossipRelayed      atomic.Uint64
 	recent             *DeltaRecent
+	mu                 sync.Mutex
+	recvByType         map[string]uint64
+	dropByReason       map[string]uint64
+	currentConns       atomic.Uint64
+	currentStreams     atomic.Uint64
 }
 
 func New() *Metrics {
-	return &Metrics{recent: NewDeltaRecent(64)}
+	return &Metrics{
+		recent:       NewDeltaRecent(64),
+		recvByType:   make(map[string]uint64),
+		dropByReason: make(map[string]uint64),
+	}
 }
 
 func (m *Metrics) Recent() *DeltaRecent {
@@ -83,10 +96,54 @@ func (m *Metrics) IncGossipRelayed() {
 	m.gossipRelayed.Add(1)
 }
 
+func (m *Metrics) IncRecvByType(msgType string) {
+	if m == nil || msgType == "" {
+		return
+	}
+	m.mu.Lock()
+	m.recvByType[msgType]++
+	m.mu.Unlock()
+}
+
+func (m *Metrics) IncDropByReason(reason string) {
+	if m == nil || reason == "" {
+		return
+	}
+	m.mu.Lock()
+	m.dropByReason[reason]++
+	m.mu.Unlock()
+}
+
+func (m *Metrics) SetCurrentConns(n uint64) {
+	if m == nil {
+		return
+	}
+	m.currentConns.Store(n)
+}
+
+func (m *Metrics) SetCurrentStreams(n uint64) {
+	if m == nil {
+		return
+	}
+	m.currentStreams.Store(n)
+}
+
 func (m *Metrics) Snapshot() Snapshot {
 	recent := []DeltaHeader{}
 	if m.recent != nil {
 		recent = m.recent.List()
+	}
+	recvByType := map[string]uint64{}
+	dropByReason := map[string]uint64{}
+	if m != nil {
+		m.mu.Lock()
+		for k, v := range m.recvByType {
+			recvByType[k] = v
+		}
+		for k, v := range m.dropByReason {
+			dropByReason[k] = v
+		}
+		m.mu.Unlock()
 	}
 	return Snapshot{
 		GeneratedAt: time.Now().UTC(),
@@ -101,7 +158,11 @@ func (m *Metrics) Snapshot() Snapshot {
 		Gossip: GossipMetrics{
 			Relayed: m.gossipRelayed.Load(),
 		},
-		Recent: recent,
+		Recent:         recent,
+		RecvByType:     recvByType,
+		DropByReason:   dropByReason,
+		CurrentConns:   m.currentConns.Load(),
+		CurrentStreams: m.currentStreams.Load(),
 	}
 }
 

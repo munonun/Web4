@@ -41,6 +41,7 @@ type Runner struct {
 	Checker   math4.LocalChecker
 	Self      *node.Node
 	Metrics   *metrics.Metrics
+	Mode      string
 	snapPath  string
 	fieldPath string
 	stopSnap  chan struct{}
@@ -63,6 +64,8 @@ func NewRunner(root string, opts Options) (*Runner, error) {
 	if err := ensureKeypair(root); err != nil {
 		return nil, err
 	}
+	mode := nodeMode()
+	applyNodeModeDefaults(mode)
 	self, err := node.NewNode(root, node.Options{})
 	if err != nil {
 		return nil, err
@@ -94,6 +97,7 @@ func NewRunner(root string, opts Options) (*Runner, error) {
 		Checker:   checker,
 		Self:      self,
 		Metrics:   m,
+		Mode:      mode,
 		snapPath:  snapPath,
 		fieldPath: filepath.Join(root, "field.json"),
 		stopSnap:  make(chan struct{}),
@@ -113,6 +117,10 @@ func (r *Runner) StartSnapshotWriter(interval time.Duration) {
 		for {
 			select {
 			case <-ticker.C:
+				if r.Metrics != nil {
+					r.Metrics.SetCurrentConns(network.CurrentConns())
+					r.Metrics.SetCurrentStreams(network.CurrentStreams())
+				}
 				_ = r.Metrics.WriteSnapshot(r.snapPath)
 			case <-r.stopSnap:
 				return
@@ -337,14 +345,19 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 	}
 	reject := func(msg string, err error) *recvError {
 		if os.Getenv("WEB4_DEBUG") == "1" {
-			fmt.Fprintf(os.Stderr, "recv reject: %s: %v\n", msg, err)
+			if shouldLogReject(msg) {
+				fmt.Fprintf(os.Stderr, "recv reject: %s: %v\n", msg, err)
+			}
 		}
-		debugCount.incDrop(msg)
+		debugCount.incDrop(classifyDropReason(msg, err))
 		return &recvError{msg: msg, err: err}
 	}
 
 	var hdr struct {
 		Type string `json:"type"`
+	}
+	if len(data) == 0 || len(data) > proto.MaxFrameSize {
+		return nil, false, reject("message too large", fmt.Errorf("frame size %d", len(data)))
 	}
 	if err := json.Unmarshal(data, &hdr); err != nil {
 		return nil, false, reject("decode message type failed", err)
@@ -1027,7 +1040,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 			if r.Metrics != nil {
 				r.Metrics.IncDeltaDropDuplicate()
 			}
-			if os.Getenv("WEB4_DEBUG") == "1" {
+			if os.Getenv("WEB4_DEBUG") == "1" && shouldLogReject("duplicate delta_b") {
 				fmt.Fprintf(os.Stderr, "drop deltab duplicate id=%x\n", deltaID[:])
 			}
 			return nil, false, reject("duplicate delta_b", fmt.Errorf("duplicate delta_id"))
@@ -1037,7 +1050,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 			if r.Metrics != nil && strings.Contains(err.Error(), "node_id not member") {
 				r.Metrics.IncDeltaDropNonMember()
 			}
-			if os.Getenv("WEB4_DEBUG") == "1" {
+			if os.Getenv("WEB4_DEBUG") == "1" && shouldLogReject("invalid delta_b") {
 				fmt.Fprintf(os.Stderr, "recv drop: delta_b invalid err=%v\n", err)
 				if strings.Contains(err.Error(), "node_id not member") {
 					fmt.Fprintf(os.Stderr, "recv drop: delta_b non_member\n")
@@ -1060,7 +1073,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 			if r.Metrics != nil {
 				r.Metrics.IncDeltaDropRate()
 			}
-			if os.Getenv("WEB4_DEBUG") == "1" {
+			if os.Getenv("WEB4_DEBUG") == "1" && shouldLogReject("rate_limited") {
 				fmt.Fprintf(os.Stderr, "drop deltab rate_limited key=%s\n", rateKey)
 			}
 			return nil, false, reject("rate_limited", fmt.Errorf("delta_b rate limited"))
@@ -1071,7 +1084,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 				if r.Metrics != nil {
 					r.Metrics.IncDeltaDropZKFail()
 				}
-				if os.Getenv("WEB4_DEBUG") == "1" {
+				if os.Getenv("WEB4_DEBUG") == "1" && shouldLogReject("invalid delta_b zk") {
 					fmt.Fprintf(os.Stderr, "recv drop: delta_b zk invalid err=%v\n", err)
 				}
 				return nil, false, reject("invalid delta_b zk", err)
@@ -1133,6 +1146,53 @@ const (
 var deltabSeen = newDeltabCache(deltabCacheCap, deltabCacheTTL)
 var deltabLimiter = newDeltabRateLimiter(10, 20, 10*time.Minute)
 var runtimeMetrics *metrics.Metrics
+
+const (
+	nodeModePeer      = "peer"
+	nodeModeBootstrap = "bootstrap"
+
+	defaultMaxConnsPeer      = 512
+	defaultMaxConnsBootstrap = 128
+
+	defaultMaxStreamsPerConnPeer      = 64
+	defaultMaxStreamsPerConnBootstrap = 8
+
+	defaultPeerExchangeMaxPeer      = 64
+	defaultPeerExchangeMaxBootstrap = 32
+)
+
+func nodeMode() string {
+	mode := strings.TrimSpace(strings.ToLower(os.Getenv("WEB4_NODE_MODE")))
+	if mode == "" {
+		return nodeModePeer
+	}
+	if mode != nodeModeBootstrap {
+		return nodeModePeer
+	}
+	return mode
+}
+
+func applyNodeModeDefaults(mode string) {
+	if mode != nodeModeBootstrap {
+		mode = nodeModePeer
+	}
+	setDefaultEnv := func(key string, value int) {
+		if os.Getenv(key) != "" {
+			return
+		}
+		_ = os.Setenv(key, strconv.Itoa(value))
+	}
+	switch mode {
+	case nodeModeBootstrap:
+		setDefaultEnv("WEB4_MAX_CONNS", defaultMaxConnsBootstrap)
+		setDefaultEnv("WEB4_MAX_STREAMS_PER_CONN", defaultMaxStreamsPerConnBootstrap)
+		setDefaultEnv("WEB4_PEER_EXCHANGE_MAX", defaultPeerExchangeMaxBootstrap)
+	default:
+		setDefaultEnv("WEB4_MAX_CONNS", defaultMaxConnsPeer)
+		setDefaultEnv("WEB4_MAX_STREAMS_PER_CONN", defaultMaxStreamsPerConnPeer)
+		setDefaultEnv("WEB4_PEER_EXCHANGE_MAX", defaultPeerExchangeMaxPeer)
+	}
+}
 
 func gossipDebugf(format string, args ...any) {
 	if os.Getenv("WEB4_DEBUG") == "1" {
@@ -1201,7 +1261,10 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 		if err != nil {
 			msg = err.Error()
 		}
-		fmt.Fprintf(os.Stderr, "DROP reason=%s from=%s type=%s err=%s\n", reason, senderAddr, t, msg)
+		if os.Getenv("WEB4_DEBUG") == "1" && shouldLogReject(reason) {
+			fmt.Fprintf(os.Stderr, "DROP reason=%s from=%s type=%s err=%s\n", reason, senderAddr, t, msg)
+		}
+		debugCount.incDrop(classifyDropReason(reason, err))
 	}
 	msg, err := proto.DecodeGossipPushMsg(data)
 	if err != nil {
@@ -2317,6 +2380,27 @@ const (
 	gossipCacheTTL       = 2 * time.Minute
 )
 
+func peerExchangeCap() int {
+	cap := defaultPeerExchangeMaxPeer
+	if v, ok := envInt("WEB4_PEER_EXCHANGE_MAX"); ok && v > 0 {
+		cap = v
+	}
+	if cap > maxPeerExchangeK {
+		return maxPeerExchangeK
+	}
+	return cap
+}
+
+func peerExchangeRand() *mrand.Rand {
+	seed := time.Now().UnixNano()
+	if raw := os.Getenv("WEB4_PEER_EXCHANGE_SEED"); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			seed = v
+		}
+	}
+	return mrand.New(mrand.NewSource(seed))
+}
+
 func gossipFanout() int {
 	if v, ok := envInt("WEB4_GOSSIP_FANOUT"); ok {
 		if v <= 0 {
@@ -2644,6 +2728,14 @@ func (c *debugCounters) inc(m map[string]uint64, kind, key string) {
 	m[key]++
 	count := m[key]
 	c.mu.Unlock()
+	if runtimeMetrics != nil {
+		switch kind {
+		case "recv_by_type":
+			runtimeMetrics.IncRecvByType(key)
+		case "drop_reason":
+			runtimeMetrics.IncDropByReason(key)
+		}
+	}
 	if os.Getenv("WEB4_DEBUG") == "1" {
 		fmt.Fprintf(os.Stderr, "counter kind=%s key=%s count=%d\n", kind, key, count)
 	}
@@ -2653,12 +2745,101 @@ var debugCount = newDebugCounters()
 
 var recvHostLimiter = newRateLimiter(defaultHostRateLimit, defaultRateWindow)
 var recvNodeLimiter = newRateLimiter(defaultNodeRateLimit, defaultRateWindow)
+var rejectLogLimiter = newLogLimiter(1 * time.Second)
 
 const (
 	defaultHostRateLimit = 50
 	defaultNodeRateLimit = 20
 	defaultRateWindow    = time.Second
 )
+
+type logLimiter struct {
+	mu     sync.Mutex
+	window time.Duration
+	bucket map[string]*logBucket
+}
+
+type logBucket struct {
+	last  time.Time
+	count int
+}
+
+func newLogLimiter(window time.Duration) *logLimiter {
+	if window <= 0 {
+		window = time.Second
+	}
+	return &logLimiter{
+		window: window,
+		bucket: make(map[string]*logBucket),
+	}
+}
+
+func (l *logLimiter) Allow(key string) bool {
+	if l == nil || key == "" {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	b, ok := l.bucket[key]
+	if !ok || now.Sub(b.last) > l.window {
+		l.bucket[key] = &logBucket{last: now, count: 1}
+		return true
+	}
+	b.count++
+	b.last = now
+	if b.count == 1 || b.count%10 == 0 {
+		return true
+	}
+	return false
+}
+
+func shouldLogReject(reason string) bool {
+	mode := nodeMode()
+	if mode != nodeModeBootstrap {
+		return true
+	}
+	return rejectLogLimiter.Allow(reason)
+}
+
+func classifyDropReason(reason string, err error) string {
+	low := strings.ToLower(reason)
+	switch {
+	case strings.Contains(low, "decode"):
+		return "decode"
+	case strings.Contains(low, "message too large"), strings.Contains(low, "too large"), strings.Contains(low, "size"):
+		return "size"
+	case strings.Contains(low, "rate"):
+		return "rate"
+	case strings.Contains(low, "duplicate"), strings.Contains(low, "already_seen"):
+		return "dedupe"
+	case strings.Contains(low, "membership"), strings.Contains(low, "non_member"), strings.Contains(low, "scope"):
+		return "scope"
+	case strings.Contains(low, "sig"):
+		return "sig"
+	case strings.Contains(low, "powad"):
+		return "powad"
+	case strings.Contains(low, "zk"):
+		return "zk"
+	default:
+		if err != nil {
+			elow := strings.ToLower(err.Error())
+			switch {
+			case strings.Contains(elow, "not member"), strings.Contains(elow, "member"):
+				return "scope"
+			case strings.Contains(elow, "zk"):
+				return "zk"
+			case strings.Contains(elow, "powad"):
+				return "powad"
+			case strings.Contains(elow, "sig"):
+				return "sig"
+			case strings.Contains(elow, "rate"):
+				return "rate"
+			}
+		}
+		return "other"
+	}
+}
 
 type rateLimiter struct {
 	mu      sync.Mutex
@@ -2798,10 +2979,15 @@ func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, e
 	if k <= 0 {
 		k = defaultPeerExchangeK
 	}
-	if k > maxPeerExchangeK {
-		k = maxPeerExchangeK
+	cap := peerExchangeCap()
+	if k > cap {
+		k = cap
 	}
 	peers := self.Peers.List()
+	if nodeMode() == nodeModeBootstrap {
+		rng := peerExchangeRand()
+		rng.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+	}
 	respPeers := make([]proto.PeerExchangePeer, 0, k)
 	for _, p := range peers {
 		if len(respPeers) >= k {
@@ -2846,8 +3032,8 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 	}
 	added := 0
 	limit := len(resp.Peers)
-	if limit > maxPeerExchangeK {
-		limit = maxPeerExchangeK
+	if cap := peerExchangeCap(); limit > cap {
+		limit = cap
 	}
 	for i := 0; i < limit; i++ {
 		p, err := decodePeerExchangePeer(resp.Peers[i])
