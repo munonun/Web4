@@ -82,6 +82,9 @@ func VerifyLinearNullspace(L [][]int64, C []pedersen.Element, bundle *ProofBundl
 	if len(L) == 0 || len(C) == 0 {
 		return false
 	}
+	if len(L) > maxRows() || len(C) > maxCommitments() {
+		return false
+	}
 	rowLen := len(L[0])
 	if rowLen != len(C) {
 		return false

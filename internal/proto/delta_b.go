@@ -22,6 +22,8 @@ type DeltaBMsg struct {
 	ProtoVersion string         `json:"proto_version"`
 	Suite        string         `json:"suite"`
 	ViewID       string         `json:"view_id"`
+	CtxTag       string         `json:"ctx_tag,omitempty"`
+	ClaimID      string         `json:"claim_id,omitempty"`
 	Entries      []DeltaBEntry  `json:"entries"`
 	ZK           *ZKLinearProof `json:"zk,omitempty"`
 }

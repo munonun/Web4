@@ -61,6 +61,12 @@ func DecodeLinearProof(z *proto.ZKLinearProof) ([]pedersen.Element, *ProofBundle
 	if len(z.Commitments) == 0 || len(z.Proofs) == 0 {
 		return nil, nil, fmt.Errorf("empty proof fields")
 	}
+	if len(z.Proofs) > maxProofs() {
+		return nil, nil, fmt.Errorf("zk cap: proofs")
+	}
+	if len(z.Commitments) > maxCommitments() {
+		return nil, nil, fmt.Errorf("zk cap: commitments")
+	}
 	g := pedersen.Group()
 	C := make([]pedersen.Element, len(z.Commitments))
 	for i, enc := range z.Commitments {

@@ -2040,20 +2040,36 @@ func deltaBContext(msg proto.DeltaBMsg, viewID [32]byte) ([]byte, error) {
 		return nil, err
 	}
 	msg.Entries = canonEntries
-	raw, err := proto.EncodeDeltaBMsg(msg)
-	if err != nil {
-		return nil, err
-	}
-	deltaHash := crypto.SHA3_256(raw)
 	scopeHash, err := deltaBScopeHash(canonEntries)
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 0, 32*3+len("web4/deltab/v0"))
-	buf = append(buf, []byte("web4/deltab/v0")...)
-	buf = append(buf, viewID[:]...)
+	tag := msg.CtxTag
+	if tag == "" {
+		tag = "web4/deltab/v0"
+	}
+	var claimID []byte
+	if msg.ClaimID != "" {
+		rawID, err := hex.DecodeString(msg.ClaimID)
+		if err != nil || len(rawID) != 32 {
+			return nil, fmt.Errorf("invalid claim_id")
+		}
+		claimID = rawID
+	}
+	buf := make([]byte, 0, len(tag)+32*3)
+	buf = append(buf, []byte(tag)...)
 	buf = append(buf, scopeHash[:]...)
-	buf = append(buf, deltaHash[:]...)
+	buf = append(buf, viewID[:]...)
+	if len(claimID) > 0 {
+		buf = append(buf, claimID...)
+	} else {
+		raw, err := proto.EncodeDeltaBMsg(msg)
+		if err != nil {
+			return nil, err
+		}
+		deltaHash := crypto.SHA3_256(raw)
+		buf = append(buf, deltaHash[:]...)
+	}
 	sum := crypto.SHA3_256(buf)
 	return sum[:], nil
 }
@@ -2606,8 +2622,6 @@ func requiredMemberScope(msgType string) (uint32, bool) {
 	switch msgType {
 	case proto.MsgTypeContractOpen, proto.MsgTypeRepayReq, proto.MsgTypeAck, proto.MsgTypeDeltaB:
 		return proto.InviteScopeContract, true
-	case proto.MsgTypePeerExchangeReq, proto.MsgTypePeerExchangeResp:
-		return proto.InviteScopeGossip, true
 	default:
 		return 0, false
 	}

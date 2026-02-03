@@ -178,6 +178,15 @@ else
 	go build -o "${WEB4_BIN}" ./cmd/web4
 fi
 
+if [[ -n "${WEB4_NODE_BIN:-}" ]]; then
+	if [[ ! -x "${WEB4_NODE_BIN}" ]]; then
+		fail "WEB4_NODE_BIN not executable: ${WEB4_NODE_BIN}"
+	fi
+else
+	WEB4_NODE_BIN="${TMPWORK}/web4-node"
+	go build -o "${WEB4_NODE_BIN}" ./cmd/web4-node
+fi
+
 run_a() {
 	HOME="${TMPA}" "${WEB4_BIN}" "$@"
 }
@@ -192,6 +201,14 @@ run_c() {
 
 run_d() {
 	HOME="${TMPD}" "${WEB4_BIN}" "$@"
+}
+
+run_node_a() {
+	HOME="${TMPA}" "${WEB4_NODE_BIN}" "$@"
+}
+
+run_node_b() {
+	HOME="${TMPB}" "${WEB4_NODE_BIN}" "$@"
 }
 
 if [[ "${WEB4_ZK_SMOKE}" == "1" ]]; then
@@ -741,6 +758,60 @@ kill "${SERVER_PID}" 2>/dev/null || true
 wait "${SERVER_PID}" 2>/dev/null || true
 SERVER_PID=""
 pass "check 5 (QUIC peer exchange)"
+
+PORT_PAY="$(pick_unique_port 42431)"
+server_log_pay="${TMPWORK}/quic_pay_server.log"
+NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
+NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
+PUBA="$(cat "${TMPA}/.web4mvp/pub.hex")"
+PUBB="$(cat "${TMPB}/.web4mvp/pub.hex")"
+rm -f "${TMPA}/.web4mvp/members.jsonl" "${TMPB}/.web4mvp/members.jsonl" 2>/dev/null || true
+printf '{"node_id":"%s","scope":3}\n' "${NODEIDA}" > "${TMPA}/.web4mvp/members.jsonl"
+printf '{"node_id":"%s","scope":3}\n' "${NODEIDB}" >> "${TMPA}/.web4mvp/members.jsonl"
+printf '{"node_id":"%s","scope":3}\n' "${NODEIDA}" > "${TMPB}/.web4mvp/members.jsonl"
+printf '{"node_id":"%s","scope":3}\n' "${NODEIDB}" >> "${TMPB}/.web4mvp/members.jsonl"
+printf '{"node_id":"%s","pubkey":"%s","addr":"127.0.0.1:%s"}\n' "${NODEIDA}" "${PUBA}" "${PORT_PAY}" >> "${TMPB}/.web4mvp/peers.jsonl"
+
+echo "Starting QUIC server (wallet pay): env HOME=${TMPA} WEB4_DELTA_MODE=deltab WEB4_ZK_MODE=1 ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PAY}"
+env HOME="${TMPA}" WEB4_DELTA_MODE=deltab WEB4_ZK_MODE=1 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PAY}" >"${server_log_pay}" 2>&1 &
+SERVER_PID=$!
+LISTENER_PIDS+=("${SERVER_PID}")
+server_log="${server_log_pay}"
+
+wait_quic_ready "${server_log_pay}" "check 5b (wallet pay): server did not start"
+
+for _ in $(seq 1 20); do
+	if [[ -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
+		break
+	fi
+	sleep 0.05
+done
+if [[ ! -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
+	quic_fail "check 5b (wallet pay): missing devtls CA"
+fi
+
+pay_log="${TMPWORK}/wallet_pay.log"
+if ! ( env HOME="${TMPB}" WEB4_DELTA_MODE=deltab WEB4_ZK_MODE=1 "${WEB4_NODE_BIN}" pay --to "${NODEIDA}" --amount 5 --send --devtls --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" >"${pay_log}" 2>&1 ); then
+	tail -n 200 "${pay_log}" 2>/dev/null || true
+	quic_fail "check 5b (wallet pay): pay failed"
+fi
+
+found=0
+for _ in $(seq 1 30); do
+	if [[ -f "${TMPA}/.web4mvp/metrics.json" ]] && grep -Eq '"verified":[[:space:]]*[1-9]' "${TMPA}/.web4mvp/metrics.json"; then
+		found=1
+		break
+	fi
+	sleep 0.1
+done
+if [[ "${found}" -ne 1 ]]; then
+	quic_fail "check 5b (wallet pay): delta_b not observed"
+fi
+
+kill "${SERVER_PID}" 2>/dev/null || true
+wait "${SERVER_PID}" 2>/dev/null || true
+SERVER_PID=""
+pass "check 5b (wallet pay delta_b)"
 
 PORT_SCOPE="$(pick_unique_port 42431)"
 

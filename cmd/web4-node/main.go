@@ -18,12 +18,14 @@ import (
 	"github.com/chzyer/readline"
 	"github.com/fatih/color"
 
+	"web4mvp/internal/crypto"
 	"web4mvp/internal/daemon"
 	"web4mvp/internal/metrics"
 	"web4mvp/internal/network"
 	"web4mvp/internal/node"
 	"web4mvp/internal/peer"
 	"web4mvp/internal/proto"
+	"web4mvp/internal/wallet"
 )
 
 func main() {
@@ -54,6 +56,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runDelta(args[1:], stdout, stderr)
 	case "field":
 		return runField(args[1:], stdout, stderr)
+	case "pay":
+		return runPay(args[1:], stdout, stderr)
+	case "wallet":
+		return runWallet(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		printUsage(stderr)
@@ -62,7 +68,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: web4-node [run|status|peers|members|delta|field] [args]")
+	fmt.Fprintln(w, "usage: web4-node [run|status|peers|members|delta|field|pay|wallet] [args]")
 	fmt.Fprintln(w, "  (no args) starts interactive peer mode")
 	fmt.Fprintln(w, "  run    --addr <ip:port> [--devtls] [--debug] [--bootstrap] (interactive if TTY)")
 	fmt.Fprintln(w, "  status")
@@ -70,9 +76,14 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  members")
 	fmt.Fprintln(w, "  delta recent [--n 20]")
 	fmt.Fprintln(w, "  field show")
+	fmt.Fprintln(w, "  pay --to <addr|nodeid> --amount <v> [--scope <s>] [--send] [--devtls] [--devtls-ca <path>]")
+	fmt.Fprintln(w, "  wallet list")
 }
 
 func homeDir() string {
+	if h := strings.TrimSpace(os.Getenv("HOME")); h != "" {
+		return filepath.Join(h, ".web4mvp")
+	}
 	h, _ := os.UserHomeDir()
 	return filepath.Join(h, ".web4mvp")
 }
@@ -110,6 +121,8 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "load node failed: %v\n", err)
 		return 1
 	}
+	runner.StartSnapshotWriter(time.Second)
+	defer runner.StopSnapshotWriter()
 	printModeSummary(stderr, runner.Mode)
 	fmt.Fprintf(stdout, "READY addr=%s node_id=%s\n", readyAddr, hex.EncodeToString(runner.Self.ID[:]))
 	startBootstrapConnections(context.Background(), runner.Self, *devTLS)
@@ -277,6 +290,343 @@ func runField(args []string, stdout, _ io.Writer) int {
 	}
 }
 
+func claimStorePath(root string) string {
+	return filepath.Join(root, "claims.jsonl")
+}
+
+func resolveRecipient(self *node.Node, raw string) ([32]byte, string, error) {
+	var toID [32]byte
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return toID, "", fmt.Errorf("missing recipient")
+	}
+	if self != nil && self.Peers != nil {
+		_ = self.Peers.Refresh()
+	}
+	if decoded, err := hex.DecodeString(raw); err == nil && len(decoded) == 32 {
+		copy(toID[:], decoded)
+		if p, ok := findPeerByNodeID(self.Peers.List(), toID); ok {
+			return toID, p.Addr, nil
+		}
+		return toID, "", nil
+	}
+	if p, ok := findPeerByAddr(self.Peers.List(), raw); ok {
+		return p.NodeID, p.Addr, nil
+	}
+	return toID, "", fmt.Errorf("unknown recipient")
+}
+
+func canonicalDeltaBForPay(msg proto.DeltaBMsg) (proto.DeltaBMsg, []byte, [32]byte, [32]byte, error) {
+	canonEntries, err := proto.CanonicalizeDeltaBEntries(msg.Entries)
+	if err != nil {
+		return proto.DeltaBMsg{}, nil, [32]byte{}, [32]byte{}, err
+	}
+	msg.Entries = canonEntries
+	msg.Type = proto.MsgTypeDeltaB
+	data, err := proto.EncodeDeltaBMsg(msg)
+	if err != nil {
+		return proto.DeltaBMsg{}, nil, [32]byte{}, [32]byte{}, err
+	}
+	var deltaID [32]byte
+	copy(deltaID[:], crypto.SHA3_256(data))
+	scopeHash, err := daemon.DeltaBScopeHash(canonEntries)
+	if err != nil {
+		return proto.DeltaBMsg{}, nil, [32]byte{}, [32]byte{}, err
+	}
+	return msg, data, deltaID, scopeHash, nil
+}
+
+func preparePayDelta(self *node.Node, toID [32]byte, amount int64) (wallet.Claim, proto.DeltaBMsg, []byte, [32]byte, [32]byte, [32]byte, error) {
+	var zero [32]byte
+	if self == nil {
+		return wallet.Claim{}, proto.DeltaBMsg{}, nil, zero, zero, zero, fmt.Errorf("node unavailable")
+	}
+	if self.Members != nil {
+		_ = self.Members.Refresh()
+	}
+	if amount <= 0 {
+		return wallet.Claim{}, proto.DeltaBMsg{}, nil, zero, zero, zero, fmt.Errorf("amount must be positive")
+	}
+	viewID := daemon.MembersViewID(self.Members.List())
+	viewHex := hex.EncodeToString(viewID[:])
+	claim, err := wallet.NewClaim(hex.EncodeToString(self.ID[:]), hex.EncodeToString(toID[:]), amount)
+	if err != nil {
+		return wallet.Claim{}, proto.DeltaBMsg{}, nil, zero, zero, zero, fmt.Errorf("claim failed: %w", err)
+	}
+	msg := proto.DeltaBMsg{
+		Type:         proto.MsgTypeDeltaB,
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		ViewID:       viewHex,
+		CtxTag:       "web4/wallet/pay/v0",
+		ClaimID:      claim.ID,
+		Entries: []proto.DeltaBEntry{
+			{NodeID: hex.EncodeToString(self.ID[:]), Delta: -1 * amount},
+			{NodeID: hex.EncodeToString(toID[:]), Delta: amount},
+		},
+	}
+	canonMsg, canonBytes, deltaID, scopeHash, err := canonicalDeltaBForPay(msg)
+	if err != nil {
+		return wallet.Claim{}, proto.DeltaBMsg{}, nil, zero, zero, zero, fmt.Errorf("invalid delta_b: %w", err)
+	}
+	claim.ViewID = viewHex
+	claim.ScopeHash = hex.EncodeToString(scopeHash[:])
+	claim.DeltaID = hex.EncodeToString(deltaID[:])
+	if os.Getenv("WEB4_ZK_MODE") == "1" {
+		ctx, err := daemon.DeltaBContext(canonMsg, viewID)
+		if err != nil {
+			return wallet.Claim{}, proto.DeltaBMsg{}, nil, zero, zero, zero, fmt.Errorf("zk ctx failed: %w", err)
+		}
+		zk, err := daemon.BuildDeltaBZK(canonMsg.Entries, ctx)
+		if err != nil {
+			return wallet.Claim{}, proto.DeltaBMsg{}, nil, zero, zero, zero, fmt.Errorf("zk proof failed: %w", err)
+		}
+		canonMsg.ZK = zk
+		canonBytes, err = proto.EncodeDeltaBMsg(canonMsg)
+		if err != nil {
+			return wallet.Claim{}, proto.DeltaBMsg{}, nil, zero, zero, zero, fmt.Errorf("encode delta_b failed: %w", err)
+		}
+		copy(deltaID[:], crypto.SHA3_256(canonBytes))
+		claim.DeltaID = hex.EncodeToString(deltaID[:])
+	}
+	return claim, canonMsg, canonBytes, deltaID, scopeHash, viewID, nil
+}
+
+func sendDeltaBToPeers(self *node.Node, toID [32]byte, toAddr string, payload []byte, devTLS bool, devTLSCA string) error {
+	if self == nil || self.Peers == nil {
+		return fmt.Errorf("peer store unavailable")
+	}
+	_ = self.Peers.Refresh()
+	peers := self.Peers.List()
+	var targets []peer.Peer
+	if toAddr != "" {
+		if p, ok := findPeerByAddr(peers, toAddr); ok {
+			targets = []peer.Peer{p}
+		}
+	}
+	if len(targets) == 0 && !isZeroNodeID(toID) {
+		if p, ok := findPeerByNodeID(peers, toID); ok {
+			targets = []peer.Peer{p}
+		}
+	}
+	if len(targets) == 0 {
+		for _, p := range peers {
+			if p.Addr != "" && len(p.PubKey) > 0 {
+				targets = append(targets, p)
+			}
+		}
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("no peers to send")
+	}
+	devTLSCAPath := devTLSCA
+	if devTLSCAPath == "" {
+		devTLSCAPath = filepath.Join(homeDir(), "devtls_ca.pem")
+	}
+	for _, p := range targets {
+		if p.Addr == "" {
+			continue
+		}
+		if !self.Sessions.Has(p.NodeID) {
+			if err := handshakeWithPeer(context.Background(), self, p.NodeID, p.Addr, devTLS, devTLSCAPath); err != nil {
+				return err
+			}
+		}
+		out, err := daemon.SealSecureEnvelope(self, p.NodeID, proto.MsgTypeDeltaB, "", payload)
+		if err != nil {
+			return err
+		}
+		if err := network.Send(p.Addr, out, false, devTLS, devTLSCAPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sendPeerExchangeToPeers(self *node.Node, toID [32]byte, toAddr string, devTLS bool, devTLSCA string) error {
+	if self == nil || self.Peers == nil {
+		return fmt.Errorf("peer store unavailable")
+	}
+	_ = self.Peers.Refresh()
+	peers := self.Peers.List()
+	var targets []peer.Peer
+	if toAddr != "" {
+		if p, ok := findPeerByAddr(peers, toAddr); ok {
+			targets = []peer.Peer{p}
+		}
+	}
+	if len(targets) == 0 && !isZeroNodeID(toID) {
+		if p, ok := findPeerByNodeID(peers, toID); ok {
+			targets = []peer.Peer{p}
+		}
+	}
+	if len(targets) == 0 {
+		for _, p := range peers {
+			if p.Addr != "" && len(p.PubKey) > 0 {
+				targets = append(targets, p)
+			}
+		}
+	}
+	if len(targets) == 0 {
+		return fmt.Errorf("no peers to exchange")
+	}
+	devTLSCAPath := devTLSCA
+	if devTLSCAPath == "" {
+		devTLSCAPath = filepath.Join(homeDir(), "devtls_ca.pem")
+	}
+	for _, p := range targets {
+		if p.Addr == "" {
+			continue
+		}
+		if !self.Sessions.Has(p.NodeID) {
+			if err := handshakeWithPeer(context.Background(), self, p.NodeID, p.Addr, devTLS, devTLSCAPath); err != nil {
+				return err
+			}
+		}
+		req := proto.PeerExchangeReqMsg{
+			Type:         proto.MsgTypePeerExchangeReq,
+			ProtoVersion: proto.ProtoVersion,
+			Suite:        proto.Suite,
+			K:            8,
+			FromNodeID:   hex.EncodeToString(self.ID[:]),
+		}
+		data, err := proto.EncodePeerExchangeReq(req)
+		if err != nil {
+			return err
+		}
+		secureReq, err := daemon.SealSecureEnvelope(self, p.NodeID, proto.MsgTypePeerExchangeReq, "", data)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err = network.ExchangeWithContext(ctx, p.Addr, secureReq, false, devTLS, devTLSCAPath)
+		cancel()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isZeroNodeID(id [32]byte) bool {
+	var zero [32]byte
+	return id == zero
+}
+
+func findPeerByAddr(peers []peer.Peer, addr string) (peer.Peer, bool) {
+	for _, p := range peers {
+		if p.Addr == addr {
+			return p, true
+		}
+	}
+	return peer.Peer{}, false
+}
+
+func findPeerByNodeID(peers []peer.Peer, id [32]byte) (peer.Peer, bool) {
+	for _, p := range peers {
+		if p.NodeID == id {
+			return p, true
+		}
+	}
+	return peer.Peer{}, false
+}
+
+func runPay(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("pay", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	to := fs.String("to", "", "recipient addr or node id hex")
+	amount := fs.Int64("amount", 0, "amount to transfer")
+	scope := fs.String("scope", "", "optional scope hint (unused in v0)")
+	send := fs.Bool("send", false, "gossip delta to peers")
+	devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
+	devTLSCA := fs.String("devtls-ca", "", "dev TLS CA PEM path")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+	if *to == "" || *amount <= 0 {
+		fmt.Fprintln(stderr, "missing --to or --amount")
+		return 1
+	}
+	if *scope != "" {
+		color.New(color.FgYellow).Fprintln(stderr, "warning: --scope is ignored in v0; derived from entries")
+	}
+	root := homeDir()
+	self, err := node.NewNode(root, node.Options{})
+	if err != nil {
+		color.New(color.FgRed).Fprintf(stderr, "pay: node unavailable: %v\n", err)
+		return 1
+	}
+	toID, toAddr, err := resolveRecipient(self, *to)
+	if err != nil {
+		color.New(color.FgRed).Fprintf(stderr, "pay: %v\n", err)
+		return 1
+	}
+	claim, _, canonBytes, _, _, _, err := preparePayDelta(self, toID, *amount)
+	if err != nil {
+		color.New(color.FgRed).Fprintf(stderr, "pay: %v\n", err)
+		return 1
+	}
+	store, err := wallet.NewStore(claimStorePath(root))
+	if err != nil {
+		color.New(color.FgRed).Fprintf(stderr, "pay: claim store failed: %v\n", err)
+		return 1
+	}
+	if err := store.Add(claim); err != nil {
+		color.New(color.FgRed).Fprintf(stderr, "pay: store claim failed: %v\n", err)
+		return 1
+	}
+	color.New(color.FgGreen).Fprintf(stdout, "OK claim stored id=%s delta_id=%s\n", claim.ID, claim.DeltaID)
+	if *send {
+		if !*devTLS {
+			color.New(color.FgYellow).Fprintln(stderr, "dev TLS disabled by default; pass --devtls to enable")
+			return 1
+		}
+		if err := sendDeltaBToPeers(self, toID, toAddr, canonBytes, *devTLS, *devTLSCA); err != nil {
+			color.New(color.FgRed).Fprintf(stderr, "pay: send failed: %v\n", err)
+			return 1
+		}
+		if err := sendPeerExchangeToPeers(self, toID, toAddr, *devTLS, *devTLSCA); err != nil && os.Getenv("WEB4_DEBUG") == "1" {
+			color.New(color.FgYellow).Fprintf(stderr, "pay: peer exchange skipped: %v\n", err)
+		}
+		color.New(color.FgGreen).Fprintln(stdout, "OK delta_b sent (local observation)")
+	}
+	return 0
+}
+
+func runWallet(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: wallet list")
+		return 1
+	}
+	switch args[0] {
+	case "list":
+		fs := flag.NewFlagSet("wallet list", flag.ContinueOnError)
+		limit := fs.Int("n", 20, "max items")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 1
+		}
+		root := homeDir()
+		store, err := wallet.NewStore(claimStorePath(root))
+		if err != nil {
+			color.New(color.FgRed).Fprintf(stderr, "wallet: %v\n", err)
+			return 1
+		}
+		claims, err := store.List(*limit)
+		if err != nil {
+			color.New(color.FgRed).Fprintf(stderr, "wallet: %v\n", err)
+			return 1
+		}
+		for _, c := range claims {
+			fmt.Fprintf(stdout, "%s from=%s to=%s amount=%d view=%s delta=%s\n",
+				c.ID, c.FromNode, c.ToNode, c.Amount, c.ViewID, c.DeltaID)
+		}
+		return 0
+	default:
+		fmt.Fprintln(stderr, "usage: wallet list")
+		return 1
+	}
+}
+
 func runInteractive(stdout, stderr io.Writer) int {
 	addr := strings.TrimSpace(os.Getenv("WEB4_ADDR"))
 	if addr == "" {
@@ -297,6 +647,8 @@ func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool) 
 		fmt.Fprintf(stderr, "load node failed: %v\n", err)
 		return 1
 	}
+	runner.StartSnapshotWriter(time.Second)
+	defer runner.StopSnapshotWriter()
 	banner(stdout, homeDir(), runner.Mode)
 	startBootstrapConnections(ctx, runner.Self, devTLS)
 	handlers := replHandlers{
@@ -405,11 +757,15 @@ func roleForMode(mode string) string {
 }
 
 func isInteractive() bool {
-	info, err := os.Stdin.Stat()
+	inInfo, err := os.Stdin.Stat()
 	if err != nil {
 		return false
 	}
-	return (info.Mode() & os.ModeCharDevice) != 0
+	outInfo, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (inInfo.Mode()&os.ModeCharDevice) != 0 && (outInfo.Mode()&os.ModeCharDevice) != 0
 }
 
 func bannerCounts(root string) (int, int) {
@@ -471,7 +827,7 @@ func startBootstrapConnections(ctx context.Context, self *node.Node, devTLS bool
 			if ctx.Err() != nil {
 				return
 			}
-			if err := handshakeWithPeer(ctx, self, p.id, p.addr, devTLS); err != nil {
+			if err := handshakeWithPeer(ctx, self, p.id, p.addr, devTLS, ""); err != nil {
 				if os.Getenv("WEB4_DEBUG") == "1" {
 					color.New(color.FgYellow).Fprintf(os.Stderr, "bootstrap connect failed addr=%s err=%v\n", p.addr, err)
 				}
@@ -480,7 +836,7 @@ func startBootstrapConnections(ctx context.Context, self *node.Node, devTLS bool
 	}()
 }
 
-func handshakeWithPeer(ctx context.Context, self *node.Node, peerID [32]byte, addr string, devTLS bool) error {
+func handshakeWithPeer(ctx context.Context, self *node.Node, peerID [32]byte, addr string, devTLS bool, devTLSCAPath string) error {
 	if self == nil {
 		return fmt.Errorf("missing node")
 	}
@@ -492,8 +848,10 @@ func handshakeWithPeer(ctx context.Context, self *node.Node, peerID [32]byte, ad
 	if err != nil {
 		return err
 	}
-	devTLSCAPath := filepath.Join(homeDir(), "devtls_ca.pem")
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	if devTLSCAPath == "" {
+		devTLSCAPath = filepath.Join(homeDir(), "devtls_ca.pem")
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	respData, err := network.ExchangeWithContext(ctx, addr, data, false, devTLS, devTLSCAPath)
 	if err != nil {

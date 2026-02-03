@@ -288,6 +288,10 @@ func sealSecureEnvelope(self *node.Node, peerID [32]byte, msgType string, channe
 	return proto.EncodeSecureEnvelope(env)
 }
 
+func SealSecureEnvelope(self *node.Node, peerID [32]byte, msgType string, channelID string, payload []byte) ([]byte, error) {
+	return sealSecureEnvelope(self, peerID, msgType, channelID, payload)
+}
+
 func openSecureEnvelope(self *node.Node, env proto.SecureEnvelope) (string, []byte, [32]byte, error) {
 	var zero [32]byte
 	if self == nil || self.Sessions == nil {
@@ -1086,6 +1090,9 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 				}
 				if os.Getenv("WEB4_DEBUG") == "1" && shouldLogReject("invalid delta_b zk") {
 					fmt.Fprintf(os.Stderr, "recv drop: delta_b zk invalid err=%v\n", err)
+					if strings.Contains(err.Error(), "zk cap") {
+						fmt.Fprintf(os.Stderr, "zk cap\n")
+					}
 				}
 				return nil, false, reject("invalid delta_b zk", err)
 			}
@@ -1801,6 +1808,10 @@ func buildGossipPushForPeer(p peer.Peer, envelope []byte, hops int, self *node.N
 	return data, nil
 }
 
+func BuildGossipPushForPeer(p peer.Peer, envelope []byte, self *node.Node) ([]byte, error) {
+	return buildGossipPushForPeer(p, envelope, gossipHops(), self)
+}
+
 func validateInviteCertCert(cert proto.InviteCert, invites *peer.InviteStore, now time.Time) error {
 	_, _, err := validateInviteCert(cert, invites, now)
 	return err
@@ -1875,8 +1886,6 @@ func requiredMemberScope(msgType string) (uint32, bool) {
 	switch msgType {
 	case proto.MsgTypeContractOpen, proto.MsgTypeRepayReq, proto.MsgTypeAck, proto.MsgTypeDeltaB:
 		return proto.InviteScopeContract, true
-	case proto.MsgTypePeerExchangeReq, proto.MsgTypePeerExchangeResp:
-		return proto.InviteScopeGossip, true
 	default:
 		return 0, false
 	}
@@ -2002,22 +2011,42 @@ func deltaBContext(msg proto.DeltaBMsg, viewID [32]byte) ([]byte, error) {
 		return nil, err
 	}
 	msg.Entries = canonEntries
-	raw, err := proto.EncodeDeltaBMsg(msg)
-	if err != nil {
-		return nil, err
-	}
-	deltaHash := crypto.SHA3_256(raw)
 	scopeHash, err := deltaBScopeHash(canonEntries)
 	if err != nil {
 		return nil, err
 	}
-	buf := make([]byte, 0, 32*3+len("web4/deltab/v0"))
-	buf = append(buf, []byte("web4/deltab/v0")...)
-	buf = append(buf, viewID[:]...)
+	tag := msg.CtxTag
+	if tag == "" {
+		tag = "web4/deltab/v0"
+	}
+	var claimID []byte
+	if msg.ClaimID != "" {
+		rawID, err := hex.DecodeString(msg.ClaimID)
+		if err != nil || len(rawID) != 32 {
+			return nil, fmt.Errorf("invalid claim_id")
+		}
+		claimID = rawID
+	}
+	buf := make([]byte, 0, len(tag)+32*3)
+	buf = append(buf, []byte(tag)...)
 	buf = append(buf, scopeHash[:]...)
-	buf = append(buf, deltaHash[:]...)
+	buf = append(buf, viewID[:]...)
+	if len(claimID) > 0 {
+		buf = append(buf, claimID...)
+	} else {
+		raw, err := proto.EncodeDeltaBMsg(msg)
+		if err != nil {
+			return nil, err
+		}
+		deltaHash := crypto.SHA3_256(raw)
+		buf = append(buf, deltaHash[:]...)
+	}
 	sum := crypto.SHA3_256(buf)
 	return sum[:], nil
+}
+
+func DeltaBContext(msg proto.DeltaBMsg, viewID [32]byte) ([]byte, error) {
+	return deltaBContext(msg, viewID)
 }
 
 func deltaBScopeHash(entries []proto.DeltaBEntry) ([32]byte, error) {
@@ -2041,6 +2070,10 @@ func deltaBScopeHash(entries []proto.DeltaBEntry) ([32]byte, error) {
 	var outSum [32]byte
 	copy(outSum[:], sum[:])
 	return outSum, nil
+}
+
+func DeltaBScopeHash(entries []proto.DeltaBEntry) ([32]byte, error) {
+	return deltaBScopeHash(entries)
 }
 
 func canonicalDeltaB(msg proto.DeltaBMsg) (proto.DeltaBMsg, []byte, [32]byte, error) {
@@ -2194,6 +2227,10 @@ func verifyDeltaBZK(msg proto.DeltaBMsg, viewID [32]byte) error {
 	return nil
 }
 
+func VerifyDeltaBZK(msg proto.DeltaBMsg, viewID [32]byte) error {
+	return verifyDeltaBZK(msg, viewID)
+}
+
 func membersViewID(members [][32]byte) [32]byte {
 	if len(members) == 0 {
 		return [32]byte{}
@@ -2214,6 +2251,10 @@ func membersViewID(members [][32]byte) [32]byte {
 	var id [32]byte
 	copy(id[:], sum[:])
 	return id
+}
+
+func MembersViewID(members [][32]byte) [32]byte {
+	return membersViewID(members)
 }
 
 func decodeNodeIDHex(s string) ([32]byte, error) {
@@ -2970,6 +3011,10 @@ func buildDeltaZK(entries []proto.DeltaBEntry, ctx []byte) (*proto.ZKLinearProof
 		return nil, err
 	}
 	return linear.EncodeLinearProof(C, proof)
+}
+
+func BuildDeltaBZK(entries []proto.DeltaBEntry, ctx []byte) (*proto.ZKLinearProof, error) {
+	return buildDeltaZK(entries, ctx)
 }
 
 func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, error) {
