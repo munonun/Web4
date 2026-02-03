@@ -17,7 +17,7 @@ func TestBannerRoleForMode(t *testing.T) {
 	root := t.TempDir()
 
 	var buf bytes.Buffer
-	banner(&buf, root, "peer")
+	banner(&buf, root, "peer", nil)
 	out := buf.String()
 	if !strings.Contains(out, "Mode: peer") {
 		t.Fatalf("expected mode line for peer, got: %s", out)
@@ -30,7 +30,7 @@ func TestBannerRoleForMode(t *testing.T) {
 	}
 
 	buf.Reset()
-	banner(&buf, root, "bootstrap")
+	banner(&buf, root, "bootstrap", nil)
 	out = buf.String()
 	if !strings.Contains(out, "Mode: bootstrap") {
 		t.Fatalf("expected mode line for bootstrap, got: %s", out)

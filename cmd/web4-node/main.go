@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -17,6 +18,9 @@ import (
 
 	"github.com/chzyer/readline"
 	"github.com/fatih/color"
+
+	"crypto/rsa"
+	"crypto/x509"
 
 	"web4mvp/internal/crypto"
 	"web4mvp/internal/daemon"
@@ -76,8 +80,12 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  members")
 	fmt.Fprintln(w, "  delta recent [--n 20]")
 	fmt.Fprintln(w, "  field show")
-	fmt.Fprintln(w, "  pay --to <addr|nodeid> --amount <v> [--scope <s>] [--send] [--devtls] [--devtls-ca <path>]")
+	fmt.Fprintln(w, "  pay --to <nodeid> --amount <v> [--scope <s>] [--send] [--devtls] [--devtls-ca <path>]")
+	fmt.Fprintln(w, "  wallet show")
 	fmt.Fprintln(w, "  wallet list")
+	fmt.Fprintln(w, "  wallet new --force")
+	fmt.Fprintln(w, "  wallet export --out <file>")
+	fmt.Fprintln(w, "  wallet import --in <file> [--force]")
 }
 
 func homeDir() string {
@@ -123,6 +131,7 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	}
 	runner.StartSnapshotWriter(time.Second)
 	defer runner.StopSnapshotWriter()
+	printWalletLine(stdout, runner.Self)
 	printModeSummary(stderr, runner.Mode)
 	fmt.Fprintf(stdout, "READY addr=%s node_id=%s\n", readyAddr, hex.EncodeToString(runner.Self.ID[:]))
 	startBootstrapConnections(context.Background(), runner.Self, *devTLS)
@@ -139,7 +148,7 @@ func runStatus(args []string, stdout, _ io.Writer) int {
 		return 1
 	}
 	root := homeDir()
-	self, err := node.NewNode(root, node.Options{})
+	self, err := loadNode(root)
 	if err != nil {
 		color.New(color.FgRed).Fprintf(stdout, "status: node unavailable: %v\n", err)
 		return 1
@@ -195,7 +204,7 @@ func runPeers(args []string, stdout, _ io.Writer) int {
 		return 1
 	}
 	root := homeDir()
-	self, err := node.NewNode(root, node.Options{})
+	self, err := loadNode(root)
 	if err != nil {
 		color.New(color.FgRed).Fprintf(stdout, "peers: node unavailable: %v\n", err)
 		return 1
@@ -217,7 +226,7 @@ func runMembers(args []string, stdout, _ io.Writer) int {
 		return 1
 	}
 	root := homeDir()
-	self, err := node.NewNode(root, node.Options{})
+	self, err := loadNode(root)
 	if err != nil {
 		color.New(color.FgRed).Fprintf(stdout, "members: node unavailable: %v\n", err)
 		return 1
@@ -294,6 +303,232 @@ func claimStorePath(root string) string {
 	return filepath.Join(root, "claims.jsonl")
 }
 
+type walletExport struct {
+	Algo          string `json:"algo"`
+	NodeIDHex     string `json:"node_id_hex"`
+	PrivateKeyPEM string `json:"private_key_pem"`
+	PublicKeyPEM  string `json:"public_key_pem,omitempty"`
+}
+
+func loadNode(root string) (*node.Node, error) {
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return nil, fmt.Errorf("home not writable: %w", err)
+	}
+	self, err := node.NewNode(root, node.Options{})
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureWalletFiles(root, self); err != nil {
+		return nil, err
+	}
+	return self, nil
+}
+
+func ensureWalletFiles(root string, self *node.Node) error {
+	if self == nil {
+		return fmt.Errorf("missing node")
+	}
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return fmt.Errorf("home not writable: %w", err)
+	}
+	nodeIDHex := hex.EncodeToString(self.ID[:])
+	if err := os.WriteFile(filepath.Join(root, "node_id.hex"), []byte(nodeIDHex), 0600); err != nil {
+		return fmt.Errorf("write node_id.hex: %w", err)
+	}
+	if len(self.PrivKey) > 0 {
+		privHex := hex.EncodeToString(self.PrivKey)
+		if err := os.WriteFile(filepath.Join(root, "id_key"), []byte(privHex), 0600); err != nil {
+			return fmt.Errorf("write id_key: %w", err)
+		}
+	}
+	return nil
+}
+
+func exportWallet(root, out string) error {
+	pub, priv, err := crypto.LoadKeypair(root)
+	if err != nil {
+		return err
+	}
+	privKey, err := crypto.ParseRSAPrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	pubKey, err := crypto.ParseRSAPublicKey(pub)
+	if err != nil {
+		return err
+	}
+	privDER := x509.MarshalPKCS1PrivateKey(privKey)
+	privPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privDER})
+	pubDER, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		return err
+	}
+	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
+	id := node.DeriveNodeID(pub)
+	payload := walletExport{
+		Algo:          "rsa",
+		NodeIDHex:     hex.EncodeToString(id[:]),
+		PrivateKeyPEM: string(privPEM),
+		PublicKeyPEM:  string(pubPEM),
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(out, data, 0600)
+}
+
+func importWallet(root, in string, force bool) error {
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return fmt.Errorf("home not writable: %w", err)
+	}
+	if !force {
+		if _, err := os.Stat(filepath.Join(root, "priv.hex")); err == nil {
+			return fmt.Errorf("existing wallet found; use --force to overwrite")
+		}
+	}
+	data, err := os.ReadFile(in)
+	if err != nil {
+		return err
+	}
+	var payload walletExport
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+	if payload.Algo != "" && payload.Algo != "rsa" {
+		return fmt.Errorf("unsupported algo")
+	}
+	privKey, pubKey, err := parseWalletKeys(payload)
+	if err != nil {
+		return err
+	}
+	pubDER, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		return err
+	}
+	privDER, err := x509.MarshalPKCS8PrivateKey(privKey)
+	if err != nil {
+		return err
+	}
+	id := node.DeriveNodeID(pubDER)
+	if payload.NodeIDHex != "" && payload.NodeIDHex != hex.EncodeToString(id[:]) {
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			return fmt.Errorf("node_id mismatch file=%s computed=%s", payload.NodeIDHex, hex.EncodeToString(id[:]))
+		}
+		return fmt.Errorf("node_id mismatch")
+	}
+	if err := crypto.SaveKeypair(root, pubDER, privDER); err != nil {
+		return err
+	}
+	if err := ensureWalletFiles(root, &node.Node{ID: id, PubKey: pubDER, PrivKey: privDER}); err != nil {
+		return err
+	}
+	return nil
+}
+
+func shortFingerprint(pub []byte) string {
+	sum := crypto.SHA3_256(pub)
+	return hex.EncodeToString(sum[:4])
+}
+
+func parseWalletKeys(payload walletExport) (*rsa.PrivateKey, *rsa.PublicKey, error) {
+	if strings.TrimSpace(payload.PrivateKeyPEM) == "" {
+		return nil, nil, fmt.Errorf("missing private_key_pem")
+	}
+	block, _ := pem.Decode([]byte(payload.PrivateKeyPEM))
+	if block == nil {
+		return nil, nil, fmt.Errorf("invalid private_key_pem")
+	}
+	var privKey *rsa.PrivateKey
+	if block.Type == "RSA PRIVATE KEY" {
+		k, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("bad private_key_pem")
+		}
+		privKey = k
+	} else {
+		k, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("bad private_key_pem")
+		}
+		rsaKey, ok := k.(*rsa.PrivateKey)
+		if !ok {
+			return nil, nil, fmt.Errorf("bad private_key_pem")
+		}
+		privKey = rsaKey
+	}
+	var pubKey *rsa.PublicKey
+	if strings.TrimSpace(payload.PublicKeyPEM) == "" {
+		pubKey = &privKey.PublicKey
+	} else {
+		pb, _ := pem.Decode([]byte(payload.PublicKeyPEM))
+		if pb == nil {
+			return nil, nil, fmt.Errorf("invalid public_key_pem")
+		}
+		k, err := x509.ParsePKIXPublicKey(pb.Bytes)
+		if err != nil {
+			return nil, nil, fmt.Errorf("bad public_key_pem")
+		}
+		rsaKey, ok := k.(*rsa.PublicKey)
+		if !ok {
+			return nil, nil, fmt.Errorf("bad public_key_pem")
+		}
+		pubKey = rsaKey
+	}
+	return privKey, pubKey, nil
+}
+
+func rotateWallet(root string) (string, string, []string, error) {
+	self, err := loadNode(root)
+	if err != nil {
+		return "", "", nil, err
+	}
+	oldID := hex.EncodeToString(self.ID[:])
+	pub, priv, err := crypto.GenKeypair()
+	if err != nil {
+		return "", "", nil, err
+	}
+	if err := crypto.SaveKeypair(root, pub, priv); err != nil {
+		return "", "", nil, err
+	}
+	cleared, err := clearIdentityStores(root)
+	if err != nil {
+		return "", "", nil, err
+	}
+	newSelf, err := loadNode(root)
+	if err != nil {
+		return "", "", nil, err
+	}
+	newID := hex.EncodeToString(newSelf.ID[:])
+	return oldID, newID, cleared, nil
+}
+
+func clearIdentityStores(root string) ([]string, error) {
+	paths := []string{
+		filepath.Join(root, "peers.jsonl"),
+		filepath.Join(root, "members.jsonl"),
+		filepath.Join(root, "invites.jsonl"),
+		filepath.Join(root, "revokes.jsonl"),
+		filepath.Join(root, "claims.jsonl"),
+		filepath.Join(root, "field.json"),
+		filepath.Join(root, "metrics.json"),
+	}
+	var cleared []string
+	for _, base := range paths {
+		matches, err := filepath.Glob(base + "*")
+		if err != nil {
+			return cleared, err
+		}
+		for _, p := range matches {
+			if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+				return cleared, err
+			}
+			cleared = append(cleared, p)
+		}
+	}
+	return cleared, nil
+}
+
 func resolveRecipient(self *node.Node, raw string) ([32]byte, string, error) {
 	var toID [32]byte
 	raw = strings.TrimSpace(raw)
@@ -314,6 +549,17 @@ func resolveRecipient(self *node.Node, raw string) ([32]byte, string, error) {
 		return p.NodeID, p.Addr, nil
 	}
 	return toID, "", fmt.Errorf("unknown recipient")
+}
+
+func parseNodeIDHex(raw string) ([32]byte, error) {
+	var id [32]byte
+	raw = strings.TrimSpace(raw)
+	decoded, err := hex.DecodeString(raw)
+	if err != nil || len(decoded) != 32 {
+		return id, fmt.Errorf("bad node_id")
+	}
+	copy(id[:], decoded)
+	return id, nil
 }
 
 func canonicalDeltaBForPay(msg proto.DeltaBMsg) (proto.DeltaBMsg, []byte, [32]byte, [32]byte, error) {
@@ -534,7 +780,7 @@ func findPeerByNodeID(peers []peer.Peer, id [32]byte) (peer.Peer, bool) {
 func runPay(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("pay", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	to := fs.String("to", "", "recipient addr or node id hex")
+	to := fs.String("to", "", "recipient node id hex")
 	amount := fs.Int64("amount", 0, "amount to transfer")
 	scope := fs.String("scope", "", "optional scope hint (unused in v0)")
 	send := fs.Bool("send", false, "gossip delta to peers")
@@ -551,16 +797,21 @@ func runPay(args []string, stdout, stderr io.Writer) int {
 		color.New(color.FgYellow).Fprintln(stderr, "warning: --scope is ignored in v0; derived from entries")
 	}
 	root := homeDir()
-	self, err := node.NewNode(root, node.Options{})
+	self, err := loadNode(root)
 	if err != nil {
 		color.New(color.FgRed).Fprintf(stderr, "pay: node unavailable: %v\n", err)
 		return 1
 	}
-	toID, toAddr, err := resolveRecipient(self, *to)
+	toID, err := parseNodeIDHex(*to)
 	if err != nil {
 		color.New(color.FgRed).Fprintf(stderr, "pay: %v\n", err)
 		return 1
 	}
+	toAddr := ""
+	if p, ok := findPeerByNodeID(self.Peers.List(), toID); ok {
+		toAddr = p.Addr
+	}
+	color.New(color.FgHiBlack).Fprintf(stdout, "Sender: %s\n", hex.EncodeToString(self.ID[:]))
 	claim, _, canonBytes, _, _, _, err := preparePayDelta(self, toID, *amount)
 	if err != nil {
 		color.New(color.FgRed).Fprintf(stderr, "pay: %v\n", err)
@@ -581,6 +832,10 @@ func runPay(args []string, stdout, stderr io.Writer) int {
 			color.New(color.FgYellow).Fprintln(stderr, "dev TLS disabled by default; pass --devtls to enable")
 			return 1
 		}
+		if toAddr == "" {
+			color.New(color.FgRed).Fprintln(stderr, "pay: recipient addr unknown (not in peers list)")
+			return 1
+		}
 		if err := sendDeltaBToPeers(self, toID, toAddr, canonBytes, *devTLS, *devTLSCA); err != nil {
 			color.New(color.FgRed).Fprintf(stderr, "pay: send failed: %v\n", err)
 			return 1
@@ -595,10 +850,28 @@ func runPay(args []string, stdout, stderr io.Writer) int {
 
 func runWallet(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: wallet list")
+		fmt.Fprintln(stderr, "usage: wallet [show|list|new|export|import]")
 		return 1
 	}
 	switch args[0] {
+	case "show":
+		root := homeDir()
+		self, err := loadNode(root)
+		if err != nil {
+			color.New(color.FgRed).Fprintf(stderr, "wallet: %v\n", err)
+			return 1
+		}
+		members := self.Members.List()
+		scopeCounts := countScopes(self.Members, members)
+		mode := strings.TrimSpace(os.Getenv("WEB4_NODE_MODE"))
+		if mode == "" {
+			mode = "peer"
+		}
+		fmt.Fprintf(stdout, "wallet: %s\n", hex.EncodeToString(self.ID[:]))
+		fmt.Fprintf(stdout, "pubkey_fingerprint: %s\n", shortFingerprint(self.PubKey))
+		fmt.Fprintf(stdout, "mode: %s\n", mode)
+		fmt.Fprintf(stdout, "members: %d (gossip=%d contract=%d admin=%d)\n", len(members), scopeCounts.gossip, scopeCounts.contract, scopeCounts.admin)
+		return 0
 	case "list":
 		fs := flag.NewFlagSet("wallet list", flag.ContinueOnError)
 		limit := fs.Int("n", 20, "max items")
@@ -621,8 +894,67 @@ func runWallet(args []string, stdout, stderr io.Writer) int {
 				c.ID, c.FromNode, c.ToNode, c.Amount, c.ViewID, c.DeltaID)
 		}
 		return 0
+	case "new":
+		fs := flag.NewFlagSet("wallet new", flag.ContinueOnError)
+		force := fs.Bool("force", false, "confirm rotation")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 1
+		}
+		if !*force {
+			color.New(color.FgRed).Fprintln(stderr, "wallet new requires --force")
+			return 1
+		}
+		root := homeDir()
+		oldID, newID, cleared, err := rotateWallet(root)
+		if err != nil {
+			color.New(color.FgRed).Fprintf(stderr, "wallet: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "wallet rotated -> node reset (old=%s new=%s)\n", oldID, newID)
+		if len(cleared) > 0 {
+			fmt.Fprintln(stdout, "cleared:")
+			for _, p := range cleared {
+				fmt.Fprintf(stdout, "  %s\n", p)
+			}
+		}
+		return 0
+	case "export":
+		fs := flag.NewFlagSet("wallet export", flag.ContinueOnError)
+		out := fs.String("out", "", "output file path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 1
+		}
+		if *out == "" {
+			color.New(color.FgRed).Fprintln(stderr, "wallet export requires --out")
+			return 1
+		}
+		root := homeDir()
+		if err := exportWallet(root, *out); err != nil {
+			color.New(color.FgRed).Fprintf(stderr, "wallet: %v\n", err)
+			return 1
+		}
+		color.New(color.FgGreen).Fprintln(stdout, "wallet exported")
+		return 0
+	case "import":
+		fs := flag.NewFlagSet("wallet import", flag.ContinueOnError)
+		in := fs.String("in", "", "input file path")
+		force := fs.Bool("force", false, "overwrite existing keys")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 1
+		}
+		if *in == "" {
+			color.New(color.FgRed).Fprintln(stderr, "wallet import requires --in")
+			return 1
+		}
+		root := homeDir()
+		if err := importWallet(root, *in, *force); err != nil {
+			color.New(color.FgRed).Fprintf(stderr, "wallet: %v\n", err)
+			return 1
+		}
+		color.New(color.FgGreen).Fprintln(stdout, "wallet imported")
+		return 0
 	default:
-		fmt.Fprintln(stderr, "usage: wallet list")
+		fmt.Fprintln(stderr, "usage: wallet [show|list|new|export|import]")
 		return 1
 	}
 }
@@ -649,7 +981,7 @@ func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool) 
 	}
 	runner.StartSnapshotWriter(time.Second)
 	defer runner.StopSnapshotWriter()
-	banner(stdout, homeDir(), runner.Mode)
+	banner(stdout, homeDir(), runner.Mode, runner.Self)
 	startBootstrapConnections(ctx, runner.Self, devTLS)
 	handlers := replHandlers{
 		help: func(w io.Writer) {
@@ -660,6 +992,8 @@ func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool) 
 			fmt.Fprintln(w, "  members")
 			fmt.Fprintln(w, "  delta recent [--n N]")
 			fmt.Fprintln(w, "  field show")
+			fmt.Fprintln(w, "  wallet show|list|new --force|export --out <file>|import --in <file> [--force]")
+			fmt.Fprintln(w, "  pay --to <nodeid> --amount <n> [--send]")
 			fmt.Fprintln(w, "  quit | exit")
 		},
 		status: func() {
@@ -677,6 +1011,12 @@ func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool) 
 		},
 		fieldShow: func() {
 			_ = runField([]string{"show"}, stdout, stderr)
+		},
+		wallet: func(args []string) {
+			_ = runWallet(args, stdout, stderr)
+		},
+		pay: func(args []string) {
+			_ = runPay(args, stdout, stderr)
 		},
 		unknown: func(w io.Writer) {
 			color.New(color.FgRed).Fprintln(w, "unknown command; type 'help'")
@@ -700,6 +1040,9 @@ func startRunner(ctx context.Context, addr string, devTLS bool) (*daemon.Runner,
 	if err != nil {
 		return nil, "", nil, err
 	}
+	if err := ensureWalletFiles(root, runner.Self); err != nil {
+		return nil, "", nil, err
+	}
 	ready := make(chan string, 1)
 	errCh := make(chan error, 1)
 	go func() {
@@ -713,9 +1056,10 @@ func startRunner(ctx context.Context, addr string, devTLS bool) (*daemon.Runner,
 	return runner, readyAddr, errCh, nil
 }
 
-func banner(w io.Writer, root string, mode string) {
+func banner(w io.Writer, root string, mode string, self *node.Node) {
 	peers, scopes := bannerCounts(root)
 	color.New(color.FgGreen).Fprintln(w, "Web4 Node running.")
+	printWalletLine(w, self)
 	printModeSummary(w, mode)
 	color.New(color.FgHiBlack).Fprintf(w, "Peers: %d\n", peers)
 	color.New(color.FgHiBlack).Fprintf(w, "Scopes: %d\n", scopes)
@@ -733,6 +1077,13 @@ func printModeSummary(w io.Writer, mode string) {
 	color.New(color.FgHiBlack).Fprintf(w, "Mode: %s\n", role)
 	color.New(color.FgHiBlack).Fprintf(w, "Role: %s\n", roleForMode(role))
 	color.New(color.FgHiBlack).Fprintf(w, "Limits: max_conns=%d streams/conn=%d peer_exchange_max=%d\n", maxConns, maxStreams, peerCap)
+}
+
+func printWalletLine(w io.Writer, self *node.Node) {
+	if self == nil {
+		return
+	}
+	color.New(color.FgHiBlack).Fprintf(w, "Wallet: %s\n", hex.EncodeToString(self.ID[:]))
 }
 
 func getenvInt(key string, def int) int {
@@ -871,6 +1222,8 @@ type replHandlers struct {
 	members     func()
 	deltaRecent func(int)
 	fieldShow   func()
+	wallet      func([]string)
+	pay         func([]string)
 	unknown     func(io.Writer)
 }
 
@@ -918,6 +1271,14 @@ func replCompleter() readline.AutoCompleter {
 		readline.PcItem("members"),
 		readline.PcItem("delta", readline.PcItem("recent")),
 		readline.PcItem("field", readline.PcItem("show")),
+		readline.PcItem("wallet",
+			readline.PcItem("show"),
+			readline.PcItem("list"),
+			readline.PcItem("new"),
+			readline.PcItem("export"),
+			readline.PcItem("import"),
+		),
+		readline.PcItem("pay"),
 		readline.PcItem("exit"),
 		readline.PcItem("quit"),
 	)
@@ -961,6 +1322,14 @@ func dispatchRepl(line string, w io.Writer, handlers replHandlers) bool {
 			}
 		} else if handlers.unknown != nil {
 			handlers.unknown(w)
+		}
+	case "wallet":
+		if handlers.wallet != nil {
+			handlers.wallet(fields[1:])
+		}
+	case "pay":
+		if handlers.pay != nil {
+			handlers.pay(fields[1:])
 		}
 	case "quit", "exit":
 		return true
