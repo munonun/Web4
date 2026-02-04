@@ -153,3 +153,58 @@ of Δ events, provided that:
 - Verification remains local and bounded
 
 Any such extensions are interpretations, not protocol changes.
+
+
+## Net Position (Local Balance Definition)
+
+Web4 does **not** define a global balance.
+
+Instead, each node maintains a **local net position**, derived from the
+rights it can immediately exercise and the obligations it must immediately honor.
+
+Formally, for a node `X` at time `t`:
+NetPosition(X, t)
+= Σ ReceivableRights_X(t)
+- Σ PayableObligations_X(t)
+
+### Interpretation
+
+- This value is **computed locally**.
+- There is **no global ledger**, **no shared history**, and **no globally agreed balance**.
+- Different nodes may observe different net positions for the same peer,
+  depending on their local knowledge and scope membership.
+
+A positive net position represents immediately exercisable rights.  
+A negative net position represents immediately enforceable obligations.
+
+### Relation to Δ (DeltaB)
+
+State changes in Web4 are propagated as `Δb` messages, subject to the constraint:
+ΣΔb = 0
+
+
+This ensures that no value is created or destroyed at the network level.
+All updates represent a **redistribution of rights and obligations** among participants.
+
+### Enforcement Model
+
+Web4 does not enforce balances globally.
+
+Verification ensures only that:
+- local constraints are satisfied (e.g., ΣΔ = 0),
+- proofs are valid (when ZK is enabled),
+- and updates are locally admissible.
+
+Whether a right is exercised or an obligation is honored remains a **participant choice**,
+not a network mandate.
+
+### Design Implications
+
+- No-chain
+- No-global-history
+- No-global-consensus
+- Local verification only
+- Rights and obligations exist only where they are observed and accepted
+
+In Web4, a "balance" is not a fact.
+It is a **local position**.
