@@ -211,6 +211,10 @@ run_node_b() {
 	HOME="${TMPB}" "${WEB4_NODE_BIN}" "$@"
 }
 
+run_node_c() {
+	HOME="${TMPC}" "${WEB4_NODE_BIN}" "$@"
+}
+
 if [[ "${WEB4_ZK_SMOKE}" == "1" ]]; then
 	if ! go test ./internal/zk/linear -run '^TestProveVerifyLinearNullspace$' -count=1; then
 		fail "zk smoke failed"
@@ -1396,7 +1400,193 @@ pass "check 6b (scope + revoke)"
 	kill "${SERVER_PID_A}" 2>/dev/null || true
 	wait "${SERVER_PID_A}" 2>/dev/null || true
 	SERVER_PID_A=""
-	pass "check 6 (gossip forward)"
+pass "check 6 (gossip forward)"
 )
+
+metric_value() {
+	local home="$1"
+	local field="$2"
+	local path="${home}/.web4mvp/metrics.json"
+	if [[ ! -f "${path}" ]]; then
+		echo ""
+		return 0
+	fi
+	if command -v python3 >/dev/null 2>&1; then
+		python3 - "${path}" "${field}" <<'PY' 2>/dev/null || true
+import json, sys
+path = sys.argv[1]
+field = sys.argv[2]
+try:
+    data = json.load(open(path, "r", encoding="utf-8"))
+except Exception:
+    print("")
+    sys.exit(0)
+cur = data
+for part in field.split("."):
+    if isinstance(cur, dict) and part in cur:
+        cur = cur[part]
+    else:
+        print("")
+        sys.exit(0)
+print(cur if isinstance(cur, (int, float, str)) else "")
+PY
+		return 0
+	fi
+	grep -o "\"${field}\":[[:space:]]*[0-9]*" "${path}" 2>/dev/null | awk -F: '{print $2}' | tr -d ' ' || true
+}
+
+wait_metric_gt() {
+	local home="$1"
+	local field="$2"
+	local min="$3"
+	local deadline="$4"
+	local now
+	while true; do
+		now="$(date +%s)"
+		if [[ "${now}" -ge "${deadline}" ]]; then
+			return 1
+		fi
+		val="$(metric_value "${home}" "${field}")"
+		if [[ -n "${val}" && "${val}" =~ ^[0-9]+$ && "${val}" -gt "${min}" ]]; then
+			return 0
+		fi
+		sleep 0.2
+	done
+}
+
+wait_peer_non_bootstrap() {
+	local home="$1"
+	local bootstrap_addr="$2"
+	local deadline="$3"
+	local path="${home}/.web4mvp/peers.jsonl"
+	while true; do
+		if [[ -f "${path}" ]]; then
+			if command -v python3 >/dev/null 2>&1; then
+				if python3 - "${path}" "${bootstrap_addr}" <<'PY' 2>/dev/null
+import json, sys
+path = sys.argv[1]
+boot = sys.argv[2]
+try:
+    f = open(path, "r", encoding="utf-8")
+except Exception:
+    sys.exit(1)
+found = False
+for line in f:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except Exception:
+        continue
+    addr = obj.get("addr", "")
+    if addr and addr != boot:
+        found = True
+        break
+f.close()
+sys.exit(0 if found else 1)
+PY
+				then
+					return 0
+				fi
+			else
+				if grep -q "\"addr\":\"[^\"]\\+\"" "${path}" 2>/dev/null && ! grep -q "\"addr\":\"${bootstrap_addr}\"" "${path}" 2>/dev/null; then
+					return 0
+				fi
+			fi
+		fi
+		if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+			return 1
+		fi
+		sleep 0.2
+	done
+}
+
+bootstrap_debug_dump() {
+	local msg="$1"
+	echo "check 7 debug: ${msg}"
+	for log in "${bootstrap_log}" "${peer_a_log}" "${peer_b_log}"; do
+		if [[ -n "${log}" && -f "${log}" ]]; then
+			echo "Log tail (${log}):"
+			tail -n 200 "${log}" || true
+		fi
+	done
+	echo "A status:"
+	run_node_b status || true
+	echo "B status:"
+	run_node_c status || true
+	echo "Bootstrap status:"
+	run_node_a status || true
+	echo "A metrics:"
+	tail -n 200 "${TMPB}/.web4mvp/metrics.json" 2>/dev/null || true
+	echo "B metrics:"
+	tail -n 200 "${TMPC}/.web4mvp/metrics.json" 2>/dev/null || true
+	echo "Bootstrap metrics:"
+	tail -n 200 "${TMPA}/.web4mvp/metrics.json" 2>/dev/null || true
+}
+
+rm -rf "${TMPA}/.web4mvp" "${TMPB}/.web4mvp" "${TMPC}/.web4mvp" 2>/dev/null || true
+PORT_BOOT="$(pick_unique_port 42440)"
+PORT_PEER_A="$(pick_unique_port 42441)"
+PORT_PEER_B="$(pick_unique_port 42442)"
+
+bootstrap_log="${TMPWORK}/bootstrap_server.log"
+peer_a_log="${TMPWORK}/peer_a_server.log"
+peer_b_log="${TMPWORK}/peer_b_server.log"
+bootstrap_addr="127.0.0.1:${PORT_BOOT}"
+
+echo "Starting QUIC bootstrap node: env HOME=${TMPA} WEB4_NODE_MODE=bootstrap ${WEB4_NODE_BIN} run --devtls --addr ${bootstrap_addr}"
+env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_PEX_INTERVAL_SEC=2 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
+SERVER_PID_BOOT=$!
+LISTENER_PIDS+=("${SERVER_PID_BOOT}")
+
+wait_quic_ready "${bootstrap_log}" "check 7 (bootstrap discovery): bootstrap did not start"
+
+echo "Starting QUIC peer A: env HOME=${TMPB} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_A}"
+env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
+SERVER_PID_PEER_A=$!
+LISTENER_PIDS+=("${SERVER_PID_PEER_A}")
+
+echo "Starting QUIC peer B: env HOME=${TMPC} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_B}"
+env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
+SERVER_PID_PEER_B=$!
+LISTENER_PIDS+=("${SERVER_PID_PEER_B}")
+
+wait_quic_ready "${peer_a_log}" "check 7 (bootstrap discovery): peer A did not start"
+wait_quic_ready "${peer_b_log}" "check 7 (bootstrap discovery): peer B did not start"
+
+deadline=$(( $(date +%s) + 30 ))
+peer_ok=""
+if wait_metric_gt "${TMPB}" "peertable_size" 1 "${deadline}" && wait_peer_non_bootstrap "${TMPB}" "${bootstrap_addr}" "${deadline}"; then
+	peer_ok="A"
+elif wait_metric_gt "${TMPC}" "peertable_size" 1 "${deadline}" && wait_peer_non_bootstrap "${TMPC}" "${bootstrap_addr}" "${deadline}"; then
+	peer_ok="B"
+fi
+if [ -z "${peer_ok}" ]; then
+	bootstrap_debug_dump "peer discovery did not grow peertable"
+	quic_fail "check 7 (bootstrap discovery): peertable did not grow"
+fi
+if [ "${peer_ok}" = "A" ]; then
+	if ! wait_metric_gt "${TMPB}" "outbound_connected" 0 "${deadline}"; then
+		bootstrap_debug_dump "peer A outbound not observed"
+		quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
+	fi
+else
+	if ! wait_metric_gt "${TMPC}" "outbound_connected" 0 "${deadline}"; then
+		bootstrap_debug_dump "peer B outbound not observed"
+		quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
+	fi
+fi
+
+kill "${SERVER_PID_BOOT}" 2>/dev/null || true
+kill "${SERVER_PID_PEER_A}" 2>/dev/null || true
+kill "${SERVER_PID_PEER_B}" 2>/dev/null || true
+wait "${SERVER_PID_BOOT}" 2>/dev/null || true
+wait "${SERVER_PID_PEER_A}" 2>/dev/null || true
+wait "${SERVER_PID_PEER_B}" 2>/dev/null || true
+SERVER_PID_BOOT=""
+SERVER_PID_PEER_A=""
+SERVER_PID_PEER_B=""
+pass "check 7 (bootstrap discovery)"
 
 echo "ALL SMOKE CHECKS PASSED"

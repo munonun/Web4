@@ -17,14 +17,20 @@ type DeltaHeader struct {
 }
 
 type Snapshot struct {
-	GeneratedAt    time.Time         `json:"generated_at"`
-	Delta          DeltaMetrics      `json:"delta"`
-	Gossip         GossipMetrics     `json:"gossip"`
-	Recent         []DeltaHeader     `json:"recent"`
-	RecvByType     map[string]uint64 `json:"recv_by_type,omitempty"`
-	DropByReason   map[string]uint64 `json:"drop_by_reason,omitempty"`
-	CurrentConns   uint64            `json:"current_conns"`
-	CurrentStreams uint64            `json:"current_streams"`
+	GeneratedAt        time.Time         `json:"generated_at"`
+	Delta              DeltaMetrics      `json:"delta"`
+	Gossip             GossipMetrics     `json:"gossip"`
+	Recent             []DeltaHeader     `json:"recent"`
+	RecvByType         map[string]uint64 `json:"recv_by_type,omitempty"`
+	DropByReason       map[string]uint64 `json:"drop_by_reason,omitempty"`
+	CurrentConns       uint64            `json:"current_conns"`
+	CurrentStreams     uint64            `json:"current_streams"`
+	PeerTableSize      uint64            `json:"peertable_size"`
+	OutboundConnected  uint64            `json:"outbound_connected"`
+	InboundConnected   uint64            `json:"inbound_connected"`
+	PexRequestsTotal   uint64            `json:"pex_requests_total"`
+	PexResponsesTotal  uint64            `json:"pex_responses_total"`
+	EvictionCountTotal uint64            `json:"eviction_count_total"`
 }
 
 type DeltaMetrics struct {
@@ -48,12 +54,18 @@ type Metrics struct {
 	deltaDropNonMember atomic.Uint64
 	deltaDropZKFail    atomic.Uint64
 	gossipRelayed      atomic.Uint64
+	pexRequestsTotal   atomic.Uint64
+	pexResponsesTotal  atomic.Uint64
+	evictionCountTotal atomic.Uint64
 	recent             *DeltaRecent
 	mu                 sync.Mutex
 	recvByType         map[string]uint64
 	dropByReason       map[string]uint64
 	currentConns       atomic.Uint64
 	currentStreams     atomic.Uint64
+	peertableSize      atomic.Uint64
+	outboundConnected  atomic.Uint64
+	inboundConnected   atomic.Uint64
 }
 
 func New() *Metrics {
@@ -96,6 +108,18 @@ func (m *Metrics) IncGossipRelayed() {
 	m.gossipRelayed.Add(1)
 }
 
+func (m *Metrics) IncPexRequestsTotal() {
+	m.pexRequestsTotal.Add(1)
+}
+
+func (m *Metrics) IncPexResponsesTotal() {
+	m.pexResponsesTotal.Add(1)
+}
+
+func (m *Metrics) IncEvictionCountTotal() {
+	m.evictionCountTotal.Add(1)
+}
+
 func (m *Metrics) IncRecvByType(msgType string) {
 	if m == nil || msgType == "" {
 		return
@@ -128,6 +152,27 @@ func (m *Metrics) SetCurrentStreams(n uint64) {
 	m.currentStreams.Store(n)
 }
 
+func (m *Metrics) SetPeerTableSize(n uint64) {
+	if m == nil {
+		return
+	}
+	m.peertableSize.Store(n)
+}
+
+func (m *Metrics) SetOutboundConnected(n uint64) {
+	if m == nil {
+		return
+	}
+	m.outboundConnected.Store(n)
+}
+
+func (m *Metrics) SetInboundConnected(n uint64) {
+	if m == nil {
+		return
+	}
+	m.inboundConnected.Store(n)
+}
+
 func (m *Metrics) Snapshot() Snapshot {
 	recent := []DeltaHeader{}
 	if m.recent != nil {
@@ -158,11 +203,17 @@ func (m *Metrics) Snapshot() Snapshot {
 		Gossip: GossipMetrics{
 			Relayed: m.gossipRelayed.Load(),
 		},
-		Recent:         recent,
-		RecvByType:     recvByType,
-		DropByReason:   dropByReason,
-		CurrentConns:   m.currentConns.Load(),
-		CurrentStreams: m.currentStreams.Load(),
+		Recent:             recent,
+		RecvByType:         recvByType,
+		DropByReason:       dropByReason,
+		CurrentConns:       m.currentConns.Load(),
+		CurrentStreams:     m.currentStreams.Load(),
+		PeerTableSize:      m.peertableSize.Load(),
+		OutboundConnected:  m.outboundConnected.Load(),
+		InboundConnected:   m.inboundConnected.Load(),
+		PexRequestsTotal:   m.pexRequestsTotal.Load(),
+		PexResponsesTotal:  m.pexResponsesTotal.Load(),
+		EvictionCountTotal: m.evictionCountTotal.Load(),
 	}
 }
 

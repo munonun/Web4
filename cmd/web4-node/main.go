@@ -160,13 +160,24 @@ func runStatus(args []string, stdout, _ io.Writer) int {
 			connected++
 		}
 	}
+	peerTotal := len(peers)
+	outboundTarget := envIntDefault("WEB4_OUTBOUND_TARGET", 12)
+	exploreSlots := envIntDefault("WEB4_OUTBOUND_EXPLORE", 2)
+	pexInterval := envIntDefault("WEB4_PEX_INTERVAL_SEC", 20)
+	peertableMax := envIntDefault("WEB4_PEERTABLE_MAX", 2048)
+	subnetMax := envIntDefault("WEB4_SUBNET_MAX", 32)
 	members := self.Members.List()
 	scopeCounts := countScopes(self.Members, members)
 	snap := readMetricsSnapshot(filepath.Join(root, "metrics.json"))
 	viewCount := countViews(snap.Recent)
 	color.New(color.FgGreen).Fprintln(stdout, "Local observation summary (not consensus):")
-	color.New(color.FgHiBlack).Fprintf(stdout, "  connected peers: %d\n", connected)
+	color.New(color.FgHiBlack).Fprintf(stdout, "  peers: %d total, %d connected\n", peerTotal, connected)
+	color.New(color.FgHiBlack).Fprintf(stdout, "  outbound target: %d explore: %d pex interval: %ds\n", outboundTarget, exploreSlots, pexInterval)
+	color.New(color.FgHiBlack).Fprintf(stdout, "  peertable max: %d subnet max: %d\n", peertableMax, subnetMax)
 	color.New(color.FgHiBlack).Fprintf(stdout, "  current conns: %d streams: %d\n", snap.CurrentConns, snap.CurrentStreams)
+	if snap.PeerTableSize > 0 || snap.OutboundConnected > 0 || snap.InboundConnected > 0 {
+		color.New(color.FgHiBlack).Fprintf(stdout, "  observed peertable: %d outbound: %d inbound: %d\n", snap.PeerTableSize, snap.OutboundConnected, snap.InboundConnected)
+	}
 	color.New(color.FgHiBlack).Fprintf(stdout, "  members: %d (gossip=%d contract=%d admin=%d)\n", len(members), scopeCounts.gossip, scopeCounts.contract, scopeCounts.admin)
 	color.New(color.FgHiBlack).Fprintf(stdout, "  Δ verified: %d\n", snap.Delta.Verified)
 	color.New(color.FgHiBlack).Fprintf(stdout, "  Δ relayed: %d\n", snap.Delta.Relayed)
@@ -1419,6 +1430,18 @@ func countViews(recent []metrics.DeltaHeader) int {
 		seen[key] = struct{}{}
 	}
 	return len(seen)
+}
+
+func envIntDefault(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }
 
 func sortPeersByID(peers []peer.Peer) {

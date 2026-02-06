@@ -36,15 +36,17 @@ import (
 )
 
 type Runner struct {
-	Root      string
-	Store     *store.Store
-	Checker   math4.LocalChecker
-	Self      *node.Node
-	Metrics   *metrics.Metrics
-	Mode      string
-	snapPath  string
-	fieldPath string
-	stopSnap  chan struct{}
+	Root       string
+	Store      *store.Store
+	Checker    math4.LocalChecker
+	Self       *node.Node
+	Metrics    *metrics.Metrics
+	Mode       string
+	listenMu   sync.RWMutex
+	listenAddr string
+	snapPath   string
+	fieldPath  string
+	stopSnap   chan struct{}
 }
 
 type Options struct {
@@ -120,6 +122,9 @@ func (r *Runner) StartSnapshotWriter(interval time.Duration) {
 				if r.Metrics != nil {
 					r.Metrics.SetCurrentConns(network.CurrentConns())
 					r.Metrics.SetCurrentStreams(network.CurrentStreams())
+					if r.Self != nil && r.Self.Peers != nil {
+						r.Metrics.SetPeerTableSize(uint64(len(r.Self.Peers.List())))
+					}
 				}
 				_ = r.Metrics.WriteSnapshot(r.snapPath)
 			case <-r.stopSnap:
@@ -184,6 +189,8 @@ func (r *Runner) Run(addr string, devTLS bool) error {
 		return fmt.Errorf("missing runner")
 	}
 	r.StartSnapshotWriter(time.Second)
+	ctx := context.Background()
+	startConnMan(ctx, r, devTLS)
 	err := network.ListenAndServeWithResponderFrom(addr, nil, devTLS, func(senderAddr string, data []byte) ([]byte, error) {
 		resp, _, err := r.recvDataWithResponse(data, senderAddr)
 		if err != nil {
@@ -202,8 +209,21 @@ func (r *Runner) RunWithContext(ctx context.Context, addr string, devTLS bool, r
 	if r == nil {
 		return fmt.Errorf("missing runner")
 	}
+	r.setListenAddr(addr)
 	r.StartSnapshotWriter(time.Second)
-	err := network.ListenAndServeWithResponderFromContext(ctx, addr, ready, devTLS, func(senderAddr string, data []byte) ([]byte, error) {
+	startConnMan(ctx, r, devTLS)
+	readyCh := ready
+	if ready != nil {
+		internalReady := make(chan string, 1)
+		readyCh = internalReady
+		go func() {
+			if actual, ok := <-internalReady; ok {
+				r.setListenAddr(actual)
+				ready <- actual
+			}
+		}()
+	}
+	err := network.ListenAndServeWithResponderFromContext(ctx, addr, readyCh, devTLS, func(senderAddr string, data []byte) ([]byte, error) {
 		resp, _, err := r.recvDataWithResponse(data, senderAddr)
 		if err != nil {
 			if os.Getenv("WEB4_DEBUG") == "1" {
@@ -215,6 +235,25 @@ func (r *Runner) RunWithContext(ctx context.Context, addr string, devTLS bool, r
 	})
 	r.StopSnapshotWriter()
 	return err
+}
+
+func (r *Runner) setListenAddr(addr string) {
+	if r == nil {
+		return
+	}
+	r.listenMu.Lock()
+	r.listenAddr = addr
+	r.listenMu.Unlock()
+}
+
+func (r *Runner) getListenAddr() string {
+	if r == nil {
+		return ""
+	}
+	r.listenMu.RLock()
+	addr := r.listenAddr
+	r.listenMu.RUnlock()
+	return addr
 }
 
 func ensureKeypair(root string) error {
@@ -439,7 +478,8 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 		}
 	}
 	if !wasSecure && hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 && hdr.Type != proto.MsgTypeGossipPush {
-		if hdr.Type != proto.MsgTypeInviteCert && hdr.Type != proto.MsgTypeInviteBundle && hdr.Type != proto.MsgTypeRevoke {
+		if hdr.Type != proto.MsgTypeInviteCert && hdr.Type != proto.MsgTypeInviteBundle && hdr.Type != proto.MsgTypeRevoke &&
+			hdr.Type != proto.MsgTypePeerExchangeReq && hdr.Type != proto.MsgTypePeerExchangeResp {
 			return nil, false, reject("handshake required", fmt.Errorf("missing secure envelope"))
 		}
 	}
@@ -546,7 +586,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 		if err != nil {
 			return nil, false, reject("decode peer exchange req failed", err)
 		}
-		resp, err := buildPeerExchangeResp(r.Self, req.K)
+		resp, err := buildPeerExchangeResp(r.Self, req.K, r.getListenAddr())
 		if err != nil {
 			return nil, false, reject("peer exchange failed", err)
 		}
@@ -3017,7 +3057,7 @@ func BuildDeltaBZK(entries []proto.DeltaBEntry, ctx []byte) (*proto.ZKLinearProo
 	return buildDeltaZK(entries, ctx)
 }
 
-func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, error) {
+func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.PeerExchangeRespMsg, error) {
 	if self == nil || self.Peers == nil {
 		return proto.PeerExchangeRespMsg{}, fmt.Errorf("peer store unavailable")
 	}
@@ -3052,6 +3092,34 @@ func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, e
 		}
 		respPeers = append(respPeers, peerMsg)
 	}
+	if listenAddr != "" && len(self.PubKey) > 0 && len(respPeers) < k && isValidAddr(listenAddr) {
+		selfIDHex := hex.EncodeToString(self.ID[:])
+		dup := false
+		for _, p := range respPeers {
+			if p.NodeID == selfIDHex || p.Addr == listenAddr {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			respPeers = append(respPeers, proto.PeerExchangePeer{
+				Addr:   listenAddr,
+				NodeID: selfIDHex,
+				PubKey: hex.EncodeToString(self.PubKey),
+			})
+		}
+	}
+	if os.Getenv("WEB4_DEBUG") == "1" {
+		selfIncluded := false
+		selfIDHex := hex.EncodeToString(self.ID[:])
+		for _, p := range respPeers {
+			if p.NodeID == selfIDHex {
+				selfIncluded = true
+				break
+			}
+		}
+		fmt.Fprintf(os.Stderr, "peer_exchange_resp peers=%d self_included=%t addr=%s\n", len(respPeers), selfIncluded, listenAddr)
+	}
 	msg := proto.PeerExchangeRespMsg{
 		Type:         proto.MsgTypePeerExchangeResp,
 		ProtoVersion: proto.ProtoVersion,
@@ -3076,29 +3144,57 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 		return 0, fmt.Errorf("peer store unavailable")
 	}
 	added := 0
-	limit := len(resp.Peers)
-	if cap := peerExchangeCap(); limit > cap {
-		limit = cap
-	}
-	for i := 0; i < limit; i++ {
+	limit := pexInsertCap()
+	for i := 0; i < len(resp.Peers); i++ {
+		if limit > 0 && added >= limit {
+			break
+		}
 		p, err := decodePeerExchangePeer(resp.Peers[i])
 		if err != nil {
-			return added, err
+			continue
 		}
+		if !isValidAddr(p.Addr) {
+			continue
+		}
+		p.Source = "pex"
+		p.SubnetKey = peer.SubnetKeyForAddr(p.Addr)
 		if p.Addr != "" && self.Candidates != nil {
 			self.Candidates.Add(p.Addr)
 		}
 		if p.Addr != "" && self.Peers != nil {
 			_, _ = self.Peers.SetAddrUnverified(p, p.Addr, true)
+			self.Peers.PeerSeen(p.NodeID, p.Addr)
 		}
 		p.Addr = ""
 		persist := len(p.PubKey) > 0
 		if err := self.Peers.Upsert(p, persist); err != nil {
-			return added, err
+			continue
 		}
 		added++
 	}
+	if os.Getenv("WEB4_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "peer_exchange_apply peers=%d added=%d\n", len(resp.Peers), added)
+	}
 	return added, nil
+}
+
+func pexInsertCap() int {
+	cap := 64
+	if v, ok := envInt("WEB4_PEX_INSERT_MAX"); ok && v > 0 {
+		cap = v
+	}
+	if cap > maxPeerExchangeK {
+		return maxPeerExchangeK
+	}
+	return cap
+}
+
+func isValidAddr(addr string) bool {
+	if addr == "" {
+		return false
+	}
+	_, _, err := net.SplitHostPort(addr)
+	return err == nil
 }
 
 func decodePeerExchangePeer(w proto.PeerExchangePeer) (peer.Peer, error) {
