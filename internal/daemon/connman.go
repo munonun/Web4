@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"web4mvp/internal/crypto"
 	"web4mvp/internal/metrics"
 	"web4mvp/internal/network"
 	"web4mvp/internal/node"
@@ -26,21 +27,25 @@ const (
 	defaultPeertableMax    = 2048
 	defaultSubnetMax       = 32
 	outboundSuccessWindow  = 60 * time.Second
-	connManTick            = 5 * time.Second
 	backoffBase            = 2 * time.Second
 	backoffJitter          = 1 * time.Second
 )
+
+var connManTick = 5 * time.Second
 
 type connMan struct {
 	self      *node.Node
 	metrics   *metrics.Metrics
 	devTLS    bool
 	devTLSCA  string
+	root      string
 	mu        sync.Mutex
 	nextTry   map[[32]byte]time.Time
 	outbound  map[[32]byte]time.Time
 	rng       *rand.Rand
 	bootstrap []string
+	dialLog   map[[32]byte]time.Time
+	addrLog   map[string]time.Time
 }
 
 func startConnMan(ctx context.Context, r *Runner, devTLS bool) {
@@ -56,8 +61,16 @@ func newConnMan(r *Runner, devTLS bool) *connMan {
 	devTLSCA := ""
 	if devTLS {
 		path := filepath.Join(r.Root, "devtls_ca.pem")
-		if _, err := os.Stat(path); err == nil {
+		if envPath := os.Getenv("WEB4_DEVTLS_CA_PATH"); envPath != "" {
+			path = envPath
+		}
+		if fi, err := os.Stat(path); err == nil {
 			devTLSCA = path
+			if os.Getenv("WEB4_DEBUG") == "1" {
+				fmt.Fprintf(os.Stderr, "connman tls devtls_ca_path=%s exists=true size=%d\n", path, fi.Size())
+			}
+		} else if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(os.Stderr, "connman tls devtls_ca_path=%s exists=false size=0\n", path)
 		}
 	}
 	return &connMan{
@@ -65,16 +78,19 @@ func newConnMan(r *Runner, devTLS bool) *connMan {
 		metrics:   r.Metrics,
 		devTLS:    devTLS,
 		devTLSCA:  devTLSCA,
+		root:      r.Root,
 		nextTry:   make(map[[32]byte]time.Time),
 		outbound:  make(map[[32]byte]time.Time),
 		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		bootstrap: bootstrapAddrs(),
+		dialLog:   make(map[[32]byte]time.Time),
+		addrLog:   make(map[string]time.Time),
 	}
 }
 
 func (c *connMan) run(ctx context.Context) {
 	c.seedBootstrap()
-	ticker := time.NewTicker(connManTick)
+	ticker := time.NewTicker(connManTickDuration())
 	defer ticker.Stop()
 	for {
 		select {
@@ -82,6 +98,7 @@ func (c *connMan) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 			c.tickOutbound(ctx)
+			c.tickSeeds(ctx)
 		}
 	}
 }
@@ -155,6 +172,19 @@ func (c *connMan) tickPex(ctx context.Context) {
 	c.enforcePeertableMax()
 }
 
+func (c *connMan) tickSeeds(ctx context.Context) {
+	if c.self == nil || len(c.bootstrap) == 0 {
+		return
+	}
+	if c.self.Peers == nil {
+		return
+	}
+	if len(c.self.Peers.List()) > 0 {
+		return
+	}
+	c.sendPeerExchangePlain(ctx, c.bootstrap)
+}
+
 func (c *connMan) pickAndConnect(ctx context.Context, peers []peer.Peer, count int, explore bool) {
 	if count <= 0 {
 		return
@@ -176,6 +206,7 @@ func (c *connMan) pickAndConnect(ctx context.Context, peers []peer.Peer, count i
 			continue
 		}
 		if err := c.handshake(ctx, p.NodeID, p.Addr); err != nil {
+			c.logDialError(p.NodeID, err)
 			c.markFailure(p.NodeID)
 			continue
 		}
@@ -188,6 +219,12 @@ func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string) e
 	if c.self == nil {
 		return fmt.Errorf("missing node")
 	}
+	if c.metrics != nil {
+		c.metrics.IncDialAttemptsTotal()
+	}
+	if connManDialHook != nil {
+		connManDialHook()
+	}
 	hello1, err := c.self.BuildHello1(peerID)
 	if err != nil {
 		return err
@@ -199,11 +236,14 @@ func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string) e
 	if err := enforceTypeMax(proto.MsgTypeHello1, len(data)); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout())
 	defer cancel()
 	respData, err := network.ExchangeOnceWithContext(ctx, addr, data, false, c.devTLS, c.devTLSCA)
 	if err != nil {
 		return err
+	}
+	if c.metrics != nil {
+		c.metrics.IncDialSuccessTotal()
 	}
 	resp, err := proto.DecodeHello2Msg(respData)
 	if err != nil {
@@ -222,6 +262,7 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	if c.self == nil {
 		return fmt.Errorf("missing node")
 	}
+	c.ensurePubKey()
 	if !c.self.Sessions.Has(p.NodeID) {
 		if err := c.handshake(ctx, p.NodeID, p.Addr); err != nil {
 			c.markFailure(p.NodeID)
@@ -231,6 +272,7 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	}
 	if c.metrics != nil {
 		c.metrics.IncPexRequestsTotal()
+		c.metrics.IncPexReqSentTotal()
 	}
 	reqK := defaultPeerExchangeK
 	if cap := peerExchangeCap(); reqK > cap {
@@ -243,6 +285,10 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 		K:            reqK,
 	}
 	req.FromNodeID = hex.EncodeToString(c.self.ID[:])
+	req.PubKey = hex.EncodeToString(c.self.PubKey)
+	if req.PubKey == "" {
+		return fmt.Errorf("missing pubkey")
+	}
 	data, err := proto.EncodePeerExchangeReq(req)
 	if err != nil {
 		return err
@@ -254,7 +300,7 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout())
 	defer cancel()
 	respData, err := network.ExchangeOnceWithContext(ctx, p.Addr, secureReq, false, c.devTLS, c.devTLSCA)
 	if err != nil {
@@ -278,6 +324,7 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	}
 	if c.metrics != nil {
 		c.metrics.IncPexResponsesTotal()
+		c.metrics.IncPexRespRecvTotal()
 	}
 	if _, err := applyPeerExchangeResp(c.self, resp); err != nil {
 		return err
@@ -290,12 +337,15 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 	if c.self == nil {
 		return
 	}
+	c.ensurePubKey()
 	for _, addr := range addrs {
 		if !isValidAddr(addr) {
 			continue
 		}
 		if c.metrics != nil {
 			c.metrics.IncPexRequestsTotal()
+			c.metrics.IncPexReqSentTotal()
+			c.metrics.IncDialAttemptsTotal()
 		}
 		reqK := defaultPeerExchangeK
 		if cap := peerExchangeCap(); reqK > cap {
@@ -308,6 +358,7 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			K:            reqK,
 		}
 		req.FromNodeID = hex.EncodeToString(c.self.ID[:])
+		req.PubKey = hex.EncodeToString(c.self.PubKey)
 		data, err := proto.EncodePeerExchangeReq(req)
 		if err != nil {
 			continue
@@ -315,30 +366,41 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		if err := enforceTypeMax(proto.MsgTypePeerExchangeReq, len(data)); err != nil {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
-		respData, err := network.ExchangeOnceWithContext(ctx, addr, data, false, c.devTLS, c.devTLSCA)
+		reqCtx, cancel := context.WithTimeout(ctx, dialTimeout())
+		respData, err := network.ExchangeOnceWithContext(reqCtx, addr, data, false, c.devTLS, c.devTLSCA)
 		cancel()
 		if err != nil {
-			if os.Getenv("WEB4_DEBUG") == "1" {
-				fmt.Fprintf(os.Stderr, "pex plain exchange failed addr=%s err=%v\n", addr, err)
-			}
+			c.logPexError(addr, err)
 			continue
+		}
+		if c.metrics != nil {
+			c.metrics.IncDialSuccessTotal()
 		}
 		resp, err := proto.DecodePeerExchangeResp(respData)
 		if err != nil {
-			if os.Getenv("WEB4_DEBUG") == "1" {
-				fmt.Fprintf(os.Stderr, "pex plain decode failed addr=%s err=%v\n", addr, err)
-			}
+			c.logPexError(addr, err)
 			continue
 		}
 		if c.metrics != nil {
 			c.metrics.IncPexResponsesTotal()
+			c.metrics.IncPexRespRecvTotal()
 		}
 		if _, err := applyPeerExchangeResp(c.self, resp); err != nil {
 			continue
 		}
 		c.promoteSeed(resp, addr)
 	}
+}
+
+func (c *connMan) ensurePubKey() {
+	if c.self == nil || len(c.self.PubKey) > 0 || c.root == "" {
+		return
+	}
+	pub, _, err := crypto.LoadKeypair(c.root)
+	if err != nil || len(pub) == 0 {
+		return
+	}
+	c.self.PubKey = pub
 }
 
 func (c *connMan) promoteSeed(resp proto.PeerExchangeRespMsg, seedAddr string) {
@@ -455,6 +517,22 @@ func nextBackoffDuration(self *node.Node, id [32]byte, rng *rand.Rand) time.Dura
 	if failCount < 0 {
 		failCount = 0
 	}
+	if failCount <= 0 {
+		backoff := 200 * time.Millisecond
+		if backoff > maxBackoff() {
+			return maxBackoff()
+		}
+		jitter := time.Duration(rng.Int63n(int64(backoffJitter)))
+		return backoff + jitter
+	}
+	if failCount <= 3 {
+		backoff := 200 * time.Millisecond * time.Duration(1<<(failCount-1))
+		if backoff > maxBackoff() {
+			return maxBackoff()
+		}
+		jitter := time.Duration(rng.Int63n(int64(backoffJitter)))
+		return backoff + jitter
+	}
 	backoff := backoffBase * time.Duration(1<<min(failCount, 10))
 	if backoff > maxBackoff() {
 		backoff = maxBackoff()
@@ -484,11 +562,80 @@ func maxBackoff() time.Duration {
 	return time.Duration(defaultMaxBackoffSec) * time.Second
 }
 
+var connManDialHook func()
+
+const dialLogTTL = 30 * time.Second
+
+func (c *connMan) logDialError(id [32]byte, err error) {
+	if os.Getenv("WEB4_DEBUG") != "1" || err == nil {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	last := c.dialLog[id]
+	if now.Sub(last) < dialLogTTL {
+		c.mu.Unlock()
+		return
+	}
+	c.dialLog[id] = now
+	c.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "connman dial failed node=%x err=%v\n", id[:], err)
+}
+
+func (c *connMan) logAddrError(addr string, err error) {
+	if os.Getenv("WEB4_DEBUG") != "1" || err == nil || addr == "" {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	last := c.addrLog[addr]
+	if now.Sub(last) < dialLogTTL {
+		c.mu.Unlock()
+		return
+	}
+	c.addrLog[addr] = now
+	c.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "connman dial failed addr=%s err=%v\n", addr, err)
+}
+
+func (c *connMan) logPexError(addr string, err error) {
+	if err == nil || addr == "" {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	last := c.addrLog[addr]
+	if now.Sub(last) < dialLogTTL {
+		c.mu.Unlock()
+		return
+	}
+	c.addrLog[addr] = now
+	c.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "pex dial failed addr=%s err=%v\n", addr, err)
+}
+
 func pexInterval() time.Duration {
+	if v, ok := envInt("WEB4_PEX_INTERVAL_MS"); ok && v > 0 {
+		return time.Duration(v) * time.Millisecond
+	}
 	if v, ok := envInt("WEB4_PEX_INTERVAL_SEC"); ok && v > 0 {
 		return time.Duration(v) * time.Second
 	}
 	return time.Duration(defaultPexIntervalSec) * time.Second
+}
+
+func connManTickDuration() time.Duration {
+	if v, ok := envInt("WEB4_CONNMAN_TICK_MS"); ok && v > 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return connManTick
+}
+
+func dialTimeout() time.Duration {
+	if v, ok := envInt("WEB4_DIAL_TIMEOUT_MS"); ok && v > 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return 8 * time.Second
 }
 
 func peertableMax() int {

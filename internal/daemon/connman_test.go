@@ -30,16 +30,22 @@ func TestNextBackoffDurationMonotonic(t *testing.T) {
 		t.Fatalf("upsert peer: %v", err)
 	}
 	rng := rand.New(zeroSource{})
-	prev := time.Duration(0)
-	for i := 0; i < 6; i++ {
+	expected := []time.Duration{
+		200 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+		800 * time.Millisecond,
+		5 * time.Second,
+		5 * time.Second,
+	}
+	for i := 0; i < len(expected); i++ {
 		if i > 0 {
 			self.Peers.PeerFail(id)
 		}
 		d := nextBackoffDuration(self, id, rng)
-		if d < prev {
-			t.Fatalf("expected monotonic backoff, got %v then %v", prev, d)
+		if d != expected[i] {
+			t.Fatalf("unexpected backoff at fail=%d: got %v want %v", i, d, expected[i])
 		}
-		prev = d
 		if d > 5*time.Second+backoffJitter {
 			t.Fatalf("backoff exceeded cap: %v", d)
 		}

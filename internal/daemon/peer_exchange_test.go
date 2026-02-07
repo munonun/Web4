@@ -92,3 +92,75 @@ func TestBuildPeerExchangeRespCapAndDeterministicShuffle(t *testing.T) {
 		}
 	}
 }
+
+func TestBootstrapDiscoveryFromUnverifiedPex(t *testing.T) {
+	t.Setenv("WEB4_NODE_MODE", "bootstrap")
+	bootstrap, err := node.NewNode(t.TempDir(), node.Options{})
+	if err != nil {
+		t.Fatalf("new bootstrap node: %v", err)
+	}
+	r := &Runner{Self: bootstrap}
+
+	pubA, _, err := crypto.GenKeypair()
+	if err != nil {
+		t.Fatalf("gen key A: %v", err)
+	}
+	idA := node.DeriveNodeID(pubA)
+	reqA := proto.PeerExchangeReqMsg{
+		Type:         proto.MsgTypePeerExchangeReq,
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		K:            8,
+		FromNodeID:   hex.EncodeToString(idA[:]),
+	}
+	dataA, err := proto.EncodePeerExchangeReq(reqA)
+	if err != nil {
+		t.Fatalf("encode req A: %v", err)
+	}
+	if _, _, err := r.recvDataWithResponse(dataA, "127.0.0.1:1111"); err != nil {
+		t.Fatalf("recv req A: %v", err)
+	}
+
+	pubB, _, err := crypto.GenKeypair()
+	if err != nil {
+		t.Fatalf("gen key B: %v", err)
+	}
+	idB := node.DeriveNodeID(pubB)
+	reqB := proto.PeerExchangeReqMsg{
+		Type:         proto.MsgTypePeerExchangeReq,
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		K:            8,
+		FromNodeID:   hex.EncodeToString(idB[:]),
+	}
+	dataB, err := proto.EncodePeerExchangeReq(reqB)
+	if err != nil {
+		t.Fatalf("encode req B: %v", err)
+	}
+	if _, _, err := r.recvDataWithResponse(dataB, "127.0.0.1:2222"); err != nil {
+		t.Fatalf("recv req B: %v", err)
+	}
+
+	resp, err := buildPeerExchangeResp(bootstrap, 10, "")
+	if err != nil {
+		t.Fatalf("build resp: %v", err)
+	}
+
+	client, err := node.NewNode(t.TempDir(), node.Options{})
+	if err != nil {
+		t.Fatalf("new client node: %v", err)
+	}
+	if _, err := applyPeerExchangeResp(client, resp); err != nil {
+		t.Fatalf("apply resp: %v", err)
+	}
+	foundB := false
+	for _, p := range client.Peers.List() {
+		if p.NodeID == idB {
+			foundB = true
+			break
+		}
+	}
+	if !foundB {
+		t.Fatalf("expected peer B from bootstrap PEX")
+	}
+}

@@ -1454,6 +1454,19 @@ wait_metric_gt() {
 	done
 }
 
+wait_file_nonempty() {
+  local path="$1"
+  local timeout="$2"
+  local deadline=$(( $(date +%s) + timeout ))
+  while [ $(date +%s) -lt $deadline ]; do
+    if [ -s "$path" ]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 1
+}
+
 wait_peer_non_bootstrap() {
 	local home="$1"
 	local bootstrap_addr="$2"
@@ -1536,46 +1549,54 @@ peer_b_log="${TMPWORK}/peer_b_server.log"
 bootstrap_addr="127.0.0.1:${PORT_BOOT}"
 
 echo "Starting QUIC bootstrap node: env HOME=${TMPA} WEB4_NODE_MODE=bootstrap ${WEB4_NODE_BIN} run --devtls --addr ${bootstrap_addr}"
-env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_PEX_INTERVAL_SEC=2 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
+env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_PEX_INTERVAL_MS=500 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
 SERVER_PID_BOOT=$!
 LISTENER_PIDS+=("${SERVER_PID_BOOT}")
 
 wait_quic_ready "${bootstrap_log}" "check 7 (bootstrap discovery): bootstrap did not start"
+if ! wait_file_nonempty "${TMPA}/.web4mvp/devtls_ca.pem" 5; then
+\tbootstrap_debug_dump "bootstrap devtls ca not ready"
+\tquic_fail "check 7 (bootstrap discovery): bootstrap devtls ca not ready"
+fi
+BOOTSTRAP_CA="${TMPA}/.web4mvp/devtls_ca.pem"
 
 echo "Starting QUIC peer A: env HOME=${TMPB} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_A}"
-env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
+env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${BOOTSTRAP_CA}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_MS=500 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
 SERVER_PID_PEER_A=$!
 LISTENER_PIDS+=("${SERVER_PID_PEER_A}")
 
 echo "Starting QUIC peer B: env HOME=${TMPC} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_B}"
-env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
+env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${BOOTSTRAP_CA}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_MS=500 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
 SERVER_PID_PEER_B=$!
 LISTENER_PIDS+=("${SERVER_PID_PEER_B}")
 
 wait_quic_ready "${peer_a_log}" "check 7 (bootstrap discovery): peer A did not start"
 wait_quic_ready "${peer_b_log}" "check 7 (bootstrap discovery): peer B did not start"
+if ! wait_file_nonempty "${TMPB}/.web4mvp/devtls_ca.pem" 5; then
+\tbootstrap_debug_dump "peer A devtls ca not ready"
+\tquic_fail "check 7 (bootstrap discovery): peer A devtls ca not ready"
+fi
+if ! wait_file_nonempty "${TMPC}/.web4mvp/devtls_ca.pem" 5; then
+\tbootstrap_debug_dump "peer B devtls ca not ready"
+\tquic_fail "check 7 (bootstrap discovery): peer B devtls ca not ready"
+fi
 
 deadline=$(( $(date +%s) + 30 ))
-peer_ok=""
-if wait_metric_gt "${TMPB}" "peertable_size" 1 "${deadline}" && wait_peer_non_bootstrap "${TMPB}" "${bootstrap_addr}" "${deadline}"; then
-	peer_ok="A"
-elif wait_metric_gt "${TMPC}" "peertable_size" 1 "${deadline}" && wait_peer_non_bootstrap "${TMPC}" "${bootstrap_addr}" "${deadline}"; then
-	peer_ok="B"
+if ! wait_metric_gt "${TMPB}" "peertable_size" 1 "${deadline}"; then
+	bootstrap_debug_dump "peer A peertable did not grow"
+	quic_fail "check 7 (bootstrap discovery): peer A peertable did not grow"
 fi
-if [ -z "${peer_ok}" ]; then
-	bootstrap_debug_dump "peer discovery did not grow peertable"
-	quic_fail "check 7 (bootstrap discovery): peertable did not grow"
+if ! wait_metric_gt "${TMPC}" "peertable_size" 1 "${deadline}"; then
+	bootstrap_debug_dump "peer B peertable did not grow"
+	quic_fail "check 7 (bootstrap discovery): peer B peertable did not grow"
 fi
-if [ "${peer_ok}" = "A" ]; then
-	if ! wait_metric_gt "${TMPB}" "outbound_connected" 0 "${deadline}"; then
-		bootstrap_debug_dump "peer A outbound not observed"
-		quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
-	fi
-else
-	if ! wait_metric_gt "${TMPC}" "outbound_connected" 0 "${deadline}"; then
-		bootstrap_debug_dump "peer B outbound not observed"
-		quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
-	fi
+if ! wait_metric_gt "${TMPB}" "outbound_connected" 0 "${deadline}"; then
+	bootstrap_debug_dump "peer A outbound not observed"
+	quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
+fi
+if ! wait_metric_gt "${TMPC}" "outbound_connected" 0 "${deadline}"; then
+	bootstrap_debug_dump "peer B outbound not observed"
+	quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
 fi
 
 kill "${SERVER_PID_BOOT}" 2>/dev/null || true

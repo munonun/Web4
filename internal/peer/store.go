@@ -31,9 +31,9 @@ const (
 )
 
 type Peer struct {
-	NodeID [32]byte
-	PubKey []byte
-	Addr   string
+	NodeID          [32]byte
+	PubKey          []byte
+	Addr            string
 	LastSeenUnix    int64
 	LastSuccessUnix int64
 	FailCount       int
@@ -267,6 +267,52 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 		Score:           p.Score,
 	}
 	return store.AppendJSONL(s.path, rec)
+}
+
+// UpsertUnverified stores a peer without requiring a pubkey. It never persists to disk.
+// Intended for bootstrap/PEX discovery before keys are known.
+func (s *Store) UpsertUnverified(p Peer) error {
+	if isZeroNodeID(p.NodeID) {
+		return fmt.Errorf("missing node_id")
+	}
+	now := time.Now()
+	p.LastSeenUnix = now.Unix()
+	s.mu.Lock()
+	s.pruneLocked()
+	key := keyForPeer(p)
+	var ent *entry
+	var entEl *list.Element
+	if el, ok := s.hot[key]; ok {
+		entEl = el
+		ent = el.Value.(*entry)
+	}
+	if ent == nil {
+		if s.cap > 0 && len(s.hot) >= s.cap {
+			s.evictLocked(len(s.hot) - s.cap + 1)
+		}
+		ent = &entry{key: key, peer: Peer{NodeID: p.NodeID}, expiresAt: now.Add(s.ttl)}
+		entEl = s.order.PushFront(ent)
+		s.hot[key] = entEl
+	} else {
+		ent.peer.NodeID = p.NodeID
+		mergePeerMeta(&ent.peer, p, now)
+	}
+	if p.Addr != "" {
+		if err := s.setAddrLocked(ent, p.Addr, now, false, false); err != nil {
+			s.mu.Unlock()
+			return err
+		}
+	}
+	ent.peer.Source = p.Source
+	if ent.peer.SubnetKey == "" {
+		ent.peer.SubnetKey = p.SubnetKey
+	}
+	ent.expiresAt = now.Add(s.ttl)
+	if entEl != nil {
+		s.order.MoveToFront(entEl)
+	}
+	s.mu.Unlock()
+	return nil
 }
 
 func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, verified bool, persist bool) (bool, error) {

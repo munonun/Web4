@@ -76,6 +76,11 @@ func clientTLSConfig(insecure bool, devTLS bool, devTLSCAPath string) (*tls.Conf
 		}, nil
 	}
 	if devTLS {
+		if envPath := os.Getenv("WEB4_DEVTLS_CA_PATH"); envPath != "" {
+			if fi, err := os.Stat(envPath); err == nil && fi.Size() > 0 {
+				devTLSCAPath = envPath
+			}
+		}
 		var pool *x509.CertPool
 		var err error
 		if devTLSCAPath != "" {

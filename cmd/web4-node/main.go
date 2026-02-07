@@ -164,6 +164,12 @@ func runStatus(args []string, stdout, _ io.Writer) int {
 	outboundTarget := envIntDefault("WEB4_OUTBOUND_TARGET", 12)
 	exploreSlots := envIntDefault("WEB4_OUTBOUND_EXPLORE", 2)
 	pexInterval := envIntDefault("WEB4_PEX_INTERVAL_SEC", 20)
+	if v := envIntDefault("WEB4_PEX_INTERVAL_MS", 0); v > 0 {
+		pexInterval = v / 1000
+		if pexInterval == 0 {
+			pexInterval = 1
+		}
+	}
 	peertableMax := envIntDefault("WEB4_PEERTABLE_MAX", 2048)
 	subnetMax := envIntDefault("WEB4_SUBNET_MAX", 32)
 	members := self.Members.List()
@@ -177,6 +183,10 @@ func runStatus(args []string, stdout, _ io.Writer) int {
 	color.New(color.FgHiBlack).Fprintf(stdout, "  current conns: %d streams: %d\n", snap.CurrentConns, snap.CurrentStreams)
 	if snap.PeerTableSize > 0 || snap.OutboundConnected > 0 || snap.InboundConnected > 0 {
 		color.New(color.FgHiBlack).Fprintf(stdout, "  observed peertable: %d outbound: %d inbound: %d\n", snap.PeerTableSize, snap.OutboundConnected, snap.InboundConnected)
+	}
+	if snap.DialAttemptsTotal > 0 || snap.DialSuccessTotal > 0 || snap.PexReqSentTotal > 0 || snap.PexRespRecvTotal > 0 {
+		color.New(color.FgHiBlack).Fprintf(stdout, "  dial attempts: %d success: %d pex sent: %d recv: %d\n",
+			snap.DialAttemptsTotal, snap.DialSuccessTotal, snap.PexReqSentTotal, snap.PexRespRecvTotal)
 	}
 	color.New(color.FgHiBlack).Fprintf(stdout, "  members: %d (gossip=%d contract=%d admin=%d)\n", len(members), scopeCounts.gossip, scopeCounts.contract, scopeCounts.admin)
 	color.New(color.FgHiBlack).Fprintf(stdout, "  Δ verified: %d\n", snap.Delta.Verified)

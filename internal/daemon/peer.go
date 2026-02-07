@@ -185,54 +185,52 @@ func (r *Runner) HandleRaw(data []byte) error {
 }
 
 func (r *Runner) Run(addr string, devTLS bool) error {
-	if r == nil {
-		return fmt.Errorf("missing runner")
-	}
-	r.StartSnapshotWriter(time.Second)
-	ctx := context.Background()
-	startConnMan(ctx, r, devTLS)
-	err := network.ListenAndServeWithResponderFrom(addr, nil, devTLS, func(senderAddr string, data []byte) ([]byte, error) {
-		resp, _, err := r.recvDataWithResponse(data, senderAddr)
-		if err != nil {
-			if os.Getenv("WEB4_DEBUG") == "1" {
-				fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
-			}
-			return nil, err
-		}
-		return resp, nil
-	})
-	r.StopSnapshotWriter()
-	return err
+	return r.RunWithContext(context.Background(), addr, devTLS, nil)
 }
 
 func (r *Runner) RunWithContext(ctx context.Context, addr string, devTLS bool, ready chan<- string) error {
 	if r == nil {
 		return fmt.Errorf("missing runner")
 	}
-	r.setListenAddr(addr)
 	r.StartSnapshotWriter(time.Second)
-	startConnMan(ctx, r, devTLS)
-	readyCh := ready
-	if ready != nil {
-		internalReady := make(chan string, 1)
-		readyCh = internalReady
-		go func() {
-			if actual, ok := <-internalReady; ok {
-				r.setListenAddr(actual)
-				ready <- actual
+	internalReady := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- network.ListenAndServeWithResponderFromContext(ctx, addr, internalReady, devTLS, func(senderAddr string, data []byte) ([]byte, error) {
+			resp, _, err := r.recvDataWithResponse(data, senderAddr)
+			if err != nil {
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
+				}
+				return nil, err
 			}
-		}()
-	}
-	err := network.ListenAndServeWithResponderFromContext(ctx, addr, readyCh, devTLS, func(senderAddr string, data []byte) ([]byte, error) {
-		resp, _, err := r.recvDataWithResponse(data, senderAddr)
-		if err != nil {
-			if os.Getenv("WEB4_DEBUG") == "1" {
-				fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
+			return resp, nil
+		})
+	}()
+	select {
+	case actual := <-internalReady:
+		r.setListenAddr(actual)
+		if ready != nil {
+			select {
+			case ready <- actual:
+			default:
 			}
-			return nil, err
 		}
-		return resp, nil
-	})
+		if devTLS {
+			if err := waitDevTLSCA(ctx, r.Root, 3*time.Second); err != nil {
+				r.StopSnapshotWriter()
+				return err
+			}
+		}
+		startConnManAfterReady(ctx, r, devTLS)
+	case err := <-errCh:
+		r.StopSnapshotWriter()
+		return err
+	case <-ctx.Done():
+		r.StopSnapshotWriter()
+		return ctx.Err()
+	}
+	err := <-errCh
 	r.StopSnapshotWriter()
 	return err
 }
@@ -254,6 +252,47 @@ func (r *Runner) getListenAddr() string {
 	addr := r.listenAddr
 	r.listenMu.RUnlock()
 	return addr
+}
+
+func startConnManAfterReady(ctx context.Context, r *Runner, devTLS bool) {
+	ready := make(chan struct{})
+	close(ready)
+	startConnManWithReady(ctx, r, devTLS, ready)
+}
+
+func startConnManWithReady(ctx context.Context, r *Runner, devTLS bool, ready <-chan struct{}) {
+	if r == nil || r.Self == nil || r.Self.Peers == nil {
+		return
+	}
+	go func() {
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			return
+		}
+		startConnMan(ctx, r, devTLS)
+	}()
+}
+
+func waitDevTLSCA(ctx context.Context, root string, timeout time.Duration) error {
+	if root == "" {
+		return fmt.Errorf("missing root for devtls ca")
+	}
+	path := filepath.Join(root, "devtls_ca.pem")
+	deadline := time.Now().Add(timeout)
+	for {
+		if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("devtls ca not ready")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func ensureKeypair(root string) error {
@@ -488,12 +527,14 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 	}
 
 	if wasSecure {
-		if scope, ok := requiredMemberScope(hdr.Type); ok {
-			if r.Self.Members == nil || !r.Self.Members.HasScope(secureFromID, scope) {
-				if os.Getenv("WEB4_DEBUG") == "1" {
-					fmt.Fprintf(os.Stderr, "recv drop: membership_gate type=%s sender=%x scope=%d\n", hdr.Type, secureFromID[:], scope)
+		if nodeMode() != nodeModeBootstrap || !isBootstrapDiscoveryType(hdr.Type) {
+			if scope, ok := requiredMemberScope(hdr.Type); ok {
+				if r.Self.Members == nil || !r.Self.Members.HasScope(secureFromID, scope) {
+					if os.Getenv("WEB4_DEBUG") == "1" {
+						fmt.Fprintf(os.Stderr, "recv drop: membership_gate type=%s sender=%x scope=%d\n", hdr.Type, secureFromID[:], scope)
+					}
+					return nil, false, reject("membership_gate", fmt.Errorf("sender not member"))
 				}
-				return nil, false, reject("membership_gate", fmt.Errorf("sender not member"))
 			}
 		}
 	}
@@ -585,6 +626,40 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 		req, err := proto.DecodePeerExchangeReq(data)
 		if err != nil {
 			return nil, false, reject("decode peer exchange req failed", err)
+		}
+		if senderAddr != "" && r.Self != nil && r.Self.Peers != nil {
+			var fromID [32]byte
+			if req.FromNodeID != "" {
+				if id, err := decodeNodeIDHex(req.FromNodeID); err == nil {
+					fromID = id
+				}
+			}
+			if req.PubKey != "" {
+				pub, err := hex.DecodeString(req.PubKey)
+				if err == nil && len(pub) > 0 && isValidAddr(senderAddr) {
+					if isZeroNodeID(fromID) {
+						fromID = node.DeriveNodeID(pub)
+					}
+					if !isZeroNodeID(fromID) {
+						p := peer.Peer{NodeID: fromID, PubKey: pub, Source: "pex", SubnetKey: peer.SubnetKeyForAddr(senderAddr)}
+						_, _ = r.Self.Peers.SetAddrUnverified(p, senderAddr, true)
+						r.Self.Peers.PeerSeen(fromID, senderAddr)
+						p.Addr = ""
+						_ = r.Self.Peers.Upsert(p, true)
+						if r.Self.Candidates != nil {
+							r.Self.Candidates.Add(senderAddr)
+						}
+					}
+				} else if os.Getenv("WEB4_DEBUG") == "1" && err != nil {
+					fmt.Fprintf(os.Stderr, "peer_exchange_req invalid pubkey: %v\n", err)
+				}
+			} else if nodeMode() == nodeModeBootstrap && !isZeroNodeID(fromID) && isValidAddr(senderAddr) {
+				p := peer.Peer{NodeID: fromID, Addr: senderAddr, Source: "pex", SubnetKey: peer.SubnetKeyForAddr(senderAddr)}
+				_ = r.Self.Peers.UpsertUnverified(p)
+				if r.Self.Candidates != nil {
+					r.Self.Candidates.Add(senderAddr)
+				}
+			}
 		}
 		resp, err := buildPeerExchangeResp(r.Self, req.K, r.getListenAddr())
 		if err != nil {
@@ -1931,6 +2006,15 @@ func requiredMemberScope(msgType string) (uint32, bool) {
 	}
 }
 
+func isBootstrapDiscoveryType(msgType string) bool {
+	switch msgType {
+	case proto.MsgTypeHello1, proto.MsgTypeHello2, proto.MsgTypePeerExchangeReq, proto.MsgTypePeerExchangeResp:
+		return true
+	default:
+		return false
+	}
+}
+
 func verifySignedMessage(data []byte, msgType string, self *node.Node) *recvError {
 	_ = data
 	_ = msgType
@@ -3069,7 +3153,8 @@ func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.Pee
 		k = cap
 	}
 	peers := self.Peers.List()
-	if nodeMode() == nodeModeBootstrap {
+	bootstrapMode := nodeMode() == nodeModeBootstrap
+	if bootstrapMode {
 		rng := peerExchangeRand()
 		rng.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
 	}
@@ -3078,17 +3163,25 @@ func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.Pee
 		if len(respPeers) >= k {
 			break
 		}
-		if p.Addr == "" || len(p.PubKey) == 0 {
+		if p.Addr == "" {
+			continue
+		}
+		if len(p.PubKey) == 0 && !bootstrapMode {
 			continue
 		}
 		id := p.NodeID
 		if isZeroNodeID(id) {
+			if len(p.PubKey) == 0 {
+				continue
+			}
 			id = node.DeriveNodeID(p.PubKey)
 		}
 		peerMsg := proto.PeerExchangePeer{
 			Addr:   p.Addr,
 			NodeID: hex.EncodeToString(id[:]),
-			PubKey: hex.EncodeToString(p.PubKey),
+		}
+		if len(p.PubKey) > 0 {
+			peerMsg.PubKey = hex.EncodeToString(p.PubKey)
 		}
 		respPeers = append(respPeers, peerMsg)
 	}
@@ -3161,14 +3254,19 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 		if p.Addr != "" && self.Candidates != nil {
 			self.Candidates.Add(p.Addr)
 		}
-		if p.Addr != "" && self.Peers != nil {
-			_, _ = self.Peers.SetAddrUnverified(p, p.Addr, true)
-			self.Peers.PeerSeen(p.NodeID, p.Addr)
-		}
-		p.Addr = ""
-		persist := len(p.PubKey) > 0
-		if err := self.Peers.Upsert(p, persist); err != nil {
-			continue
+		if len(p.PubKey) == 0 {
+			if err := self.Peers.UpsertUnverified(p); err != nil {
+				continue
+			}
+		} else {
+			if p.Addr != "" && self.Peers != nil {
+				_, _ = self.Peers.SetAddrUnverified(p, p.Addr, true)
+				self.Peers.PeerSeen(p.NodeID, p.Addr)
+			}
+			p.Addr = ""
+			if err := self.Peers.Upsert(p, true); err != nil {
+				continue
+			}
 		}
 		added++
 	}

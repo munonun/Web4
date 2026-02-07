@@ -19,6 +19,7 @@ type PeerExchangeReqMsg struct {
 	Suite        string `json:"suite"`
 	K            int    `json:"k"`
 	FromNodeID   string `json:"from_node_id,omitempty"`
+	PubKey       string `json:"pubkey,omitempty"`
 	SigFrom      string `json:"sig_from,omitempty"`
 }
 

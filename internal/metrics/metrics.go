@@ -30,6 +30,10 @@ type Snapshot struct {
 	InboundConnected   uint64            `json:"inbound_connected"`
 	PexRequestsTotal   uint64            `json:"pex_requests_total"`
 	PexResponsesTotal  uint64            `json:"pex_responses_total"`
+	DialAttemptsTotal  uint64            `json:"dial_attempts_total"`
+	DialSuccessTotal   uint64            `json:"dial_success_total"`
+	PexReqSentTotal    uint64            `json:"pex_req_sent_total"`
+	PexRespRecvTotal   uint64            `json:"pex_resp_recv_total"`
 	EvictionCountTotal uint64            `json:"eviction_count_total"`
 }
 
@@ -56,6 +60,10 @@ type Metrics struct {
 	gossipRelayed      atomic.Uint64
 	pexRequestsTotal   atomic.Uint64
 	pexResponsesTotal  atomic.Uint64
+	dialAttemptsTotal  atomic.Uint64
+	dialSuccessTotal   atomic.Uint64
+	pexReqSentTotal    atomic.Uint64
+	pexRespRecvTotal   atomic.Uint64
 	evictionCountTotal atomic.Uint64
 	recent             *DeltaRecent
 	mu                 sync.Mutex
@@ -114,6 +122,22 @@ func (m *Metrics) IncPexRequestsTotal() {
 
 func (m *Metrics) IncPexResponsesTotal() {
 	m.pexResponsesTotal.Add(1)
+}
+
+func (m *Metrics) IncDialAttemptsTotal() {
+	m.dialAttemptsTotal.Add(1)
+}
+
+func (m *Metrics) IncDialSuccessTotal() {
+	m.dialSuccessTotal.Add(1)
+}
+
+func (m *Metrics) IncPexReqSentTotal() {
+	m.pexReqSentTotal.Add(1)
+}
+
+func (m *Metrics) IncPexRespRecvTotal() {
+	m.pexRespRecvTotal.Add(1)
 }
 
 func (m *Metrics) IncEvictionCountTotal() {
@@ -213,6 +237,10 @@ func (m *Metrics) Snapshot() Snapshot {
 		InboundConnected:   m.inboundConnected.Load(),
 		PexRequestsTotal:   m.pexRequestsTotal.Load(),
 		PexResponsesTotal:  m.pexResponsesTotal.Load(),
+		DialAttemptsTotal:  m.dialAttemptsTotal.Load(),
+		DialSuccessTotal:   m.dialSuccessTotal.Load(),
+		PexReqSentTotal:    m.pexReqSentTotal.Load(),
+		PexRespRecvTotal:   m.pexRespRecvTotal.Load(),
 		EvictionCountTotal: m.evictionCountTotal.Load(),
 	}
 }
