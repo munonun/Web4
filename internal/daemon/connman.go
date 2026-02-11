@@ -44,6 +44,7 @@ type connMan struct {
 	outbound  map[[32]byte]time.Time
 	rng       *rand.Rand
 	bootstrap []string
+	bootPeers []bootstrapPeer
 	dialLog   map[[32]byte]time.Time
 	addrLog   map[string]time.Time
 }
@@ -83,6 +84,7 @@ func newConnMan(r *Runner, devTLS bool) *connMan {
 		outbound:  make(map[[32]byte]time.Time),
 		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
 		bootstrap: bootstrapAddrs(),
+		bootPeers: bootstrapPeers(),
 		dialLog:   make(map[[32]byte]time.Time),
 		addrLog:   make(map[string]time.Time),
 	}
@@ -90,6 +92,7 @@ func newConnMan(r *Runner, devTLS bool) *connMan {
 
 func (c *connMan) run(ctx context.Context) {
 	c.seedBootstrap()
+	c.tickSeeds(ctx)
 	ticker := time.NewTicker(connManTickDuration())
 	defer ticker.Stop()
 	for {
@@ -126,6 +129,29 @@ func (c *connMan) seedBootstrap() {
 			continue
 		}
 		c.self.Candidates.Add(addr)
+		if c.self.Peers != nil {
+			p := peer.Peer{
+				NodeID:    bootstrapSeedNodeID(addr),
+				Addr:      addr,
+				Source:    "seed",
+				SubnetKey: peer.SubnetKeyForAddr(addr),
+			}
+			_ = c.self.Peers.UpsertUnverified(p)
+		}
+	}
+	if c.self.Peers != nil {
+		for _, bp := range c.bootPeers {
+			if bp.addr == "" || isZeroNodeID(bp.id) || !isValidAddr(bp.addr) {
+				continue
+			}
+			p := peer.Peer{
+				NodeID:    bp.id,
+				Addr:      bp.addr,
+				Source:    "seed",
+				SubnetKey: peer.SubnetKeyForAddr(bp.addr),
+			}
+			_ = c.self.Peers.UpsertUnverified(p)
+		}
 	}
 }
 
@@ -157,6 +183,17 @@ func (c *connMan) tickPex(ctx context.Context) {
 		return
 	}
 	peers := c.self.Peers.ListPeersRanked(64, peer.PeerFilter{AllowNoAddr: false})
+	if c.self.Sessions != nil {
+		connected := make([]peer.Peer, 0, len(peers))
+		for _, p := range peers {
+			if c.self.Sessions.Has(p.NodeID) {
+				connected = append(connected, p)
+			}
+		}
+		if len(connected) > 0 {
+			peers = connected
+		}
+	}
 	if len(peers) == 0 && len(c.bootstrap) == 0 {
 		return
 	}
@@ -179,7 +216,10 @@ func (c *connMan) tickSeeds(ctx context.Context) {
 	if c.self.Peers == nil {
 		return
 	}
-	if len(c.self.Peers.List()) > 0 {
+	if len(c.self.Peers.ListPeersRanked(1, peer.PeerFilter{AllowNoAddr: false, Source: "pex"})) > 0 {
+		return
+	}
+	if len(c.self.Peers.ListPeersRanked(1, peer.PeerFilter{AllowNoAddr: false, Source: "manual"})) > 0 {
 		return
 	}
 	c.sendPeerExchangePlain(ctx, c.bootstrap)
@@ -517,28 +557,17 @@ func nextBackoffDuration(self *node.Node, id [32]byte, rng *rand.Rand) time.Dura
 	if failCount < 0 {
 		failCount = 0
 	}
-	if failCount <= 0 {
-		backoff := 200 * time.Millisecond
-		if backoff > maxBackoff() {
-			return maxBackoff()
-		}
-		jitter := time.Duration(rng.Int63n(int64(backoffJitter)))
-		return backoff + jitter
+	shift := failCount
+	if shift > 30 {
+		shift = 30
 	}
-	if failCount <= 3 {
-		backoff := 200 * time.Millisecond * time.Duration(1<<(failCount-1))
-		if backoff > maxBackoff() {
-			return maxBackoff()
-		}
-		jitter := time.Duration(rng.Int63n(int64(backoffJitter)))
-		return backoff + jitter
-	}
-	backoff := backoffBase * time.Duration(1<<min(failCount, 10))
-	if backoff > maxBackoff() {
-		backoff = maxBackoff()
-	}
+	backoff := backoffBase * time.Duration(1<<shift)
 	jitter := time.Duration(rng.Int63n(int64(backoffJitter)))
-	return backoff + jitter
+	raw := backoff + jitter
+	if raw > maxBackoff() {
+		return maxBackoff()
+	}
+	return raw
 }
 
 func outboundTarget() int {
@@ -670,6 +699,47 @@ func bootstrapAddrs() []string {
 		out = append(out, addr)
 	}
 	return out
+}
+
+type bootstrapPeer struct {
+	addr string
+	id   [32]byte
+}
+
+func bootstrapPeers() []bootstrapPeer {
+	rawAddrs := strings.TrimSpace(os.Getenv("WEB4_BOOTSTRAP_ADDRS"))
+	rawIDs := strings.TrimSpace(os.Getenv("WEB4_BOOTSTRAP_IDS"))
+	if rawAddrs == "" || rawIDs == "" {
+		return nil
+	}
+	addrs := strings.Split(rawAddrs, ",")
+	ids := strings.Split(rawIDs, ",")
+	if len(addrs) != len(ids) {
+		return nil
+	}
+	out := make([]bootstrapPeer, 0, len(addrs))
+	for i := range addrs {
+		addr := strings.TrimSpace(addrs[i])
+		idHex := strings.TrimSpace(ids[i])
+		if addr == "" || idHex == "" || !isValidAddr(addr) {
+			continue
+		}
+		raw, err := hex.DecodeString(idHex)
+		if err != nil || len(raw) != 32 {
+			continue
+		}
+		var id [32]byte
+		copy(id[:], raw)
+		out = append(out, bootstrapPeer{addr: addr, id: id})
+	}
+	return out
+}
+
+func bootstrapSeedNodeID(addr string) [32]byte {
+	sum := crypto.SHA3_256([]byte("web4:bootstrap:" + addr))
+	var id [32]byte
+	copy(id[:], sum)
+	return id
 }
 
 func min(a, b int) int {

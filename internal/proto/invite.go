@@ -12,7 +12,7 @@ const (
 	MsgTypeInviteAck    = "invite_ack"
 	MaxInviteCertSize   = 8 << 10
 	MaxInviteAckSize    = 2 << 10
-	InvitePoWaDBits     = 18
+	InvitePoWaDBits     = 26
 	InviteScopeGossip   = uint32(1 << 0)
 	InviteScopeContract = uint32(1 << 1)
 	InviteScopeAdmin    = uint32(1 << 2)

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"web4mvp/internal/metrics"
+	"web4mvp/internal/node"
 )
 
 func TestBootstrapDiscoveryGrowth(t *testing.T) {
@@ -18,6 +19,22 @@ func TestBootstrapDiscoveryGrowth(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
+	errBoot := make(chan error, 1)
+	errPeer := make(chan error, 1)
+	defer func() {
+		cancel()
+		deadline := time.Now().Add(2 * time.Second)
+		for _, ch := range []chan error{errBoot, errPeer} {
+			if ch == nil {
+				continue
+			}
+			select {
+			case <-ch:
+			case <-time.After(time.Until(deadline)):
+				return
+			}
+		}
+	}()
 
 	homeBoot := t.TempDir()
 	t.Setenv("HOME", homeBoot)
@@ -28,7 +45,7 @@ func TestBootstrapDiscoveryGrowth(t *testing.T) {
 	}
 	bootReady := make(chan string, 1)
 	go func() {
-		_ = boot.RunWithContext(ctx, "127.0.0.1:0", true, bootReady)
+		errBoot <- boot.RunWithContext(ctx, "127.0.0.1:0", true, bootReady)
 	}()
 	var bootAddr string
 	select {
@@ -58,7 +75,7 @@ func TestBootstrapDiscoveryGrowth(t *testing.T) {
 	}
 	peerReady := make(chan string, 1)
 	go func() {
-		_ = peerRunner.RunWithContext(ctx, "127.0.0.1:0", true, peerReady)
+		errPeer <- peerRunner.RunWithContext(ctx, "127.0.0.1:0", true, peerReady)
 	}()
 	select {
 	case <-peerReady:
@@ -72,6 +89,7 @@ func TestBootstrapDiscoveryGrowth(t *testing.T) {
 	for time.Now().Before(deadline) {
 		snap := peerRunner.Metrics.Snapshot()
 		if snap.PexRespRecvTotal > 0 && snap.PeerTableSize > 0 {
+			cancel()
 			return
 		}
 		select {
@@ -82,4 +100,36 @@ func TestBootstrapDiscoveryGrowth(t *testing.T) {
 	}
 	snap := peerRunner.Metrics.Snapshot()
 	t.Fatalf("peer discovery not observed: peertable=%d pex_resp=%d", snap.PeerTableSize, snap.PexRespRecvTotal)
+}
+
+func TestSeedBootstrapInsertedFromAddrsOnly(t *testing.T) {
+	t.Setenv("WEB4_BOOTSTRAP_ADDRS", "127.0.0.1:14001,127.0.0.1:14002")
+	t.Setenv("WEB4_BOOTSTRAP_IDS", "")
+
+	self, err := node.NewNode(t.TempDir(), node.Options{})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+	r := &Runner{Self: self, Root: t.TempDir(), Metrics: metrics.New()}
+	cm := newConnMan(r, false)
+	cm.seedBootstrap()
+
+	peers := self.Peers.List()
+	if len(peers) < 2 {
+		t.Fatalf("expected seed peers inserted, got %d", len(peers))
+	}
+	seen := map[string]bool{
+		"127.0.0.1:14001": false,
+		"127.0.0.1:14002": false,
+	}
+	for _, p := range peers {
+		if _, ok := seen[p.Addr]; ok && p.Source == "seed" {
+			seen[p.Addr] = true
+		}
+	}
+	for addr, ok := range seen {
+		if !ok {
+			t.Fatalf("missing seed peer for %s", addr)
+		}
+	}
 }

@@ -31,10 +31,10 @@ func TestNextBackoffDurationMonotonic(t *testing.T) {
 	}
 	rng := rand.New(zeroSource{})
 	expected := []time.Duration{
-		200 * time.Millisecond,
-		200 * time.Millisecond,
-		400 * time.Millisecond,
-		800 * time.Millisecond,
+		2 * time.Second,
+		4 * time.Second,
+		5 * time.Second,
+		5 * time.Second,
 		5 * time.Second,
 		5 * time.Second,
 	}

@@ -345,7 +345,7 @@ NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
 NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
 PUBB="$(cat "${TMPB}/.web4mvp/pub.hex")"
 invite_ab_check1="${TMPWORK}/invite_ab_check1.json"
-run_a node invite --to "${PUBB}" --scope all --pow-bits 18 --expires 3600 > "${invite_ab_check1}"
+run_a node invite --to "${PUBB}" --scope all --pow-bits 26 --expires 3600 > "${invite_ab_check1}"
 if [[ ! -s "${invite_ab_check1}" ]]; then
 	fail "check 1 (JSONL rotation): invite payload missing"
 fi
@@ -896,7 +896,7 @@ if [[ "${peer_seeded}" -ne 1 ]]; then
 fi
 
 invite_ab_gossip="${TMPWORK}/invite_ab_gossip.json"
-run_checked "check 6b (scope+revoke): invite gossip scope" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope gossip --pow-bits 18 --expires 3600 > '${invite_ab_gossip}'"
+run_checked "check 6b (scope+revoke): invite gossip scope" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope gossip --pow-bits 26 --expires 3600 > '${invite_ab_gossip}'"
 invite_send_log="${TMPWORK}/scope_invite_gossip_send.log"
 if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${invite_ab_gossip}" >"${invite_send_log}" 2>&1 ); then
 	tail -n 200 "${invite_send_log}" || true
@@ -961,7 +961,7 @@ if [[ "${found}" -eq 1 ]]; then
 fi
 
 invite_ab_contract="${TMPWORK}/invite_ab_contract.json"
-run_checked "check 6b (scope+revoke): invite contract scope" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope contract --pow-bits 18 --expires 3600 > '${invite_ab_contract}'"
+run_checked "check 6b (scope+revoke): invite contract scope" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope contract --pow-bits 26 --expires 3600 > '${invite_ab_contract}'"
 invite_contract_send_log="${TMPWORK}/scope_invite_contract_send.log"
 if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --in "${invite_ab_contract}" >"${invite_contract_send_log}" 2>&1 ); then
 	tail -n 200 "${invite_contract_send_log}" || true
@@ -1271,7 +1271,7 @@ pass "check 6b (scope + revoke)"
 	run_checked "check 6 (gossip forward): node join (B<-C)" --quiet run_b node join --node-id "${NODEIDC}"
 	run_checked "check 6 (gossip forward): node join (B<-B)" --quiet run_b node join --node-id "${NODEIDB}"
 	invite_ab="${TMPWORK}/invite_ab.json"
-	run_checked "check 6 (gossip forward): invite cert (A->B)" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope gossip --pow-bits 18 --expires 3600 > '${invite_ab}'"
+	run_checked "check 6 (gossip forward): invite cert (A->B)" --quiet bash -c "HOME='${TMPA}' '${WEB4_BIN}' node invite --to '${PUBB}' --scope gossip --pow-bits 26 --expires 3600 > '${invite_ab}'"
 	if [[ ! -s "${invite_ab}" ]]; then
 		check6_quic_fail "no_conn" "check 6 (gossip forward): invite payload missing"
 	fi
@@ -1515,15 +1515,71 @@ PY
 	done
 }
 
+wait_peer_has_addr() {
+	local home="$1"
+	local target_addr="$2"
+	local deadline="$3"
+	while true; do
+		if output="$(HOME="${home}" "${WEB4_NODE_BIN}" peers 2>/dev/null)"; then
+			if printf '%s\n' "${output}" | grep -Fq " addr=${target_addr}"; then
+				return 0
+			fi
+		fi
+		if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+			return 1
+		fi
+		sleep 0.2
+	done
+}
+
+node_id_from_ready_log() {
+	local log="$1"
+	for _ in $(seq 1 200); do
+		if [[ -f "${log}" ]]; then
+			local line
+			line="$(grep -E 'READY addr=.* node_id=' "${log}" | tail -n 1 || true)"
+			if [[ -n "${line}" ]]; then
+				echo "${line##*node_id=}"
+				return 0
+			fi
+		fi
+		sleep 0.05
+	done
+	return 1
+}
+
+wait_peer_has_nodeid() {
+	local home="$1"
+	local target_id="$2"
+	local deadline="$3"
+	while true; do
+		if output="$(HOME="${home}" "${WEB4_NODE_BIN}" peers 2>/dev/null)"; then
+			if printf '%s\n' "${output}" | grep -Fq "${target_id} "; then
+				return 0
+			fi
+		fi
+		if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+			return 1
+		fi
+		sleep 0.2
+	done
+}
+
 bootstrap_debug_dump() {
 	local msg="$1"
 	echo "check 7 debug: ${msg}"
-	for log in "${bootstrap_log}" "${peer_a_log}" "${peer_b_log}"; do
-		if [[ -n "${log}" && -f "${log}" ]]; then
-			echo "Log tail (${log}):"
-			tail -n 200 "${log}" || true
-		fi
-	done
+	if [[ -f "${peer_a_log}" ]]; then
+		echo "Peer A log tail (${peer_a_log}):"
+		tail -n 80 "${peer_a_log}" || true
+	fi
+	if [[ -f "${peer_b_log}" ]]; then
+		echo "Peer B log tail (${peer_b_log}):"
+		tail -n 80 "${peer_b_log}" || true
+	fi
+	if [[ -f "${bootstrap_log}" ]]; then
+		echo "Bootstrap log tail (${bootstrap_log}):"
+		tail -n 80 "${bootstrap_log}" || true
+	fi
 	echo "A status:"
 	run_node_b status || true
 	echo "B status:"
@@ -1549,7 +1605,7 @@ peer_b_log="${TMPWORK}/peer_b_server.log"
 bootstrap_addr="127.0.0.1:${PORT_BOOT}"
 
 echo "Starting QUIC bootstrap node: env HOME=${TMPA} WEB4_NODE_MODE=bootstrap ${WEB4_NODE_BIN} run --devtls --addr ${bootstrap_addr}"
-env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_PEX_INTERVAL_MS=500 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
+env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
 SERVER_PID_BOOT=$!
 LISTENER_PIDS+=("${SERVER_PID_BOOT}")
 
@@ -1561,17 +1617,23 @@ fi
 BOOTSTRAP_CA="${TMPA}/.web4mvp/devtls_ca.pem"
 
 echo "Starting QUIC peer A: env HOME=${TMPB} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_A}"
-env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${BOOTSTRAP_CA}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_MS=500 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
+env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${BOOTSTRAP_CA}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
 SERVER_PID_PEER_A=$!
 LISTENER_PIDS+=("${SERVER_PID_PEER_A}")
 
 echo "Starting QUIC peer B: env HOME=${TMPC} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_B}"
-env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${BOOTSTRAP_CA}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_MS=500 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
+env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${BOOTSTRAP_CA}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
 SERVER_PID_PEER_B=$!
 LISTENER_PIDS+=("${SERVER_PID_PEER_B}")
 
 wait_quic_ready "${peer_a_log}" "check 7 (bootstrap discovery): peer A did not start"
 wait_quic_ready "${peer_b_log}" "check 7 (bootstrap discovery): peer B did not start"
+NODEID_PEER_A="$(node_id_from_ready_log "${peer_a_log}" || true)"
+NODEID_PEER_B="$(node_id_from_ready_log "${peer_b_log}" || true)"
+if [[ -z "${NODEID_PEER_A}" || -z "${NODEID_PEER_B}" ]]; then
+	bootstrap_debug_dump "could not parse peer node ids from READY logs"
+	quic_fail "check 7 (bootstrap discovery): missing peer node id"
+fi
 if ! wait_file_nonempty "${TMPB}/.web4mvp/devtls_ca.pem" 5; then
 \tbootstrap_debug_dump "peer A devtls ca not ready"
 \tquic_fail "check 7 (bootstrap discovery): peer A devtls ca not ready"
@@ -1582,13 +1644,13 @@ if ! wait_file_nonempty "${TMPC}/.web4mvp/devtls_ca.pem" 5; then
 fi
 
 deadline=$(( $(date +%s) + 30 ))
-if ! wait_metric_gt "${TMPB}" "peertable_size" 1 "${deadline}"; then
-	bootstrap_debug_dump "peer A peertable did not grow"
-	quic_fail "check 7 (bootstrap discovery): peer A peertable did not grow"
+if ! wait_metric_gt "${TMPB}" "peertable_size" 0 "${deadline}"; then
+	bootstrap_debug_dump "peer A peertable_size < 1 in addrs-only seed mode"
+	quic_fail "check 7 (bootstrap discovery): peer A seed not inserted"
 fi
-if ! wait_metric_gt "${TMPC}" "peertable_size" 1 "${deadline}"; then
-	bootstrap_debug_dump "peer B peertable did not grow"
-	quic_fail "check 7 (bootstrap discovery): peer B peertable did not grow"
+if ! wait_metric_gt "${TMPC}" "peertable_size" 0 "${deadline}"; then
+	bootstrap_debug_dump "peer B peertable_size < 1 in addrs-only seed mode"
+	quic_fail "check 7 (bootstrap discovery): peer B seed not inserted"
 fi
 if ! wait_metric_gt "${TMPB}" "outbound_connected" 0 "${deadline}"; then
 	bootstrap_debug_dump "peer A outbound not observed"
@@ -1597,6 +1659,14 @@ fi
 if ! wait_metric_gt "${TMPC}" "outbound_connected" 0 "${deadline}"; then
 	bootstrap_debug_dump "peer B outbound not observed"
 	quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
+fi
+if ! wait_peer_has_nodeid "${TMPB}" "${NODEID_PEER_B}" "${deadline}"; then
+	bootstrap_debug_dump "peer A did not learn peer B node_id via pex"
+	quic_fail "check 7 (bootstrap discovery): peer A did not learn peer B"
+fi
+if ! wait_peer_has_nodeid "${TMPC}" "${NODEID_PEER_A}" "${deadline}"; then
+	bootstrap_debug_dump "peer B did not learn peer A node_id via pex"
+	quic_fail "check 7 (bootstrap discovery): peer B did not learn peer A"
 fi
 
 kill "${SERVER_PID_BOOT}" 2>/dev/null || true

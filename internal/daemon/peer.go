@@ -3240,13 +3240,16 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 	limit := pexInsertCap()
 	for i := 0; i < len(resp.Peers); i++ {
 		if limit > 0 && added >= limit {
+			logPexDrop("cap")
 			break
 		}
 		p, err := decodePeerExchangePeer(resp.Peers[i])
 		if err != nil {
+			logPexDrop("decode_peer")
 			continue
 		}
 		if !isValidAddr(p.Addr) {
+			logPexDrop("invalid_addr")
 			continue
 		}
 		p.Source = "pex"
@@ -3256,15 +3259,19 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 		}
 		if len(p.PubKey) == 0 {
 			if err := self.Peers.UpsertUnverified(p); err != nil {
+				logPexDrop("upsert_unverified")
 				continue
 			}
 		} else {
 			if p.Addr != "" && self.Peers != nil {
-				_, _ = self.Peers.SetAddrUnverified(p, p.Addr, true)
+				if _, err := self.Peers.SetAddrUnverified(p, p.Addr, true); err != nil {
+					logPexDrop("addr_conflict")
+				}
 				self.Peers.PeerSeen(p.NodeID, p.Addr)
 			}
 			p.Addr = ""
 			if err := self.Peers.Upsert(p, true); err != nil {
+				logPexDrop("upsert")
 				continue
 			}
 		}
@@ -3274,6 +3281,28 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 		fmt.Fprintf(os.Stderr, "peer_exchange_apply peers=%d added=%d\n", len(resp.Peers), added)
 	}
 	return added, nil
+}
+
+var (
+	pexDropLogMu  sync.Mutex
+	pexDropLog    = make(map[string]time.Time)
+	pexDropLogTTL = 30 * time.Second
+)
+
+func logPexDrop(reason string) {
+	if os.Getenv("WEB4_DEBUG") != "1" || reason == "" {
+		return
+	}
+	now := time.Now()
+	pexDropLogMu.Lock()
+	last := pexDropLog[reason]
+	if now.Sub(last) >= pexDropLogTTL {
+		pexDropLog[reason] = now
+		pexDropLogMu.Unlock()
+		fmt.Fprintf(os.Stderr, "peer_exchange_drop reason=%s\n", reason)
+		return
+	}
+	pexDropLogMu.Unlock()
 }
 
 func pexInsertCap() int {

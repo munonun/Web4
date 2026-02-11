@@ -71,6 +71,7 @@ type Store struct {
 	addrHints           map[[32]byte]string
 	hintIndex           map[string][32]byte
 	addrVerified        map[[32]byte]bool
+	evictLog            map[[32]byte]time.Time
 }
 
 type entry struct {
@@ -147,6 +148,7 @@ func NewStore(path string, opts Options) (*Store, error) {
 		addrHints:           make(map[[32]byte]string),
 		hintIndex:           make(map[string][32]byte),
 		addrVerified:        make(map[[32]byte]bool),
+		evictLog:            make(map[[32]byte]time.Time),
 	}
 	if loadLimit > 0 {
 		if err := s.loadLast(loadLimit); err != nil {
@@ -642,11 +644,35 @@ func (s *Store) EvictToMax(max int, subnetMax int) int {
 		}
 		key := hex.EncodeToString(c.id[:])
 		if el, ok := s.hot[key]; ok {
+			reason := "capacity"
+			if c.failCount > 0 {
+				reason = "fail_count"
+			} else if c.lastSeen > 0 {
+				reason = "old"
+			} else if c.subnetOver {
+				reason = "subnet_over"
+			}
+			s.logEvict(c.id, reason)
 			s.removeEntryLocked(el)
 			evicted++
 		}
 	}
 	return evicted
+}
+
+const evictLogTTL = 30 * time.Second
+
+func (s *Store) logEvict(id [32]byte, reason string) {
+	if os.Getenv("WEB4_DEBUG") != "1" || reason == "" {
+		return
+	}
+	now := time.Now()
+	last := s.evictLog[id]
+	if now.Sub(last) < evictLogTTL {
+		return
+	}
+	s.evictLog[id] = now
+	fmt.Fprintf(os.Stderr, "peer evict node=%x reason=%s\n", id[:], reason)
 }
 
 func (s *Store) Refresh() error {
