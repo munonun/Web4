@@ -1683,7 +1683,7 @@ func handleGossipPushInner(msg proto.GossipPushMsg, data []byte, st *store.Store
 	var newState bool
 	var innerErr error
 	if hdr.Type == proto.MsgTypeHello1 {
-		newState, innerErr = handleGossipHello1Payload(envelope, self, senderAddr)
+		newState, innerErr = handleGossipHello1Payload(envelope, self, senderAddr, fromID)
 	} else {
 		_, newState, innerErr = recvDataWithResponse(envelope, st, self, checker, "")
 	}
@@ -1883,7 +1883,7 @@ func forwardGossip(msg proto.GossipPushMsg, envelope []byte, innerType string, m
 	}
 }
 
-func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string) (bool, error) {
+func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, relayNodeID [32]byte) (bool, error) {
 	if self == nil || self.Peers == nil {
 		return false, errors.New("peer store unavailable")
 	}
@@ -1907,6 +1907,18 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string) 
 	}
 	if fromID == self.ID {
 		return false, errors.New("hello1 from_id self")
+	}
+	// Rate-limit gossip hello by sender identity before any expensive signature checks.
+	fromKey := hex.EncodeToString(fromID[:])
+	if !recvNodeLimiter.Allow(fromKey) {
+		return false, errors.New("rate limited")
+	}
+	// Optional relay dimension to limit one sender fanning through many forwarders.
+	if !isZeroNodeID(relayNodeID) {
+		relayKey := fromKey + "|relay:" + hex.EncodeToString(relayNodeID[:])
+		if !recvNodeLimiter.Allow(relayKey) {
+			return false, errors.New("rate limited")
+		}
 	}
 	suiteID := byte(m.SuiteID)
 	mlkemPub, err := decodeHexOptional(m.MLKEMPub)
