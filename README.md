@@ -1,250 +1,120 @@
-> Status: experimental / test-validated
+> Status: experimental, test-validated.
+>
+> Web4 is a ledgerless peer-to-peer contract protocol.
+> State is local. Consistency is structural.
+> No global ordering.
+> No global consensus, no global ledger, no replayable global history.
+> Verified by tests, not promises.
 
 # Web4
 
-Ledgerless P2P contracts.
-Verified by tests, not promises.
+## Table of Contents
+- [Quickstart](#quickstart)
+- [CLI Basics](#cli-basics)
+- [Crypto Handshake Suites](#crypto-handshake-suites)
+- [P2P Survivability](#p2p-survivability)
+- [Design Principles](#design-principles)
+- [Validation](#validation)
+- [What This Is / Is Not](#what-this-is--is-not)
+- [Donation (Optional)](#donation-optional)
 
-Web4 is an experimental peer-to-peer protocol that removes the global ledger entirely.
-No blockchain.
-No validators.
-No global consensus.
+## Quickstart
 
-`web4-node` is a peer relay/verifier CLI (no chain, no sync, no balances).
-It reports local observation only and never claims global state.
-Example commands:
-`web4-node run --addr 127.0.0.1:7000 --devtls`
-`web4-node status`
-`web4-node peers`
-
-State correctness is enforced locally through structural constraints,
-and validated through deterministic tests rather than social agreement.
-
----
-
-## Motivation
-
-Most distributed systems solve trust by adding structure:
-
-- global ledgers
-- consensus protocols
-- validators and finality rules
-- long-lived global history
-
-Web4 explores the opposite direction.
-
-What if we remove the global structure entirely,
-and keep only what is mathematically unavoidable?
-
-- no shared ledger
-- no total ordering
-- no replayable global history
-- only local state transitions that must cancel out
-
-If a transition does not conserve state locally,
-it is invalid immediately.
-There is no “later” reconciliation.
-
----
-
-## Core design principles
-
-### Ledgerless state
-
-There is no global history to replay or synchronize.
-Each node validates state transitions locally using conservation-style constraints.
-
-If a state update cannot be balanced by another update,
-it is rejected.
-
-State correctness is local, not emergent.
-
----
-
-## DeltaB fused field (phi, b)
-
-Web4’s DeltaB path transmits only **Δb** (local imbalance deltas), not phi.
-Each DeltaB message is a sparse update over the local **members** scope:
-entries are canonicalized, zero entries are dropped, and `sum(Δb) = 0` must hold.
-
-If enabled, ZK proofs bind to canonical delta bytes and the membership view.
-They prove conservation/binding only — **not** global history or circuits.
-
-Phi is a **local-only** potential field estimated via relaxation;
-it is never transmitted and never stored as global history.
-
-Deduplication uses a **bounded, TTL cache** (not a ledger) to drop retries.
-There is no chain, no global ordering, and no replayable history.
-
----
-
-### Gossip instead of ordering
-
-Messages propagate probabilistically via gossip.
-There is no canonical ordering of events.
-
-If a message matters, it survives by redundancy.
-If it does not propagate, it does not exist.
-
----
-
-### Cryptography as enforcement
-
-Cryptography is used to enforce invariants, not to decorate the protocol.
-
-- all meaningful messages are signed
-- payloads are end-to-end sealed with PFS
-- message sizes and types are strictly capped
-- malformed or replayed data is rejected structurally
-
-Trust is minimized by construction.
-
----
-
-### QUIC transport
-
-All communication uses QUIC as the underlying transport.
-
-- encrypted by default
-- connection-oriented without TCP head-of-line blocking
-- explicit framing and backpressure handling
-- suitable for hostile or unreliable networks
-
-## InviteCert + PoWaD admission (v0)
-- NodeID = SHA3-256(pubkey).
-- Admission uses a signed InviteCert from inviter to invitee.
-- InviteCert fields include ids, times, scope, PoWaD params, and signature.
-- Signing uses canonical binary encoding (not JSON).
-- PoWaD digest: SHA3-256("web4:v0:powad|" || invite_id || invitee_nodeid || nonce_le).
-- Valid if the top pow_bits of the digest are zero.
-- Replay protection keys (inviter_nodeid, invite_id) are persisted.
-- Scope bits gate gossip vs contract updates.
-- Non-members are ignored for state-changing operations.
-
-## Scopes, revocation, and approval bundles
-- Scope bits: gossip (1), contract (2). Admin (4) is reserved for future use.
-- Gossip and peer exchange require gossip scope; contract open/close/ack require contract scope.
-- Revocation is inviter-scoped: only the original inviter can revoke an invitee.
-  - Revocation is signed and replay-protected; it clears the target's scope to zero.
-  - CLI: `web4 node revoke --to <nodeid> --reason <text>`.
-- Optional 2-of-3 admission: set `WEB4_INVITE_THRESHOLD=2`.
-  - Use invite bundles with ≥ threshold approvals over canonical bytes:
-    `"web4:v0:invite_approve|" || invite_id || invitee_nodeid || expires_at || scope`.
-  - CLI helpers: `web4 node approve-invite ...` and `web4 node join --bundle <file>`.
-
----
-
-## Project scope
-
-This repository is not a finished product.
-
-What currently exists:
-
-- cryptographic framing and signatures
-- end-to-end sealed payloads with forward secrecy
-- gossip push and forwarding logic with hop limits
-- bounded storage with rotation invariants
-- deterministic smoke testing for multi-node scenarios
-- QUIC transport hardening (size caps, type caps, rate limits)
-
-What does not exist yet:
-
-- stable end-user CLI
-- long-running public network
-- production deployment assumptions
-
-This is a protocol and testing infrastructure experiment.
-
----
-
-## Deterministic testing focus
-
-A core goal of Web4 is making non-deterministic P2P failures reproducible.
-
-Distributed systems often fail in ways that cannot be replayed:
-timing races, message loss, partial propagation, inconsistent forwarding.
-
-Web4 includes deterministic multi-node smoke tests that:
-
-- reproduce previously intermittent failures
-- classify failures explicitly (timeout, no-conn, forwarding failure)
-- allow repeated execution with identical outcomes
-
-Correctness is demonstrated by tests, not claims.
-
----
-
-## Validation
-
-There is currently no stable user-facing workflow.
-
-Instead, correctness is demonstrated through testing.
-
-### Unit tests
+Run tests first:
 
 ```bash
 go test ./...
 ```
-### These verify:
-- framing and size limits
 
-- signature and tamper rejection
+Run the smoke test used in this repo:
 
-- storage rotation invariants
-
-- sealed payload integrity
-
-### Integration smoke tests
 ```bash
-  WEB4_ZK_MODE=1 WEB4_ZK_SMOKE=1 WEB4_STORE_MAX_BYTES=65536 ./scripts/smoke.sh
+WEB4_DELTA_MODE=deltab WEB4_ZK_MODE=1 WEB4_STORE_MAX_BYTES=65536 ./scripts/smoke.sh
 ```
-These tests exercise:
-(개발자만 읽어도 되는거: 
-  - WEB4_ZK_MODE=1 → 실제 recv 경로에서 ZK 검증 강제
-  - WEB4_ZK_SMOKE=1 → ZK 모듈 단독 테스트 실행)
-- real multi-node interaction
 
-- gossip propagation paths
+If tests and smoke pass, behavior matches current design.
 
-- persistence under load
+## CLI Basics
 
-- failure modes invisible to unit tests
+`web4-node` is a local relay/verifier CLI.
+It reports local observation only.
 
-If these pass, the system is behaving as designed.
+```bash
+web4-node run --addr 127.0.0.1:7000 --devtls
+web4-node status
+web4-node peers
+```
 
-## What this is not
-- not a blockchain
+## Crypto Handshake Suites
 
-- not a PoW or PoS system
+Handshake supports two suites:
 
-- not a payment network (yet)
+- `Suite 0` (default): `X25519 + ML-KEM-768`, signatures by `SPHINCS+`
+- `Suite 1` (legacy): `X25519`, signatures by `RSA-PSS`
 
-- not production-ready software
+Binding is explicit in the handshake signing scheme:
 
-This repository is a research-driven protocol experiment.
+- session binding
+- transcript binding
+- ephemeral key binding
 
-## Philosophy
-Most systems attempt to redistribute trust.
+Meaning: transcript or suite tampering breaks verification.
 
-Web4 attempts to remove it.
+## P2P Survivability
 
-Nodes do not reason about identity, reputation, or history.
-They only enforce invariants and transport hygiene.
+Network growth is daemon-side:
 
-If a state transition violates conservation,
-it should not exist at all.
+- bootstrap seeds for first contact
+- connection manager for outbound maintenance
+- periodic peer exchange (PEX) for discovery
+- bounded peertable + eviction policy for spam resistance
 
-Falsifiability is valued over completeness.
+Trust model separation is strict:
 
----
+- seed/bootstrap is discovery only
+- membership verification is separate
+- hello/peer-exchange do not grant membership
 
-## Donation (optional)
-This project is developed independently.
+## Design Principles
 
-If you wish to support continued research and experimentation, donations are welcome.
-(Monero: 48NwwMKku48fKLYu7YN2S3hZM6iWX5WpRAoyC85AaUe8FZyTCHMRbJqGDNRdm3QdBDF8h71V9xJAJ1UUZKsnpyCRKXqQbiE)
-(Bitcoin: bc1qaz5dz2cze0me979j9prhxr6dc5x9j7esyhcxzp)
+- No ledger, no global consensus, no replayable global history.
+- DeltaB path transmits `Δb` updates only.
+- Conservation constraint (`Lx = 0` form): invalid local imbalance is rejected.
+- Gossip propagation instead of total ordering.
+- Local verification over global narrative.
 
-No promises. No roadmap tied to donations.
+## Validation
 
----
+Web4 prioritizes reproducibility of distributed behavior.
+
+What validation focuses on:
+
+- structural/message-size/type caps
+- signature and tamper rejection
+- bounded persistence and rotation invariants
+- deterministic multi-node smoke behavior
+
+This repository treats tests as the source of truth.
+
+## What This Is / Is Not
+
+What this is:
+
+- a protocol experiment
+- a ledgerless P2P contract model
+- a test-first implementation
+
+What this is not:
+
+- a blockchain
+- a PoW/PoS network
+- production-ready software
+
+## Donation (Optional)
+
+Independent research project.
+
+- Monero: `48NwwMKku48fKLYu7YN2S3hZM6iWX5WpRAoyC85AaUe8FZyTCHMRbJqGDNRdm3QdBDF8h71V9xJAJ1UUZKsnpyCRKXqQbiE`
+- Bitcoin: `bc1qaz5dz2cze0me979j9prhxr6dc5x9j7esyhcxzp`
+
+No promises. No donation-coupled roadmap.
