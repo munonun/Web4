@@ -296,7 +296,18 @@ func (e recvError) Error() string {
 	return fmt.Sprintf("%s: %v", e.msg, e.err)
 }
 
-func hello1SigInput(fromID, toID [32]byte, ea, na []byte) []byte {
+func hello1SigInput(fromID, toID [32]byte, ea, na, sessionID []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v2")+32+32+len(ea)+len(na)+len(sessionID))
+	buf = append(buf, []byte("web4:h1:v2")...)
+	buf = append(buf, fromID[:]...)
+	buf = append(buf, toID[:]...)
+	buf = append(buf, ea...)
+	buf = append(buf, na...)
+	buf = append(buf, sessionID...)
+	return buf
+}
+
+func hello1SigInputLegacy(fromID, toID [32]byte, ea, na []byte) []byte {
 	buf := make([]byte, 0, len("web4:h1:v1")+32+32+len(ea)+len(na))
 	buf = append(buf, []byte("web4:h1:v1")...)
 	buf = append(buf, fromID[:]...)
@@ -304,6 +315,52 @@ func hello1SigInput(fromID, toID [32]byte, ea, na []byte) []byte {
 	buf = append(buf, ea...)
 	buf = append(buf, na...)
 	return buf
+}
+
+func sessionIDForHandshake(fromID, toID [32]byte, ea, eb, transcriptHash []byte) []byte {
+	buf := make([]byte, 0, len("WEB4/session")+len(proto.ProtoVersion)+32+32+len(ea)+len(eb)+len(transcriptHash))
+	buf = append(buf, []byte("WEB4/session")...)
+	buf = append(buf, []byte(proto.ProtoVersion)...)
+	buf = append(buf, fromID[:]...)
+	buf = append(buf, toID[:]...)
+	buf = append(buf, ea...)
+	buf = append(buf, eb...)
+	buf = append(buf, transcriptHash...)
+	sum := crypto.SHA3_256(buf)
+	out := make([]byte, len(sum))
+	copy(out, sum)
+	return out
+}
+
+func decodeSessionIDHex(s string) ([]byte, error) {
+	if s == "" {
+		return nil, errors.New("missing session_id")
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return nil, errors.New("bad session_id")
+	}
+	return b, nil
+}
+
+func allowLegacyHelloSig() bool {
+	return os.Getenv("WEB4_HELLO_ALLOW_LEGACY_SIG") == "1"
+}
+
+func zero32() []byte {
+	return make([]byte, 32)
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func updateFromParties(a, b []byte, v uint64) (math4.Update, error) {
@@ -1813,7 +1870,22 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string) 
 	if fromID == self.ID {
 		return false, errors.New("hello1 from_id self")
 	}
-	sigInput := hello1SigInput(fromID, toID, ea, na)
+	h1Bytes := proto.Hello1Bytes(fromID, toID, ea, na)
+	h1TranscriptHash := crypto.SHA3_256(h1Bytes)
+	sessionID, err := decodeSessionIDHex(m.SessionID)
+	if err != nil {
+		if !allowLegacyHelloSig() {
+			return false, err
+		}
+	}
+	expectedSID := sessionIDForHandshake(fromID, toID, ea, zero32(), h1TranscriptHash)
+	if len(sessionID) > 0 && !bytesEqual(sessionID, expectedSID) {
+		return false, errors.New("hello1 session_id mismatch")
+	}
+	sigInput := hello1SigInput(fromID, toID, ea, na, sessionID)
+	if len(sessionID) == 0 {
+		sigInput = hello1SigInputLegacy(fromID, toID, ea, na)
+	}
 	if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
 		debugCount.incVerify("hello1")
 		return false, errors.New("bad hello1 signature")

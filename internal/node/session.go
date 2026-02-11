@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
+	"os"
 	"sync"
 
 	"web4mvp/internal/crypto"
@@ -24,11 +25,13 @@ type SessionState struct {
 }
 
 type PendingHandshake struct {
-	ToID        [32]byte
-	EA          []byte
-	Na          []byte
-	Ephemeral   *crypto.Ephemeral
-	Hello1Bytes []byte
+	ToID                 [32]byte
+	EA                   []byte
+	Na                   []byte
+	Ephemeral            *crypto.Ephemeral
+	Hello1Bytes          []byte
+	Hello1TranscriptHash []byte
+	Hello1SessionID      []byte
 }
 
 type SessionStore struct {
@@ -138,7 +141,10 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 		return proto.Hello1Msg{}, err
 	}
 	fromID := n.ID
-	sigInput := hello1SigInput(fromID, toID, ea, na)
+	h1Bytes := proto.Hello1Bytes(fromID, toID, ea, na)
+	h1TranscriptHash := crypto.SHA3_256(h1Bytes)
+	hello1SessionID := sessionIDForHandshake(fromID, toID, ea, zero32(), h1TranscriptHash)
+	sigInput := hello1SigInput(fromID, toID, ea, na, hello1SessionID)
 	sig, err := crypto.SignDigest(n.PrivKey, crypto.SHA3_256(sigInput))
 	if err != nil {
 		eph.Destroy()
@@ -151,14 +157,17 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 		ToNodeID:   hex.EncodeToString(toID[:]),
 		EA:         hex.EncodeToString(ea),
 		Na:         hex.EncodeToString(na),
+		SessionID:  hex.EncodeToString(hello1SessionID),
 		Sig:        hex.EncodeToString(sig),
 	}
 	n.Sessions.SetPending(toID, &PendingHandshake{
-		ToID:        toID,
-		EA:          ea,
-		Na:          na,
-		Ephemeral:   eph,
-		Hello1Bytes: proto.Hello1Bytes(fromID, toID, ea, na),
+		ToID:                 toID,
+		EA:                   ea,
+		Na:                   na,
+		Ephemeral:            eph,
+		Hello1Bytes:          h1Bytes,
+		Hello1TranscriptHash: h1TranscriptHash,
+		Hello1SessionID:      hello1SessionID,
 	})
 	return msg, nil
 }
@@ -185,11 +194,25 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	if toID != n.ID {
 		return proto.Hello2Msg{}, errors.New("hello1 to_id mismatch")
 	}
-	sigInput := hello1SigInput(fromID, toID, ea, na)
+	h1BytesForReplay := proto.Hello1Bytes(fromID, toID, ea, na)
+	h1TranscriptHash := crypto.SHA3_256(h1BytesForReplay)
+	hello1SessionID, err := decodeSessionIDHex(m.SessionID)
+	if err != nil {
+		if !allowLegacyHelloSig() {
+			return proto.Hello2Msg{}, err
+		}
+	}
+	expectedHello1SID := sessionIDForHandshake(fromID, toID, ea, zero32(), h1TranscriptHash)
+	if len(hello1SessionID) > 0 && !bytesEqual(hello1SessionID, expectedHello1SID) {
+		return proto.Hello2Msg{}, errors.New("hello1 session_id mismatch")
+	}
+	sigInput := hello1SigInput(fromID, toID, ea, na, hello1SessionID)
+	if len(hello1SessionID) == 0 {
+		sigInput = hello1SigInputLegacy(fromID, toID, ea, na)
+	}
 	if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
 		return proto.Hello2Msg{}, errors.New("bad hello1 signature")
 	}
-	h1BytesForReplay := proto.Hello1Bytes(fromID, toID, ea, na)
 	h1HashBytes := crypto.SHA3_256(h1BytesForReplay)
 	var h1Hash [32]byte
 	copy(h1Hash[:], h1HashBytes)
@@ -238,15 +261,15 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 		eph.Destroy()
 		return proto.Hello2Msg{}, err
 	}
-	sigInput2 := hello2SigInput(fromID, toID, ea, eb, na, nb)
+	h2Bytes := proto.Hello2Bytes(n.ID, fromID, eb, nb)
+	transcript := crypto.SHA3_256(append(h1BytesForReplay, h2Bytes...))
+	sessionID := sessionIDForHandshake(fromID, toID, ea, eb, transcript)
+	sigInput2 := hello2SigInput(fromID, toID, ea, eb, na, nb, sessionID)
 	sig2, err := crypto.SignDigest(n.PrivKey, crypto.SHA3_256(sigInput2))
 	if err != nil {
 		eph.Destroy()
 		return proto.Hello2Msg{}, err
 	}
-	h1Bytes := proto.Hello1Bytes(fromID, toID, ea, na)
-	h2Bytes := proto.Hello2Bytes(n.ID, fromID, eb, nb)
-	transcript := crypto.SHA3_256(append(h1Bytes, h2Bytes...))
 	ss, err := eph.Shared(ea)
 	if err != nil {
 		eph.Destroy()
@@ -273,6 +296,7 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 		ToNodeID:   hex.EncodeToString(fromID[:]),
 		EB:         hex.EncodeToString(eb),
 		Nb:         hex.EncodeToString(nb),
+		SessionID:  hex.EncodeToString(sessionID),
 		Sig:        hex.EncodeToString(sig2),
 	}, nil
 }
@@ -300,7 +324,24 @@ func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 	if !ok || pending == nil || pending.Ephemeral == nil {
 		return errors.New("missing pending handshake")
 	}
-	sigInput := hello2SigInput(n.ID, fromID, pending.EA, eb, pending.Na, nb)
+	sessionID, err := decodeSessionIDHex(m.SessionID)
+	if err != nil {
+		if !allowLegacyHelloSig() {
+			return err
+		}
+	}
+	h1Bytes := pending.Hello1Bytes
+	h2Bytes := proto.Hello2Bytes(fromID, toID, eb, nb)
+	transcript := crypto.SHA3_256(append(h1Bytes, h2Bytes...))
+	expectedSID := sessionIDForHandshake(n.ID, fromID, pending.EA, eb, transcript)
+	if len(sessionID) > 0 && !bytesEqual(sessionID, expectedSID) {
+		pending.Ephemeral.Destroy()
+		return errors.New("hello2 session_id mismatch")
+	}
+	sigInput := hello2SigInput(n.ID, fromID, pending.EA, eb, pending.Na, nb, sessionID)
+	if len(sessionID) == 0 {
+		sigInput = hello2SigInputLegacy(n.ID, fromID, pending.EA, eb, pending.Na, nb)
+	}
 	if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
 		pending.Ephemeral.Destroy()
 		return errors.New("bad hello2 signature")
@@ -327,9 +368,6 @@ func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 			}
 		}
 	}
-	h1Bytes := pending.Hello1Bytes
-	h2Bytes := proto.Hello2Bytes(fromID, toID, eb, nb)
-	transcript := crypto.SHA3_256(append(h1Bytes, h2Bytes...))
 	ss, err := pending.Ephemeral.Shared(eb)
 	if err != nil {
 		pending.Ephemeral.Destroy()
@@ -352,7 +390,18 @@ func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 	return nil
 }
 
-func hello1SigInput(fromID, toID [32]byte, ea, na []byte) []byte {
+func hello1SigInput(fromID, toID [32]byte, ea, na, sessionID []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v2")+32+32+len(ea)+len(na)+len(sessionID))
+	buf = append(buf, []byte("web4:h1:v2")...)
+	buf = append(buf, fromID[:]...)
+	buf = append(buf, toID[:]...)
+	buf = append(buf, ea...)
+	buf = append(buf, na...)
+	buf = append(buf, sessionID...)
+	return buf
+}
+
+func hello1SigInputLegacy(fromID, toID [32]byte, ea, na []byte) []byte {
 	buf := make([]byte, 0, len("web4:h1:v1")+32+32+len(ea)+len(na))
 	buf = append(buf, []byte("web4:h1:v1")...)
 	buf = append(buf, fromID[:]...)
@@ -362,7 +411,20 @@ func hello1SigInput(fromID, toID [32]byte, ea, na []byte) []byte {
 	return buf
 }
 
-func hello2SigInput(fromID, toID [32]byte, ea, eb, na, nb []byte) []byte {
+func hello2SigInput(fromID, toID [32]byte, ea, eb, na, nb, sessionID []byte) []byte {
+	buf := make([]byte, 0, len("web4:h2:v2")+32+32+len(ea)+len(eb)+len(na)+len(nb)+len(sessionID))
+	buf = append(buf, []byte("web4:h2:v2")...)
+	buf = append(buf, fromID[:]...)
+	buf = append(buf, toID[:]...)
+	buf = append(buf, ea...)
+	buf = append(buf, eb...)
+	buf = append(buf, na...)
+	buf = append(buf, nb...)
+	buf = append(buf, sessionID...)
+	return buf
+}
+
+func hello2SigInputLegacy(fromID, toID [32]byte, ea, eb, na, nb []byte) []byte {
 	buf := make([]byte, 0, len("web4:h2:v1")+32+32+len(ea)+len(eb)+len(na)+len(nb))
 	buf = append(buf, []byte("web4:h2:v1")...)
 	buf = append(buf, fromID[:]...)
@@ -378,6 +440,52 @@ func zeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+}
+
+func sessionIDForHandshake(fromID, toID [32]byte, ea, eb, transcriptHash []byte) []byte {
+	buf := make([]byte, 0, len("WEB4/session")+len(proto.ProtoVersion)+32+32+len(ea)+len(eb)+len(transcriptHash))
+	buf = append(buf, []byte("WEB4/session")...)
+	buf = append(buf, []byte(proto.ProtoVersion)...)
+	buf = append(buf, fromID[:]...)
+	buf = append(buf, toID[:]...)
+	buf = append(buf, ea...)
+	buf = append(buf, eb...)
+	buf = append(buf, transcriptHash...)
+	sum := crypto.SHA3_256(buf)
+	out := make([]byte, len(sum))
+	copy(out, sum)
+	return out
+}
+
+func zero32() []byte {
+	return make([]byte, 32)
+}
+
+func decodeSessionIDHex(s string) ([]byte, error) {
+	if s == "" {
+		return nil, errors.New("missing session_id")
+	}
+	b, err := hex.DecodeString(s)
+	if err != nil || len(b) != 32 {
+		return nil, errors.New("bad session_id")
+	}
+	return b, nil
+}
+
+func allowLegacyHelloSig() bool {
+	return os.Getenv("WEB4_HELLO_ALLOW_LEGACY_SIG") == "1"
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func sameHost(a, b string) bool {

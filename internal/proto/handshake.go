@@ -22,6 +22,7 @@ type Hello1Msg struct {
 	ToNodeID   string `json:"to_node_id"`
 	EA         string `json:"ea"`
 	Na         string `json:"na"`
+	SessionID  string `json:"session_id,omitempty"`
 	Sig        string `json:"sig"`
 }
 
@@ -33,6 +34,7 @@ type Hello2Msg struct {
 	ToNodeID   string `json:"to_node_id"`
 	EB         string `json:"eb"`
 	Nb         string `json:"nb"`
+	SessionID  string `json:"session_id,omitempty"`
 	Sig        string `json:"sig"`
 }
 

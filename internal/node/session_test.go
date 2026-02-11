@@ -194,6 +194,76 @@ func TestHello1FromAddrPersistsUnverifiedHint(t *testing.T) {
 	}
 }
 
+func TestHandshakeRejectsTamperedTranscriptField(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	nodeA, err := NewNode(dirA, Options{})
+	if err != nil {
+		t.Fatalf("new node A failed: %v", err)
+	}
+	nodeB, err := NewNode(dirB, Options{})
+	if err != nil {
+		t.Fatalf("new node B failed: %v", err)
+	}
+	if err := nodeA.Peers.Upsert(peer.Peer{NodeID: nodeB.ID, PubKey: nodeB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+
+	hello1, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	// Tamper transcript input field without updating signature.
+	hello1.Na = "00" + hello1.Na[2:]
+	if _, err := nodeB.HandleHello1(hello1); err == nil {
+		t.Fatalf("expected transcript tamper rejection")
+	}
+}
+
+func TestHandshakeRejectsHello2ReplayAcrossDifferentTranscript(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	nodeA, err := NewNode(dirA, Options{})
+	if err != nil {
+		t.Fatalf("new node A failed: %v", err)
+	}
+	nodeB, err := NewNode(dirB, Options{})
+	if err != nil {
+		t.Fatalf("new node B failed: %v", err)
+	}
+	if err := nodeA.Peers.Upsert(peer.Peer{NodeID: nodeB.ID, PubKey: nodeB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+
+	hello1a, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1a failed: %v", err)
+	}
+	hello2a, err := nodeB.HandleHello1(hello1a)
+	if err != nil {
+		t.Fatalf("handle hello1a failed: %v", err)
+	}
+
+	hello1b, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1b failed: %v", err)
+	}
+	if _, err := nodeB.HandleHello1(hello1b); err != nil {
+		t.Fatalf("handle hello1b failed: %v", err)
+	}
+
+	// Replay hello2 from transcript A into transcript B pending state.
+	if err := nodeA.HandleHello2(hello2a); err == nil {
+		t.Fatalf("expected replayed hello2 rejection for mismatched transcript")
+	}
+}
+
 func TestRecvSeqRejectsReplay(t *testing.T) {
 	st := &SessionState{}
 	if err := st.AcceptRecvSeq(1); err != nil {
