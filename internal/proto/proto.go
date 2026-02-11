@@ -49,7 +49,8 @@ const (
 
 const (
 	ProtoVersion = "0.0.2"
-	Suite        = "rsa-pss+x25519+xchacha20poly1305+sha3"
+	// Suite is wire metadata versioning, not negotiated handshake crypto suite.
+	Suite = "web4-wire-v1"
 )
 
 const (

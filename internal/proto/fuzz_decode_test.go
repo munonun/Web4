@@ -22,7 +22,7 @@ func FuzzDecodeFrame(f *testing.F) {
 }
 
 func FuzzDecodeDeltaB(f *testing.F) {
-	f.Add([]byte(`{"type":"delta_b","proto_version":"0.0.2","suite":"rsa-pss+x25519+xchacha20poly1305","view_id":"` + strings.Repeat("00", 32) + `","entries":[{"node_id":"` + strings.Repeat("00", 32) + `","delta":1},{"node_id":"` + strings.Repeat("01", 32) + `","delta":-1}]}`))
+	f.Add([]byte(`{"type":"delta_b","proto_version":"0.0.2","suite":"web4-wire-v1","view_id":"` + strings.Repeat("00", 32) + `","entries":[{"node_id":"` + strings.Repeat("00", 32) + `","delta":1},{"node_id":"` + strings.Repeat("01", 32) + `","delta":-1}]}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		data = testutil.CapBytes(data, testutil.DefaultMaxFuzzBytes)
 		testutil.WithTimeout(t, testutil.DefaultFuzzTimeout, func() {
@@ -36,7 +36,7 @@ func FuzzDecodeDeltaB(f *testing.F) {
 }
 
 func FuzzDecodeInviteCert(f *testing.F) {
-	f.Add([]byte(`{"type":"invite_cert","proto_version":"0.0.2","suite":"rsa-pss+x25519+xchacha20poly1305"}`))
+	f.Add([]byte(`{"type":"invite_cert","proto_version":"0.0.2","suite":"web4-wire-v1"}`))
 	f.Fuzz(func(t *testing.T, data []byte) {
 		data = testutil.CapBytes(data, testutil.DefaultMaxFuzzBytes)
 		testutil.WithTimeout(t, testutil.DefaultFuzzTimeout, func() {

@@ -10,32 +10,44 @@ const (
 	MsgTypeHello1 = "hello1"
 	MsgTypeHello2 = "hello2"
 
-	MaxHello1Size = 8 << 10
-	MaxHello2Size = 8 << 10
+	// Suite 0 carries additional PQ material (ML-KEM + SLH-DSA), so
+	// handshake envelopes are larger than legacy RSA/X25519 messages.
+	MaxHello1Size = 32 << 10
+	MaxHello2Size = 32 << 10
 )
 
 type Hello1Msg struct {
-	Type       string `json:"type"`
-	FromNodeID string `json:"from_node_id"`
-	FromPub    string `json:"from_pub"`
-	FromAddr   string `json:"from_addr,omitempty"`
-	ToNodeID   string `json:"to_node_id"`
-	EA         string `json:"ea"`
-	Na         string `json:"na"`
-	SessionID  string `json:"session_id,omitempty"`
-	Sig        string `json:"sig"`
+	Type            string `json:"type"`
+	FromNodeID      string `json:"from_node_id"`
+	FromPub         string `json:"from_pub"`
+	FromAddr        string `json:"from_addr,omitempty"`
+	ToNodeID        string `json:"to_node_id"`
+	SuiteID         int    `json:"suite_id"`
+	SupportedSuites string `json:"supported_suites,omitempty"`
+	EA              string `json:"ea"`
+	Na              string `json:"na"`
+	MLKEMPub        string `json:"mlkem_pub,omitempty"`
+	PQPub           string `json:"pq_pub,omitempty"`
+	PQBindSig       string `json:"pq_bind_sig,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	Sig             string `json:"sig"`
 }
 
 type Hello2Msg struct {
-	Type       string `json:"type"`
-	FromNodeID string `json:"from_node_id"`
-	FromPub    string `json:"from_pub"`
-	FromAddr   string `json:"from_addr,omitempty"`
-	ToNodeID   string `json:"to_node_id"`
-	EB         string `json:"eb"`
-	Nb         string `json:"nb"`
-	SessionID  string `json:"session_id,omitempty"`
-	Sig        string `json:"sig"`
+	Type            string `json:"type"`
+	FromNodeID      string `json:"from_node_id"`
+	FromPub         string `json:"from_pub"`
+	FromAddr        string `json:"from_addr,omitempty"`
+	ToNodeID        string `json:"to_node_id"`
+	SuiteID         int    `json:"suite_id"`
+	SupportedSuites string `json:"supported_suites,omitempty"`
+	EB              string `json:"eb"`
+	Nb              string `json:"nb"`
+	MLKEMCT         string `json:"mlkem_ct,omitempty"`
+	PQPub           string `json:"pq_pub,omitempty"`
+	PQBindSig       string `json:"pq_bind_sig,omitempty"`
+	SessionID       string `json:"session_id,omitempty"`
+	Sig             string `json:"sig"`
 }
 
 func EncodeHello1Msg(m Hello1Msg) ([]byte, error) {

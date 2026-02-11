@@ -39,6 +39,31 @@ func DeriveSessionKeys(ss, transcript []byte) (SessionKeys, error) {
 	}, nil
 }
 
+func DeriveSessionKeysBySuite(ssX25519, ssMLKEM, transcript []byte, suiteID byte) (SessionKeys, error) {
+	if len(ssX25519) == 0 || len(transcript) == 0 {
+		return SessionKeys{}, errors.New("empty key material")
+	}
+	if suiteID == 0 && len(ssMLKEM) == 0 {
+		return SessionKeys{}, errors.New("missing mlkem key material")
+	}
+	ss := make([]byte, 0, len(ssX25519)+len(ssMLKEM))
+	ss = append(ss, ssX25519...)
+	ss = append(ss, ssMLKEM...)
+	suite := []byte{suiteID}
+	master := KDF(labelKDFMaster, ss, transcript, suite)
+	send := KDF(labelSendKey, master, suite)
+	recv := KDF(labelRecvKey, master, suite)
+	nsSend := KDF(labelNonceSend, master, suite)[:XNonceSize]
+	nsRecv := KDF(labelNonceRecv, master, suite)[:XNonceSize]
+	return SessionKeys{
+		Master:        master,
+		SendKey:       send,
+		RecvKey:       recv,
+		NonceBaseSend: nsSend,
+		NonceBaseRecv: nsRecv,
+	}, nil
+}
+
 func NonceFromBase(base []byte, counter uint64) ([]byte, error) {
 	if len(base) != XNonceSize {
 		return nil, errors.New("bad nonce base size")

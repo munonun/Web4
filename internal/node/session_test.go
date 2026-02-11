@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"os"
 	"testing"
 	"time"
 
@@ -261,6 +262,104 @@ func TestHandshakeRejectsHello2ReplayAcrossDifferentTranscript(t *testing.T) {
 	// Replay hello2 from transcript A into transcript B pending state.
 	if err := nodeA.HandleHello2(hello2a); err == nil {
 		t.Fatalf("expected replayed hello2 rejection for mismatched transcript")
+	}
+}
+
+func TestHandshakeRejectsForcedDowngradeWhenBothSupportSuite0(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	nodeA, err := NewNode(dirA, Options{})
+	if err != nil {
+		t.Fatalf("new node A failed: %v", err)
+	}
+	nodeB, err := NewNode(dirB, Options{})
+	if err != nil {
+		t.Fatalf("new node B failed: %v", err)
+	}
+	if err := nodeA.Peers.Upsert(peer.Peer{NodeID: nodeB.ID, PubKey: nodeB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+
+	hello1, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	hello1.SuiteID = int(SuiteLegacyX25519RSA)
+	if _, err := nodeB.HandleHello1(hello1); err == nil {
+		t.Fatalf("expected forced downgrade rejection")
+	}
+}
+
+func TestHandshakeAcceptsLegacyWhenPeerLacksSuite0(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	nodeA, err := NewNode(dirA, Options{})
+	if err != nil {
+		t.Fatalf("new node A failed: %v", err)
+	}
+	nodeB, err := NewNode(dirB, Options{})
+	if err != nil {
+		t.Fatalf("new node B failed: %v", err)
+	}
+	if err := nodeA.Peers.Upsert(peer.Peer{NodeID: nodeB.ID, PubKey: nodeB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+
+	prev := os.Getenv("WEB4_HANDSHAKE_DISABLE_SUITE0")
+	_ = os.Setenv("WEB4_HANDSHAKE_DISABLE_SUITE0", "1")
+	hello1, err := nodeA.BuildHello1(nodeB.ID)
+	if prev == "" {
+		_ = os.Unsetenv("WEB4_HANDSHAKE_DISABLE_SUITE0")
+	} else {
+		_ = os.Setenv("WEB4_HANDSHAKE_DISABLE_SUITE0", prev)
+	}
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	hello2, err := nodeB.HandleHello1(hello1)
+	if err != nil {
+		t.Fatalf("expected legacy compat accept, got: %v", err)
+	}
+	if err := nodeA.HandleHello2(hello2); err != nil {
+		t.Fatalf("handle hello2 failed: %v", err)
+	}
+}
+
+func TestHandshakeRejectsSuiteTamper(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	nodeA, err := NewNode(dirA, Options{})
+	if err != nil {
+		t.Fatalf("new node A failed: %v", err)
+	}
+	nodeB, err := NewNode(dirB, Options{})
+	if err != nil {
+		t.Fatalf("new node B failed: %v", err)
+	}
+	if err := nodeA.Peers.Upsert(peer.Peer{NodeID: nodeB.ID, PubKey: nodeB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+
+	hello1, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	if hello1.SuiteID == int(SuiteHybridMLKEMSPHINCS) {
+		hello1.SuiteID = int(SuiteLegacyX25519RSA)
+	} else {
+		hello1.SuiteID = int(SuiteHybridMLKEMSPHINCS)
+	}
+	if _, err := nodeB.HandleHello1(hello1); err == nil {
+		t.Fatalf("expected suite tamper rejection")
 	}
 }
 

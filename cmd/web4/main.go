@@ -296,9 +296,10 @@ func (e recvError) Error() string {
 	return fmt.Sprintf("%s: %v", e.msg, e.err)
 }
 
-func hello1SigInput(fromID, toID [32]byte, ea, na, sessionID []byte) []byte {
-	buf := make([]byte, 0, len("web4:h1:v2")+32+32+len(ea)+len(na)+len(sessionID))
-	buf = append(buf, []byte("web4:h1:v2")...)
+func hello1SigInput(suiteID byte, fromID, toID [32]byte, ea, na, sessionID []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v3")+1+32+32+len(ea)+len(na)+len(sessionID))
+	buf = append(buf, []byte("web4:h1:v3")...)
+	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
 	buf = append(buf, ea...)
@@ -307,9 +308,10 @@ func hello1SigInput(fromID, toID [32]byte, ea, na, sessionID []byte) []byte {
 	return buf
 }
 
-func hello1SigInputLegacy(fromID, toID [32]byte, ea, na []byte) []byte {
-	buf := make([]byte, 0, len("web4:h1:v1")+32+32+len(ea)+len(na))
-	buf = append(buf, []byte("web4:h1:v1")...)
+func hello1SigInputLegacy(suiteID byte, fromID, toID [32]byte, ea, na []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v2")+1+32+32+len(ea)+len(na))
+	buf = append(buf, []byte("web4:h1:v2")...)
+	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
 	buf = append(buf, ea...)
@@ -317,10 +319,11 @@ func hello1SigInputLegacy(fromID, toID [32]byte, ea, na []byte) []byte {
 	return buf
 }
 
-func sessionIDForHandshake(fromID, toID [32]byte, ea, eb, transcriptHash []byte) []byte {
-	buf := make([]byte, 0, len("WEB4/session")+len(proto.ProtoVersion)+32+32+len(ea)+len(eb)+len(transcriptHash))
+func sessionIDForHandshake(suiteID byte, fromID, toID [32]byte, ea, eb, transcriptHash []byte) []byte {
+	buf := make([]byte, 0, len("WEB4/session")+len(proto.ProtoVersion)+1+32+32+len(ea)+len(eb)+len(transcriptHash))
 	buf = append(buf, []byte("WEB4/session")...)
 	buf = append(buf, []byte(proto.ProtoVersion)...)
+	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
 	buf = append(buf, ea...)
@@ -349,6 +352,41 @@ func allowLegacyHelloSig() bool {
 
 func zero32() []byte {
 	return make([]byte, 32)
+}
+
+func hello1TranscriptBytes(suiteID byte, fromID, toID [32]byte, ea, na, mlkemPub []byte) []byte {
+	base := proto.Hello1Bytes(fromID, toID, ea, na)
+	out := make([]byte, 0, len(base)+1+len(mlkemPub))
+	out = append(out, base...)
+	out = append(out, suiteID)
+	out = append(out, mlkemPub...)
+	return out
+}
+
+func pqBindInput(nodeID [32]byte, pqPub []byte) []byte {
+	buf := make([]byte, 0, len("WEB4/pqbind")+32+len(pqPub))
+	buf = append(buf, []byte("WEB4/pqbind")...)
+	buf = append(buf, nodeID[:]...)
+	buf = append(buf, pqPub...)
+	return buf
+}
+
+func decodeHexOptional(v string) ([]byte, error) {
+	if strings.TrimSpace(v) == "" {
+		return nil, nil
+	}
+	return hex.DecodeString(v)
+}
+
+func verifyHelloBySuite(suiteID byte, rsaPub, pqPub, input, sig []byte) bool {
+	digest := crypto.SHA3_256(input)
+	if suiteID == 0 {
+		if len(pqPub) == 0 || len(sig) < 64 {
+			return false
+		}
+		return crypto.SLHDSAVerify(pqPub, digest, sig)
+	}
+	return crypto.VerifyDigest(rsaPub, digest, sig)
 }
 
 func bytesEqual(a, b []byte) bool {
@@ -1870,7 +1908,29 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string) 
 	if fromID == self.ID {
 		return false, errors.New("hello1 from_id self")
 	}
-	h1Bytes := proto.Hello1Bytes(fromID, toID, ea, na)
+	suiteID := byte(m.SuiteID)
+	mlkemPub, err := decodeHexOptional(m.MLKEMPub)
+	if err != nil {
+		return false, errors.New("bad mlkem_pub")
+	}
+	pqPub, err := decodeHexOptional(m.PQPub)
+	if err != nil {
+		return false, errors.New("bad pq_pub")
+	}
+	pqBindSig, err := decodeHexOptional(m.PQBindSig)
+	if err != nil {
+		return false, errors.New("bad pq_bind_sig")
+	}
+	if suiteID == 0 {
+		if len(mlkemPub) != crypto.MLKEM768PublicKeySize || len(pqPub) == 0 || len(pqBindSig) == 0 {
+			return false, errors.New("missing pq fields")
+		}
+		bind := pqBindInput(fromID, pqPub)
+		if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(bind), pqBindSig) {
+			return false, errors.New("bad pq binding")
+		}
+	}
+	h1Bytes := hello1TranscriptBytes(suiteID, fromID, toID, ea, na, mlkemPub)
 	h1TranscriptHash := crypto.SHA3_256(h1Bytes)
 	sessionID, err := decodeSessionIDHex(m.SessionID)
 	if err != nil {
@@ -1878,15 +1938,15 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string) 
 			return false, err
 		}
 	}
-	expectedSID := sessionIDForHandshake(fromID, toID, ea, zero32(), h1TranscriptHash)
+	expectedSID := sessionIDForHandshake(suiteID, fromID, toID, ea, zero32(), h1TranscriptHash)
 	if len(sessionID) > 0 && !bytesEqual(sessionID, expectedSID) {
 		return false, errors.New("hello1 session_id mismatch")
 	}
-	sigInput := hello1SigInput(fromID, toID, ea, na, sessionID)
+	sigInput := hello1SigInput(suiteID, fromID, toID, ea, na, sessionID)
 	if len(sessionID) == 0 {
-		sigInput = hello1SigInputLegacy(fromID, toID, ea, na)
+		sigInput = hello1SigInputLegacy(suiteID, fromID, toID, ea, na)
 	}
-	if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(sigInput), sig) {
+	if !verifyHelloBySuite(suiteID, fromPub, pqPub, sigInput, sig) {
 		debugCount.incVerify("hello1")
 		return false, errors.New("bad hello1 signature")
 	}
@@ -2445,6 +2505,23 @@ func previewBytes(b []byte, max int) string {
 		}
 	}
 	return string(out)
+}
+
+func handshakeSuiteIDLabel(payload []byte) string {
+	var hdr struct {
+		Type    string `json:"type"`
+		SuiteID *int   `json:"suite_id"`
+	}
+	if err := json.Unmarshal(payload, &hdr); err != nil {
+		return "n/a"
+	}
+	if hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 {
+		return "n/a"
+	}
+	if hdr.SuiteID == nil {
+		return "n/a"
+	}
+	return strconv.Itoa(*hdr.SuiteID)
 }
 
 func sameHost(a, b string) bool {
@@ -3904,7 +3981,8 @@ func main() {
 			if json.Unmarshal(data, &inHdr) == nil {
 				inType = inHdr.Type
 			}
-			fmt.Fprintf(os.Stderr, "OUTBOUND input type=%s bytes=%d preview=%s\n", inType, len(data), previewBytes(data, 80))
+			hsID := handshakeSuiteIDLabel(data)
+			fmt.Fprintf(os.Stderr, "OUTBOUND input type=%s bytes=%d handshake_suite_id=%s preview=%s\n", inType, len(data), hsID, previewBytes(data, 80))
 			self, err := node.NewNode(root, node.Options{})
 			if err != nil {
 				fail("load node failed", err)
@@ -3924,7 +4002,7 @@ func main() {
 			if json.Unmarshal(out, &outHdr) == nil {
 				outType = outHdr.Type
 			}
-			fmt.Fprintf(os.Stderr, "OUTBOUND top-level type=%s bytes=%d to=%s preview=%s\n", outType, len(out), *addr, previewBytes(out, 80))
+			fmt.Fprintf(os.Stderr, "OUTBOUND top-level type=%s bytes=%d to=%s handshake_suite_id=%s preview=%s\n", outType, len(out), *addr, hsID, previewBytes(out, 80))
 			if os.Getenv("WEB4_CHECK6_ACK") == "1" {
 				resp, err := network.Exchange(*addr, out, false, *devTLS, *devTLSCA)
 				if err != nil {

@@ -13,6 +13,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/cloudflare/circl/kem/mlkem/mlkem768"
+	"github.com/cloudflare/circl/sign/slhdsa"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/sha3"
 )
@@ -27,6 +29,15 @@ import (
 // -----------------------------------------------------------------------------
 
 const RSABits = 4096
+
+const (
+	MLKEM768PublicKeySize  = mlkem768.PublicKeySize
+	MLKEM768PrivateKeySize = mlkem768.PrivateKeySize
+	MLKEM768CiphertextSize = mlkem768.CiphertextSize
+	MLKEM768SharedKeySize  = mlkem768.SharedKeySize
+)
+
+var slhDSAParam = slhdsa.SHAKE_128s
 
 const (
 	// XChaCha20-Poly1305 sizes
@@ -307,6 +318,78 @@ func IsRSAPublicKey(pub []byte) bool {
 func IsRSAPrivateKey(priv []byte) bool {
 	_, err := ParseRSAPrivateKey(priv)
 	return err == nil
+}
+
+func GenSLHDSAKeypair() ([]byte, []byte, error) {
+	pub, priv, err := slhdsa.GenerateKey(rand.Reader, slhDSAParam)
+	if err != nil {
+		return nil, nil, err
+	}
+	pubBin, err := pub.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+	privBin, err := priv.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+	return pubBin, privBin, nil
+}
+
+func SLHDSASign(priv, msg []byte) ([]byte, error) {
+	key := slhdsa.PrivateKey{ID: slhDSAParam}
+	if err := key.UnmarshalBinary(priv); err != nil {
+		return nil, err
+	}
+	return slhdsa.SignRandomized(&key, rand.Reader, slhdsa.NewMessage(msg), nil)
+}
+
+func SLHDSAVerify(pub, msg, sig []byte) bool {
+	key := slhdsa.PublicKey{ID: slhDSAParam}
+	if err := key.UnmarshalBinary(pub); err != nil {
+		return false
+	}
+	return slhdsa.Verify(&key, slhdsa.NewMessage(msg), sig, nil)
+}
+
+func GenMLKEM768Keypair() ([]byte, []byte, error) {
+	pub, priv, err := mlkem768.GenerateKeyPair(rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	pubBin, err := pub.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+	privBin, err := priv.MarshalBinary()
+	if err != nil {
+		return nil, nil, err
+	}
+	return pubBin, privBin, nil
+}
+
+func MLKEM768Encapsulate(pub []byte) (ct []byte, ss []byte, err error) {
+	var p mlkem768.PublicKey
+	if err := p.Unpack(pub); err != nil {
+		return nil, nil, err
+	}
+	ct = make([]byte, mlkem768.CiphertextSize)
+	ss = make([]byte, mlkem768.SharedKeySize)
+	p.EncapsulateTo(ct, ss, nil)
+	return ct, ss, nil
+}
+
+func MLKEM768Decapsulate(priv, ct []byte) ([]byte, error) {
+	var sk mlkem768.PrivateKey
+	if err := sk.Unpack(priv); err != nil {
+		return nil, err
+	}
+	if len(ct) != mlkem768.CiphertextSize {
+		return nil, errors.New("bad mlkem ciphertext size")
+	}
+	ss := make([]byte, mlkem768.SharedKeySize)
+	sk.DecapsulateTo(ss, ct)
+	return ss, nil
 }
 
 // -----------------------------------------------------------------------------
