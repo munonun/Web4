@@ -10,8 +10,14 @@ import (
 const (
 	MsgTypeInviteCert   = "invite_cert"
 	MsgTypeInviteAck    = "invite_ack"
+	MsgTypeInviteReq    = "invite_request"
+	MsgTypePoWaDChal    = "powad_challenge"
+	MsgTypePoWaDSol     = "powad_solution"
 	MaxInviteCertSize   = 8 << 10
 	MaxInviteAckSize    = 2 << 10
+	MaxInviteReqSize    = 4 << 10
+	MaxPoWaDChalSize    = 4 << 10
+	MaxPoWaDSolSize     = 4 << 10
 	InvitePoWaDBits     = 26
 	InviteScopeGossip   = uint32(1 << 0)
 	InviteScopeContract = uint32(1 << 1)
@@ -53,6 +59,38 @@ type InviteAckMsg struct {
 	InviteID      string `json:"invite_id"`
 }
 
+type InviteRequestMsg struct {
+	Type       string `json:"type"`
+	FromNodeID string `json:"from_node_id"`
+	FromPub    string `json:"from_pub"`
+	ToNodeID   string `json:"to_node_id"`
+	Scope      uint32 `json:"scope"`
+}
+
+type PoWaDChallengeMsg struct {
+	Type           string `json:"type"`
+	FromNodeID     string `json:"from_node_id"`
+	ToNodeID       string `json:"to_node_id"`
+	Scope          uint32 `json:"scope"`
+	ChallengeNonce uint64 `json:"challenge_nonce"`
+	ExpiresAt      uint64 `json:"expires_at"`
+	PowBits        uint8  `json:"pow_bits"`
+	InviteID       string `json:"invite_id"`
+}
+
+type PoWaDSolutionMsg struct {
+	Type           string `json:"type"`
+	FromNodeID     string `json:"from_node_id"`
+	FromPub        string `json:"from_pub"`
+	ToNodeID       string `json:"to_node_id"`
+	Scope          uint32 `json:"scope"`
+	ChallengeNonce uint64 `json:"challenge_nonce"`
+	ExpiresAt      uint64 `json:"expires_at"`
+	PowBits        uint8  `json:"pow_bits"`
+	InviteID       string `json:"invite_id"`
+	PowNonce       uint64 `json:"pow_nonce"`
+}
+
 func EncodeInviteCertMsg(m InviteCertMsg) ([]byte, error) {
 	if m.Type == "" {
 		m.Type = MsgTypeInviteCert
@@ -85,6 +123,60 @@ func DecodeInviteAckMsg(data []byte) (InviteAckMsg, error) {
 	}
 	if m.Type != "" && m.Type != MsgTypeInviteAck {
 		return InviteAckMsg{}, fmt.Errorf("unexpected msg type: %s", m.Type)
+	}
+	return m, nil
+}
+
+func EncodeInviteRequestMsg(m InviteRequestMsg) ([]byte, error) {
+	if m.Type == "" {
+		m.Type = MsgTypeInviteReq
+	}
+	return json.Marshal(m)
+}
+
+func DecodeInviteRequestMsg(data []byte) (InviteRequestMsg, error) {
+	var m InviteRequestMsg
+	if err := json.Unmarshal(data, &m); err != nil {
+		return InviteRequestMsg{}, err
+	}
+	if m.Type != "" && m.Type != MsgTypeInviteReq {
+		return InviteRequestMsg{}, fmt.Errorf("unexpected msg type: %s", m.Type)
+	}
+	return m, nil
+}
+
+func EncodePoWaDChallengeMsg(m PoWaDChallengeMsg) ([]byte, error) {
+	if m.Type == "" {
+		m.Type = MsgTypePoWaDChal
+	}
+	return json.Marshal(m)
+}
+
+func DecodePoWaDChallengeMsg(data []byte) (PoWaDChallengeMsg, error) {
+	var m PoWaDChallengeMsg
+	if err := json.Unmarshal(data, &m); err != nil {
+		return PoWaDChallengeMsg{}, err
+	}
+	if m.Type != "" && m.Type != MsgTypePoWaDChal {
+		return PoWaDChallengeMsg{}, fmt.Errorf("unexpected msg type: %s", m.Type)
+	}
+	return m, nil
+}
+
+func EncodePoWaDSolutionMsg(m PoWaDSolutionMsg) ([]byte, error) {
+	if m.Type == "" {
+		m.Type = MsgTypePoWaDSol
+	}
+	return json.Marshal(m)
+}
+
+func DecodePoWaDSolutionMsg(data []byte) (PoWaDSolutionMsg, error) {
+	var m PoWaDSolutionMsg
+	if err := json.Unmarshal(data, &m); err != nil {
+		return PoWaDSolutionMsg{}, err
+	}
+	if m.Type != "" && m.Type != MsgTypePoWaDSol {
+		return PoWaDSolutionMsg{}, fmt.Errorf("unexpected msg type: %s", m.Type)
 	}
 	return m, nil
 }

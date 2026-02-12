@@ -86,6 +86,12 @@ func MaxSizeForType(t string) int {
 		return MaxInviteCertSize
 	case MsgTypeInviteAck:
 		return MaxInviteAckSize
+	case MsgTypeInviteReq:
+		return MaxInviteReqSize
+	case MsgTypePoWaDChal:
+		return MaxPoWaDChalSize
+	case MsgTypePoWaDSol:
+		return MaxPoWaDSolSize
 	case MsgTypeInviteBundle:
 		return MaxInviteBundleSize
 	case MsgTypeRevoke:

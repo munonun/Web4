@@ -1777,6 +1777,237 @@ func TestInviteCertAcceptsWithoutKnownPeer(t *testing.T) {
 	}
 }
 
+func TestHelloWorksWithoutMembership(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	nodeA, err := node.NewNode(filepath.Join(homeA, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load node A failed: %v", err)
+	}
+	nodeB, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load node B failed: %v", err)
+	}
+	if err := nodeA.Peers.Upsert(peer.Peer{NodeID: nodeB.ID, PubKey: nodeB.PubKey}, true); err != nil {
+		t.Fatalf("seed peer B failed: %v", err)
+	}
+	if err := nodeB.Peers.Upsert(peer.Peer{NodeID: nodeA.ID, PubKey: nodeA.PubKey}, true); err != nil {
+		t.Fatalf("seed peer A failed: %v", err)
+	}
+
+	hello1, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	hello2, err := nodeB.HandleHello1From(hello1, "127.0.0.1:10001")
+	if err != nil {
+		t.Fatalf("handle hello1 failed: %v", err)
+	}
+	if err := nodeA.HandleHello2From(hello2, "127.0.0.1:10002"); err != nil {
+		t.Fatalf("handle hello2 failed: %v", err)
+	}
+	if nodeA.Sessions == nil || !nodeA.Sessions.Has(nodeB.ID) {
+		t.Fatalf("expected node A session established")
+	}
+	if nodeB.Sessions == nil || !nodeB.Sessions.Has(nodeA.ID) {
+		t.Fatalf("expected node B session established")
+	}
+}
+
+func TestInviteRequestTriggersPoWaDChallenge(t *testing.T) {
+	resetInvitePoWaDState()
+	origNodeLimiter := recvNodeLimiter
+	recvNodeLimiter = newRateLimiter(1000, time.Second)
+	defer func() { recvNodeLimiter = origNodeLimiter }()
+
+	homeInviter := t.TempDir()
+	homeRequester := t.TempDir()
+	runOK(t, homeInviter, "keygen")
+	runOK(t, homeRequester, "keygen")
+	inviter, err := node.NewNode(filepath.Join(homeInviter, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	requester, err := node.NewNode(filepath.Join(homeRequester, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load requester failed: %v", err)
+	}
+
+	req := proto.InviteRequestMsg{
+		FromNodeID: hex.EncodeToString(requester.ID[:]),
+		FromPub:    hex.EncodeToString(requester.PubKey),
+		ToNodeID:   hex.EncodeToString(inviter.ID[:]),
+		Scope:      proto.InviteScopeGossip,
+	}
+	data, err := proto.EncodeInviteRequestMsg(req)
+	if err != nil {
+		t.Fatalf("encode invite request failed: %v", err)
+	}
+	resp, _, recvErr := recvDataWithResponse(data, nil, inviter, math4.NewLocalChecker(math4.Options{}), "10.0.0.1:1111")
+	if recvErr != nil {
+		t.Fatalf("invite request failed: %v", recvErr)
+	}
+	if len(resp) == 0 {
+		t.Fatalf("expected powad challenge response")
+	}
+	chal, err := proto.DecodePoWaDChallengeMsg(resp)
+	if err != nil {
+		t.Fatalf("decode challenge failed: %v", err)
+	}
+	if chal.ToNodeID != req.FromNodeID || chal.FromNodeID != req.ToNodeID {
+		t.Fatalf("challenge id binding mismatch")
+	}
+	if chal.Scope != req.Scope || chal.InviteID == "" || chal.ExpiresAt == 0 {
+		t.Fatalf("challenge missing required fields")
+	}
+}
+
+func TestInviteRequestWithoutPoWaDSolutionIssuesNoCert(t *testing.T) {
+	resetInvitePoWaDState()
+	origNodeLimiter := recvNodeLimiter
+	recvNodeLimiter = newRateLimiter(1000, time.Second)
+	defer func() { recvNodeLimiter = origNodeLimiter }()
+
+	homeInviter := t.TempDir()
+	homeRequester := t.TempDir()
+	runOK(t, homeInviter, "keygen")
+	runOK(t, homeRequester, "keygen")
+	inviter, err := node.NewNode(filepath.Join(homeInviter, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	requester, err := node.NewNode(filepath.Join(homeRequester, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load requester failed: %v", err)
+	}
+
+	req := proto.InviteRequestMsg{
+		FromNodeID: hex.EncodeToString(requester.ID[:]),
+		FromPub:    hex.EncodeToString(requester.PubKey),
+		ToNodeID:   hex.EncodeToString(inviter.ID[:]),
+		Scope:      proto.InviteScopeGossip,
+	}
+	reqData, err := proto.EncodeInviteRequestMsg(req)
+	if err != nil {
+		t.Fatalf("encode invite request failed: %v", err)
+	}
+	resp, _, recvErr := recvDataWithResponse(reqData, nil, inviter, math4.NewLocalChecker(math4.Options{}), "10.0.0.2:2222")
+	if recvErr != nil {
+		t.Fatalf("invite request failed: %v", recvErr)
+	}
+	chal, err := proto.DecodePoWaDChallengeMsg(resp)
+	if err != nil {
+		t.Fatalf("decode challenge failed: %v", err)
+	}
+
+	sol := proto.PoWaDSolutionMsg{
+		FromNodeID:     req.FromNodeID,
+		FromPub:        req.FromPub,
+		ToNodeID:       req.ToNodeID,
+		Scope:          req.Scope,
+		ChallengeNonce: chal.ChallengeNonce,
+		ExpiresAt:      chal.ExpiresAt,
+		PowBits:        chal.PowBits,
+		InviteID:       chal.InviteID,
+		PowNonce:       0,
+	}
+	solData, err := proto.EncodePoWaDSolutionMsg(sol)
+	if err != nil {
+		t.Fatalf("encode solution failed: %v", err)
+	}
+	solResp, _, solErr := recvDataWithResponse(solData, nil, inviter, math4.NewLocalChecker(math4.Options{}), "10.0.0.2:2222")
+	if solErr == nil {
+		t.Fatalf("expected invalid powad solution rejection")
+	}
+	if len(solResp) > 0 {
+		t.Fatalf("expected no invite cert on invalid solution")
+	}
+}
+
+func TestInviteRequestValidPoWaDSolutionIssuesCertAndUpgradesMembership(t *testing.T) {
+	resetInvitePoWaDState()
+	origNodeLimiter := recvNodeLimiter
+	recvNodeLimiter = newRateLimiter(1000, time.Second)
+	defer func() { recvNodeLimiter = origNodeLimiter }()
+
+	homeInviter := t.TempDir()
+	homeRequester := t.TempDir()
+	runOK(t, homeInviter, "keygen")
+	runOK(t, homeRequester, "keygen")
+	inviter, err := node.NewNode(filepath.Join(homeInviter, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load inviter failed: %v", err)
+	}
+	requester, err := node.NewNode(filepath.Join(homeRequester, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load requester failed: %v", err)
+	}
+
+	scope := proto.InviteScopeContract
+	req := proto.InviteRequestMsg{
+		FromNodeID: hex.EncodeToString(requester.ID[:]),
+		FromPub:    hex.EncodeToString(requester.PubKey),
+		ToNodeID:   hex.EncodeToString(inviter.ID[:]),
+		Scope:      scope,
+	}
+	reqData, err := proto.EncodeInviteRequestMsg(req)
+	if err != nil {
+		t.Fatalf("encode invite request failed: %v", err)
+	}
+	resp, _, recvErr := recvDataWithResponse(reqData, nil, inviter, math4.NewLocalChecker(math4.Options{}), "10.0.0.3:3333")
+	if recvErr != nil {
+		t.Fatalf("invite request failed: %v", recvErr)
+	}
+	chal, err := proto.DecodePoWaDChallengeMsg(resp)
+	if err != nil {
+		t.Fatalf("decode challenge failed: %v", err)
+	}
+	inviteID, err := hex.DecodeString(chal.InviteID)
+	if err != nil {
+		t.Fatalf("decode challenge invite id failed: %v", err)
+	}
+	powNonce, ok := crypto.PoWaDSolve(inviteID, requester.ID[:], chal.PowBits)
+	if !ok {
+		t.Fatalf("powad solve failed")
+	}
+	sol := proto.PoWaDSolutionMsg{
+		FromNodeID:     req.FromNodeID,
+		FromPub:        req.FromPub,
+		ToNodeID:       req.ToNodeID,
+		Scope:          scope,
+		ChallengeNonce: chal.ChallengeNonce,
+		ExpiresAt:      chal.ExpiresAt,
+		PowBits:        chal.PowBits,
+		InviteID:       chal.InviteID,
+		PowNonce:       powNonce,
+	}
+	solData, err := proto.EncodePoWaDSolutionMsg(sol)
+	if err != nil {
+		t.Fatalf("encode solution failed: %v", err)
+	}
+	certData, _, solErr := recvDataWithResponse(solData, nil, inviter, math4.NewLocalChecker(math4.Options{}), "10.0.0.3:3333")
+	if solErr != nil {
+		t.Fatalf("valid powad solution rejected: %v", solErr)
+	}
+	if len(certData) == 0 {
+		t.Fatalf("expected invite cert response")
+	}
+	if _, err := proto.DecodeInviteCertMsg(certData); err != nil {
+		t.Fatalf("expected invite cert response, got decode error: %v", err)
+	}
+
+	_, _, applyErr := recvDataWithResponse(certData, nil, requester, math4.NewLocalChecker(math4.Options{}), "10.0.0.4:4444")
+	if applyErr != nil {
+		t.Fatalf("apply invite cert failed: %v", applyErr)
+	}
+	if !requester.Members.HasScope(requester.ID, scope) {
+		t.Fatalf("expected requester membership upgrade from invite cert")
+	}
+}
+
 func TestHandshakeRetryRegeneratesHello1(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()

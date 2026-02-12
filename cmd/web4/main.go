@@ -524,7 +524,12 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		}
 	}
 	if !wasSecure && hdr.Type != proto.MsgTypeHello1 && hdr.Type != proto.MsgTypeHello2 && hdr.Type != proto.MsgTypeGossipPush {
-		if hdr.Type != proto.MsgTypeInviteCert && hdr.Type != proto.MsgTypeInviteBundle && hdr.Type != proto.MsgTypeRevoke {
+		if hdr.Type != proto.MsgTypeInviteCert &&
+			hdr.Type != proto.MsgTypeInviteBundle &&
+			hdr.Type != proto.MsgTypeRevoke &&
+			hdr.Type != proto.MsgTypeInviteReq &&
+			hdr.Type != proto.MsgTypePoWaDChal &&
+			hdr.Type != proto.MsgTypePoWaDSol {
 			return nil, false, reject("handshake required", fmt.Errorf("missing secure envelope"))
 		}
 	}
@@ -707,6 +712,26 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		}
 		fmt.Fprintf(os.Stderr, "RECV INVITE OK invitee=%x inviter=%x scope=%d\n", inviteeID[:], inviterID[:], cert.Scope)
 		return nil, true, nil
+
+	case proto.MsgTypeInviteReq:
+		resp, err := handleInviteRequest(self, data)
+		if err != nil {
+			return nil, false, reject("invalid invite request", err)
+		}
+		return resp, false, nil
+
+	case proto.MsgTypePoWaDChal:
+		if _, err := proto.DecodePoWaDChallengeMsg(data); err != nil {
+			return nil, false, reject("decode powad challenge failed", err)
+		}
+		return nil, false, nil
+
+	case proto.MsgTypePoWaDSol:
+		resp, err := handlePoWaDSolution(self, data)
+		if err != nil {
+			return nil, false, reject("invalid powad solution", err)
+		}
+		return resp, false, nil
 
 	case proto.MsgTypeInviteBundle:
 		msg, err := proto.DecodeInviteBundleMsg(data)
