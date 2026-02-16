@@ -24,9 +24,10 @@ type PeerExchangeReqMsg struct {
 }
 
 type PeerExchangePeer struct {
-	NodeID string `json:"node_id,omitempty"`
-	PubKey string `json:"pubkey,omitempty"`
-	Addr   string `json:"addr,omitempty"`
+	NodeID     string `json:"node_id,omitempty"`
+	PubKey     string `json:"pubkey,omitempty"`
+	ListenAddr string `json:"listen_addr,omitempty"`
+	Addr       string `json:"addr,omitempty"`
 }
 
 type PeerExchangeRespMsg struct {

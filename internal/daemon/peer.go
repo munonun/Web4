@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"context"
 	stdsha256 "crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -242,6 +243,9 @@ func (r *Runner) setListenAddr(addr string) {
 	r.listenMu.Lock()
 	r.listenAddr = addr
 	r.listenMu.Unlock()
+	if r.Self != nil {
+		r.Self.SetListenAddr(addr)
+	}
 }
 
 func (r *Runner) getListenAddr() string {
@@ -275,14 +279,44 @@ func startConnManWithReady(ctx context.Context, r *Runner, devTLS bool, ready <-
 }
 
 func waitDevTLSCA(ctx context.Context, root string, timeout time.Duration) error {
-	if root == "" {
-		return fmt.Errorf("missing root for devtls ca")
+	certPath := strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_CERT_PATH"))
+	keyPath := strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_KEY_PATH"))
+	bundlePath := strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_BUNDLE_PATH"))
+	if bundlePath != "" {
+		if certPath == "" {
+			certPath = bundlePath
+		}
+		if keyPath == "" {
+			keyPath = bundlePath
+		}
 	}
-	path := filepath.Join(root, "devtls_ca.pem")
+	if certPath == "" {
+		certPath = strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_PATH"))
+	}
+	if certPath == "" {
+		if root == "" {
+			return fmt.Errorf("missing root for devtls ca")
+		}
+		certPath = filepath.Join(root, "devtls_ca.pem")
+	}
+	explicitKeyPair := strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_CERT_PATH")) != "" ||
+		strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_KEY_PATH")) != "" ||
+		strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_BUNDLE_PATH")) != ""
 	deadline := time.Now().Add(timeout)
 	for {
-		if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {
-			return nil
+		if fi, err := os.Stat(certPath); err == nil && fi.Size() > 0 {
+			if !explicitKeyPair {
+				return nil
+			}
+			if keyPath == "" {
+				if time.Now().After(deadline) {
+					return fmt.Errorf("devtls ca not ready")
+				}
+			} else if kfi, kerr := os.Stat(keyPath); kerr == nil && kfi.Size() > 0 {
+				if _, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+					return nil
+				}
+			}
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("devtls ca not ready")
@@ -643,8 +677,8 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 					}
 					if !isZeroNodeID(fromID) {
 						p := peer.Peer{NodeID: fromID, PubKey: pub, Source: "pex", SubnetKey: peer.SubnetKeyForAddr(senderAddr)}
-						_, _ = r.Self.Peers.SetAddrUnverified(p, senderAddr, true)
-						r.Self.Peers.PeerSeen(fromID, senderAddr)
+						_, _ = r.Self.Peers.ObserveAddr(p, senderAddr, "", false, true)
+						r.Self.Peers.PeerSeen(fromID, "")
 						p.Addr = ""
 						_ = r.Self.Peers.Upsert(p, true)
 						if r.Self.Candidates != nil {
@@ -655,8 +689,9 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 					fmt.Fprintf(os.Stderr, "peer_exchange_req invalid pubkey: %v\n", err)
 				}
 			} else if nodeMode() == nodeModeBootstrap && !isZeroNodeID(fromID) && isValidAddr(senderAddr) {
-				p := peer.Peer{NodeID: fromID, Addr: senderAddr, Source: "pex", SubnetKey: peer.SubnetKeyForAddr(senderAddr)}
+				p := peer.Peer{NodeID: fromID, Addr: "", Source: "pex", SubnetKey: peer.SubnetKeyForAddr(senderAddr)}
 				_ = r.Self.Peers.UpsertUnverified(p)
+				_, _ = r.Self.Peers.ObserveAddr(p, senderAddr, "", false, true)
 				if r.Self.Candidates != nil {
 					r.Self.Candidates.Add(senderAddr)
 				}
@@ -1800,6 +1835,7 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 	if fromID == self.ID {
 		return false, errors.New("hello1 from_id self")
 	}
+	listenAddr := advertisedListenAddr(m.ListenAddr, m.FromAddr)
 	// Rate-limit gossip hello by sender identity before any expensive signature checks.
 	fromKey := hex.EncodeToString(fromID[:])
 	if !recvNodeLimiter.Allow(fromKey) {
@@ -1834,7 +1870,7 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 			return false, errors.New("bad pq binding")
 		}
 	}
-	h1Bytes := hello1TranscriptBytes(suiteID, fromID, toID, ea, na, mlkemPub)
+	h1Bytes := hello1TranscriptBytes(suiteID, fromID, toID, listenAddr, ea, na, mlkemPub)
 	h1TranscriptHash := crypto.SHA3_256(h1Bytes)
 	sessionID, err := decodeSessionIDHex(m.SessionID)
 	if err != nil {
@@ -1846,9 +1882,9 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 	if len(sessionID) > 0 && !bytesEqual(sessionID, expectedSID) {
 		return false, errors.New("hello1 session_id mismatch")
 	}
-	sigInput := hello1SigInput(suiteID, fromID, toID, ea, na, sessionID)
+	sigInput := hello1SigInput(suiteID, fromID, toID, listenAddr, ea, na, sessionID)
 	if len(sessionID) == 0 {
-		sigInput = hello1SigInputLegacy(suiteID, fromID, toID, ea, na)
+		sigInput = hello1SigInputLegacy(suiteID, fromID, toID, listenAddr, ea, na)
 	}
 	if !verifyHelloBySuite(suiteID, fromPub, pqPub, sigInput, sig) {
 		debugCount.incVerify("hello1")
@@ -1863,17 +1899,11 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 		return false, err
 	}
 	observedAddr := senderAddr
-	if observedAddr == "" && m.FromAddr != "" && isAddrParseable(m.FromAddr) {
-		observedAddr = m.FromAddr
-	}
 	if observedAddr != "" {
 		candidateAddr := ""
 		verified := false
-		if m.FromAddr != "" && isAddrParseable(m.FromAddr) && (senderAddr == "" || sameHost(senderAddr, m.FromAddr)) {
-			candidateAddr = m.FromAddr
-			verified = true
-		} else if senderAddr != "" {
-			candidateAddr = senderAddr
+		if listenAddr != "" && (senderAddr == "" || sameHost(senderAddr, listenAddr)) {
+			candidateAddr = listenAddr
 			verified = true
 		}
 		if _, err := self.Peers.ObserveAddr(peerInfo, observedAddr, candidateAddr, verified, true); err != nil {
@@ -2571,6 +2601,18 @@ func isAddrParseable(addr string) bool {
 	return err == nil
 }
 
+func normalizeListenAddr(addr string) string {
+	if !isAddrParseable(addr) {
+		return ""
+	}
+	return addr
+}
+
+func advertisedListenAddr(listenAddr, legacyFromAddr string) string {
+	_ = legacyFromAddr
+	return normalizeListenAddr(listenAddr)
+}
+
 func lessNodeID(a, b [32]byte) bool {
 	for i := 0; i < len(a); i++ {
 		if a[i] == b[i] {
@@ -2586,6 +2628,15 @@ func abs64(v int64) int64 {
 		return -v
 	}
 	return v
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func findContractByID(st *store.Store, cid [32]byte) (*proto.Contract, error) {
@@ -3118,24 +3169,26 @@ func (r *rateLimiter) Allow(key string) bool {
 	return true
 }
 
-func hello1SigInput(suiteID byte, fromID, toID [32]byte, ea, na, sessionID []byte) []byte {
-	buf := make([]byte, 0, len("web4:h1:v3")+1+32+32+len(ea)+len(na)+len(sessionID))
-	buf = append(buf, []byte("web4:h1:v3")...)
+func hello1SigInput(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na, sessionID []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v4")+1+32+32+len(listenAddr)+len(ea)+len(na)+len(sessionID))
+	buf = append(buf, []byte("web4:h1:v4")...)
 	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
+	buf = append(buf, []byte(listenAddr)...)
 	buf = append(buf, ea...)
 	buf = append(buf, na...)
 	buf = append(buf, sessionID...)
 	return buf
 }
 
-func hello1SigInputLegacy(suiteID byte, fromID, toID [32]byte, ea, na []byte) []byte {
-	buf := make([]byte, 0, len("web4:h1:v2")+1+32+32+len(ea)+len(na))
-	buf = append(buf, []byte("web4:h1:v2")...)
+func hello1SigInputLegacy(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v3")+1+32+32+len(listenAddr)+len(ea)+len(na))
+	buf = append(buf, []byte("web4:h1:v3")...)
 	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
+	buf = append(buf, []byte(listenAddr)...)
 	buf = append(buf, ea...)
 	buf = append(buf, na...)
 	return buf
@@ -3176,11 +3229,12 @@ func zero32() []byte {
 	return make([]byte, 32)
 }
 
-func hello1TranscriptBytes(suiteID byte, fromID, toID [32]byte, ea, na, mlkemPub []byte) []byte {
+func hello1TranscriptBytes(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na, mlkemPub []byte) []byte {
 	base := proto.Hello1Bytes(fromID, toID, ea, na)
-	out := make([]byte, 0, len(base)+1+len(mlkemPub))
+	out := make([]byte, 0, len(base)+1+len(listenAddr)+len(mlkemPub))
 	out = append(out, base...)
 	out = append(out, suiteID)
+	out = append(out, []byte(listenAddr)...)
 	out = append(out, mlkemPub...)
 	return out
 }
@@ -3343,8 +3397,9 @@ func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.Pee
 			id = node.DeriveNodeID(p.PubKey)
 		}
 		peerMsg := proto.PeerExchangePeer{
-			Addr:   p.Addr,
-			NodeID: hex.EncodeToString(id[:]),
+			ListenAddr: p.Addr,
+			Addr:       p.Addr,
+			NodeID:     hex.EncodeToString(id[:]),
 		}
 		if len(p.PubKey) > 0 {
 			peerMsg.PubKey = hex.EncodeToString(p.PubKey)
@@ -3362,9 +3417,10 @@ func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.Pee
 		}
 		if !dup {
 			respPeers = append(respPeers, proto.PeerExchangePeer{
-				Addr:   listenAddr,
-				NodeID: selfIDHex,
-				PubKey: hex.EncodeToString(self.PubKey),
+				ListenAddr: listenAddr,
+				Addr:       listenAddr,
+				NodeID:     selfIDHex,
+				PubKey:     hex.EncodeToString(self.PubKey),
 			})
 		}
 	}
@@ -3433,7 +3489,7 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 				if _, err := self.Peers.SetAddrUnverified(p, p.Addr, true); err != nil {
 					logPexDrop("addr_conflict")
 				}
-				self.Peers.PeerSeen(p.NodeID, p.Addr)
+				self.Peers.PeerSeen(p.NodeID, "")
 			}
 			p.Addr = ""
 			if err := self.Peers.Upsert(p, true); err != nil {
@@ -3503,9 +3559,10 @@ func decodePeerExchangePeer(w proto.PeerExchangePeer) (peer.Peer, error) {
 		}
 	}
 	p := peer.Peer{
-		NodeID: id,
-		PubKey: pub,
-		Addr:   w.Addr,
+		NodeID:   id,
+		PubKey:   pub,
+		DialAddr: firstNonEmpty(w.ListenAddr, w.Addr),
+		Addr:     firstNonEmpty(w.ListenAddr, w.Addr),
 	}
 	if len(pub) > 0 {
 		derived := node.DeriveNodeID(pub)

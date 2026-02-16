@@ -296,24 +296,26 @@ func (e recvError) Error() string {
 	return fmt.Sprintf("%s: %v", e.msg, e.err)
 }
 
-func hello1SigInput(suiteID byte, fromID, toID [32]byte, ea, na, sessionID []byte) []byte {
-	buf := make([]byte, 0, len("web4:h1:v3")+1+32+32+len(ea)+len(na)+len(sessionID))
-	buf = append(buf, []byte("web4:h1:v3")...)
+func hello1SigInput(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na, sessionID []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v4")+1+32+32+len(listenAddr)+len(ea)+len(na)+len(sessionID))
+	buf = append(buf, []byte("web4:h1:v4")...)
 	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
+	buf = append(buf, []byte(listenAddr)...)
 	buf = append(buf, ea...)
 	buf = append(buf, na...)
 	buf = append(buf, sessionID...)
 	return buf
 }
 
-func hello1SigInputLegacy(suiteID byte, fromID, toID [32]byte, ea, na []byte) []byte {
-	buf := make([]byte, 0, len("web4:h1:v2")+1+32+32+len(ea)+len(na))
-	buf = append(buf, []byte("web4:h1:v2")...)
+func hello1SigInputLegacy(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v3")+1+32+32+len(listenAddr)+len(ea)+len(na))
+	buf = append(buf, []byte("web4:h1:v3")...)
 	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
+	buf = append(buf, []byte(listenAddr)...)
 	buf = append(buf, ea...)
 	buf = append(buf, na...)
 	return buf
@@ -354,11 +356,12 @@ func zero32() []byte {
 	return make([]byte, 32)
 }
 
-func hello1TranscriptBytes(suiteID byte, fromID, toID [32]byte, ea, na, mlkemPub []byte) []byte {
+func hello1TranscriptBytes(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na, mlkemPub []byte) []byte {
 	base := proto.Hello1Bytes(fromID, toID, ea, na)
-	out := make([]byte, 0, len(base)+1+len(mlkemPub))
+	out := make([]byte, 0, len(base)+1+len(listenAddr)+len(mlkemPub))
 	out = append(out, base...)
 	out = append(out, suiteID)
+	out = append(out, []byte(listenAddr)...)
 	out = append(out, mlkemPub...)
 	return out
 }
@@ -1933,6 +1936,7 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 	if fromID == self.ID {
 		return false, errors.New("hello1 from_id self")
 	}
+	listenAddr := advertisedListenAddr(m.ListenAddr, m.FromAddr)
 	// Rate-limit gossip hello by sender identity before any expensive signature checks.
 	fromKey := hex.EncodeToString(fromID[:])
 	if !recvNodeLimiter.Allow(fromKey) {
@@ -1967,7 +1971,7 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 			return false, errors.New("bad pq binding")
 		}
 	}
-	h1Bytes := hello1TranscriptBytes(suiteID, fromID, toID, ea, na, mlkemPub)
+	h1Bytes := hello1TranscriptBytes(suiteID, fromID, toID, listenAddr, ea, na, mlkemPub)
 	h1TranscriptHash := crypto.SHA3_256(h1Bytes)
 	sessionID, err := decodeSessionIDHex(m.SessionID)
 	if err != nil {
@@ -1979,9 +1983,9 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 	if len(sessionID) > 0 && !bytesEqual(sessionID, expectedSID) {
 		return false, errors.New("hello1 session_id mismatch")
 	}
-	sigInput := hello1SigInput(suiteID, fromID, toID, ea, na, sessionID)
+	sigInput := hello1SigInput(suiteID, fromID, toID, listenAddr, ea, na, sessionID)
 	if len(sessionID) == 0 {
-		sigInput = hello1SigInputLegacy(suiteID, fromID, toID, ea, na)
+		sigInput = hello1SigInputLegacy(suiteID, fromID, toID, listenAddr, ea, na)
 	}
 	if !verifyHelloBySuite(suiteID, fromPub, pqPub, sigInput, sig) {
 		debugCount.incVerify("hello1")
@@ -1996,17 +2000,11 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 		return false, err
 	}
 	observedAddr := senderAddr
-	if observedAddr == "" && m.FromAddr != "" && isAddrParseable(m.FromAddr) {
-		observedAddr = m.FromAddr
-	}
 	if observedAddr != "" {
 		candidateAddr := ""
 		verified := false
-		if m.FromAddr != "" && isAddrParseable(m.FromAddr) && (senderAddr == "" || sameHost(senderAddr, m.FromAddr)) {
-			candidateAddr = m.FromAddr
-			verified = true
-		} else if senderAddr != "" {
-			candidateAddr = senderAddr
+		if listenAddr != "" && (senderAddr == "" || sameHost(senderAddr, listenAddr)) {
+			candidateAddr = listenAddr
 			verified = true
 		}
 		if _, err := self.Peers.ObserveAddr(peerInfo, observedAddr, candidateAddr, verified, true); err != nil {
@@ -2589,6 +2587,18 @@ func isAddrParseable(addr string) bool {
 	return err == nil
 }
 
+func normalizeListenAddr(addr string) string {
+	if !isAddrParseable(addr) {
+		return ""
+	}
+	return addr
+}
+
+func advertisedListenAddr(listenAddr, legacyFromAddr string) string {
+	_ = legacyFromAddr
+	return normalizeListenAddr(listenAddr)
+}
+
 func verifiedPeerForAddr(peers []peer.Peer, addr string, store *peer.Store) (peer.Peer, bool) {
 	if addr == "" {
 		return peer.Peer{}, false
@@ -2669,9 +2679,10 @@ func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, e
 			id = node.DeriveNodeID(p.PubKey)
 		}
 		peerMsg := proto.PeerExchangePeer{
-			Addr:   p.Addr,
-			NodeID: hex.EncodeToString(id[:]),
-			PubKey: hex.EncodeToString(p.PubKey),
+			ListenAddr: p.Addr,
+			Addr:       p.Addr,
+			NodeID:     hex.EncodeToString(id[:]),
+			PubKey:     hex.EncodeToString(p.PubKey),
 		}
 		respPeers = append(respPeers, peerMsg)
 	}
@@ -2708,11 +2719,12 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 		if err != nil {
 			return added, err
 		}
-		if p.Addr != "" && self.Candidates != nil {
-			self.Candidates.Add(p.Addr)
+		dialAddr := p.Addr
+		if dialAddr != "" && self.Candidates != nil {
+			self.Candidates.Add(dialAddr)
 		}
-		if p.Addr != "" && self.Peers != nil {
-			_, _ = self.Peers.SetAddrUnverified(p, p.Addr, true)
+		if dialAddr != "" && self.Peers != nil {
+			_, _ = self.Peers.SetAddrUnverified(p, dialAddr, true)
 		}
 		p.Addr = ""
 		persist := len(p.PubKey) > 0
@@ -2752,7 +2764,11 @@ func decodePeerExchangePeer(w proto.PeerExchangePeer) (peer.Peer, error) {
 		id = derived
 		idSet = true
 	}
-	return peer.Peer{NodeID: id, PubKey: pub, Addr: w.Addr}, nil
+	addr := w.ListenAddr
+	if addr == "" {
+		addr = w.Addr
+	}
+	return peer.Peer{NodeID: id, PubKey: pub, DialAddr: addr, Addr: addr}, nil
 }
 
 func findPeerByNodeID(peers []peer.Peer, id [32]byte) (peer.Peer, bool) {
@@ -2955,14 +2971,16 @@ func ensureSignedOutgoing(data []byte, self *node.Node) ([]byte, error) {
 }
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("usage: web4 <keygen|open|list|close|ack|recv|quic-listen|quic-send|quic-send-secure|node|gossip>")
+		fmt.Println("usage: web4 <keygen|open|list|close|ack|recv|devtls-ca-gen|quic-listen|quic-send|quic-send-secure|node|gossip>")
 		os.Exit(1)
 	}
 
 	root := homeDir()
 	_ = os.MkdirAll(root, 0700)
-	if err := ensureKeypair(root); err != nil {
-		die("load keys failed", err)
+	if os.Args[1] != "devtls-ca-gen" {
+		if err := ensureKeypair(root); err != nil {
+			die("load keys failed", err)
+		}
 	}
 
 	st := store.New(
@@ -3332,6 +3350,22 @@ func main() {
 			}
 			dieMsg(invalidMessage)
 		}
+
+	case "devtls-ca-gen":
+		fs := flag.NewFlagSet("devtls-ca-gen", flag.ExitOnError)
+		outDir := fs.String("out-dir", "", "output directory for deterministic dev TLS CA files")
+		ips := fs.String("ips", "", "comma-separated IP SANs")
+		_ = fs.Parse(os.Args[2:])
+		if strings.TrimSpace(*outDir) == "" {
+			die("missing --out-dir", fmt.Errorf("output directory required"))
+		}
+		certPath, keyPath, err := network.GenerateDeterministicDevTLSCA(*outDir, *ips)
+		if err != nil {
+			die("devtls ca generation failed", err)
+		}
+		fmt.Println("OK devtls ca generated")
+		fmt.Println("cert:", certPath)
+		fmt.Println("key:", keyPath)
 
 	case "quic-listen":
 		fs := flag.NewFlagSet("quic-listen", flag.ExitOnError)

@@ -15,6 +15,16 @@ func TestMetricsCounters(t *testing.T) {
 	m.IncPexRequestsTotal()
 	m.IncPexResponsesTotal()
 	m.IncEvictionCountTotal()
+	m.IncRecoveryPanicDialsTotal()
+	m.IncDialAttemptByReason("panic:seed")
+	m.IncDialAttemptByReason("panic:seed")
+	m.IncDialSuccessByReason("panic:seed")
+	m.IncDialFailByReason("panic:ranked")
+	m.IncHelloSuccessTotal()
+	m.IncHelloRejectByReason("to_id_mismatch")
+	m.IncCandidateAvailable()
+	m.IncBackoffBlocked()
+	m.IncSeedDialSkippedTotal()
 	m.IncRecvByType("hello1")
 	m.IncRecvByType("hello1")
 	m.IncDropByReason("rate")
@@ -41,6 +51,33 @@ func TestMetricsCounters(t *testing.T) {
 	}
 	if snap.EvictionCountTotal != 1 {
 		t.Fatalf("expected eviction count 1, got %d", snap.EvictionCountTotal)
+	}
+	if snap.RecoveryPanicDials != 1 {
+		t.Fatalf("expected recovery panic dials 1, got %d", snap.RecoveryPanicDials)
+	}
+	if snap.DialAttemptByReason["panic:seed"] != 2 {
+		t.Fatalf("expected dial attempt panic:seed=2, got %d", snap.DialAttemptByReason["panic:seed"])
+	}
+	if snap.DialSuccessByReason["panic:seed"] != 1 {
+		t.Fatalf("expected dial success panic:seed=1, got %d", snap.DialSuccessByReason["panic:seed"])
+	}
+	if snap.DialFailByReason["panic:ranked"] != 1 {
+		t.Fatalf("expected dial fail panic:ranked=1, got %d", snap.DialFailByReason["panic:ranked"])
+	}
+	if snap.HelloSuccessTotal != 1 {
+		t.Fatalf("expected hello success total 1, got %d", snap.HelloSuccessTotal)
+	}
+	if snap.HelloRejectByReason["to_id_mismatch"] != 1 {
+		t.Fatalf("expected hello reject to_id_mismatch=1, got %d", snap.HelloRejectByReason["to_id_mismatch"])
+	}
+	if snap.CandidateAvailable != 1 {
+		t.Fatalf("expected candidate_available=1, got %d", snap.CandidateAvailable)
+	}
+	if snap.BackoffBlocked != 1 {
+		t.Fatalf("expected backoff_blocked=1, got %d", snap.BackoffBlocked)
+	}
+	if snap.SeedDialSkippedTotal != 1 {
+		t.Fatalf("expected seed_dial_skipped_total=1, got %d", snap.SeedDialSkippedTotal)
 	}
 	if snap.RecvByType["hello1"] != 2 {
 		t.Fatalf("expected recv_by_type hello1=2, got %d", snap.RecvByType["hello1"])

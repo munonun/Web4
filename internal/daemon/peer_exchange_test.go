@@ -93,6 +93,26 @@ func TestBuildPeerExchangeRespCapAndDeterministicShuffle(t *testing.T) {
 	}
 }
 
+func TestDecodePeerExchangePeerPrefersListenAddr(t *testing.T) {
+	pub, _, err := crypto.GenKeypair()
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	id := node.DeriveNodeID(pub)
+	p, err := decodePeerExchangePeer(proto.PeerExchangePeer{
+		NodeID:     hex.EncodeToString(id[:]),
+		PubKey:     hex.EncodeToString(pub),
+		ListenAddr: "127.0.0.1:18081",
+		Addr:       "127.0.0.1:9999",
+	})
+	if err != nil {
+		t.Fatalf("decode peer: %v", err)
+	}
+	if p.Addr != "127.0.0.1:18081" {
+		t.Fatalf("expected listen_addr to win, got %q", p.Addr)
+	}
+}
+
 func TestBootstrapDiscoveryFromUnverifiedPex(t *testing.T) {
 	t.Setenv("WEB4_NODE_MODE", "bootstrap")
 	bootstrap, err := node.NewNode(t.TempDir(), node.Options{})
@@ -160,7 +180,46 @@ func TestBootstrapDiscoveryFromUnverifiedPex(t *testing.T) {
 			break
 		}
 	}
-	if !foundB {
-		t.Fatalf("expected peer B from bootstrap PEX")
+	if foundB {
+		t.Fatalf("did not expect unverified peer B without advertised listen_addr")
+	}
+}
+
+func TestApplyPeerExchangeRespRejectsLoopbackDialAddrWhenEnabled(t *testing.T) {
+	t.Setenv("WEB4_REJECT_LOOPBACK_DIAL_ADDR", "1")
+	self, err := node.NewNode(t.TempDir(), node.Options{})
+	if err != nil {
+		t.Fatalf("new node: %v", err)
+	}
+	pub, _, err := crypto.GenKeypair()
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	id := node.DeriveNodeID(pub)
+	resp := proto.PeerExchangeRespMsg{
+		Type:         proto.MsgTypePeerExchangeResp,
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		Peers: []proto.PeerExchangePeer{
+			{
+				NodeID:     hex.EncodeToString(id[:]),
+				PubKey:     hex.EncodeToString(pub),
+				ListenAddr: "127.0.0.1:40001",
+			},
+		},
+	}
+	added, err := applyPeerExchangeResp(self, resp)
+	if err != nil {
+		t.Fatalf("apply peer exchange resp: %v", err)
+	}
+	if added != 1 {
+		t.Fatalf("expected peer metadata upsert, got added=%d", added)
+	}
+	p, ok := self.Peers.Get(id)
+	if !ok {
+		t.Fatalf("peer missing")
+	}
+	if p.Addr != "" {
+		t.Fatalf("expected loopback listen addr to be rejected for dial, got %q", p.Addr)
 	}
 }

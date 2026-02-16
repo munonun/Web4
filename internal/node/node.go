@@ -3,6 +3,7 @@ package node
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"web4mvp/internal/crypto"
@@ -21,6 +22,8 @@ type Node struct {
 	Candidates *peer.CandidatePool
 	Sessions   *SessionStore
 	Field      *state.Field
+	listenMu   sync.RWMutex
+	listenAddr string
 }
 
 type Options struct {
@@ -139,4 +142,23 @@ func DeriveNodeID(pub []byte) [32]byte {
 	var id [32]byte
 	copy(id[:], sum)
 	return id
+}
+
+func (n *Node) SetListenAddr(addr string) {
+	if n == nil {
+		return
+	}
+	n.listenMu.Lock()
+	n.listenAddr = addr
+	n.listenMu.Unlock()
+}
+
+func (n *Node) ListenAddr() string {
+	if n == nil {
+		return ""
+	}
+	n.listenMu.RLock()
+	addr := n.listenAddr
+	n.listenMu.RUnlock()
+	return addr
 }

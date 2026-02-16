@@ -20,6 +20,7 @@ type Hello1Msg struct {
 	Type            string `json:"type"`
 	FromNodeID      string `json:"from_node_id"`
 	FromPub         string `json:"from_pub"`
+	ListenAddr      string `json:"listen_addr,omitempty"`
 	FromAddr        string `json:"from_addr,omitempty"`
 	ToNodeID        string `json:"to_node_id"`
 	SuiteID         int    `json:"suite_id"`
@@ -37,6 +38,7 @@ type Hello2Msg struct {
 	Type            string `json:"type"`
 	FromNodeID      string `json:"from_node_id"`
 	FromPub         string `json:"from_pub"`
+	ListenAddr      string `json:"listen_addr,omitempty"`
 	FromAddr        string `json:"from_addr,omitempty"`
 	ToNodeID        string `json:"to_node_id"`
 	SuiteID         int    `json:"suite_id"`

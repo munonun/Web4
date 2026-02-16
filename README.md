@@ -32,6 +32,12 @@ Run the smoke test used in this repo:
 WEB4_DELTA_MODE=deltab WEB4_ZK_MODE=1 WEB4_STORE_MAX_BYTES=65536 ./scripts/smoke.sh
 ```
 
+Run P2P stress harness (separate from smoke):
+
+```bash
+./scripts/p2p_stress.sh
+```
+
 If tests and smoke pass, behavior matches current design.
 
 ## CLI Basics
@@ -40,7 +46,7 @@ If tests and smoke pass, behavior matches current design.
 It reports local observation only.
 
 ```bash
-web4-node run --addr 127.0.0.1:7000 --devtls
+web4-node run --addr 127.0.0.1:25050
 web4-node status
 web4-node peers
 ```

@@ -176,10 +176,11 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 		}
 	}
 	fromID := n.ID
-	h1Bytes := hello1TranscriptBytes(suiteID, fromID, toID, ea, na, mlkemPub)
+	listenAddr := normalizeListenAddr(n.ListenAddr())
+	h1Bytes := hello1TranscriptBytes(suiteID, fromID, toID, listenAddr, ea, na, mlkemPub)
 	h1TranscriptHash := crypto.SHA3_256(h1Bytes)
 	hello1SessionID := sessionIDForHandshake(suiteID, fromID, toID, ea, zero32(), h1TranscriptHash)
-	sigInput := hello1SigInput(suiteID, fromID, toID, ea, na, hello1SessionID)
+	sigInput := hello1SigInput(suiteID, fromID, toID, listenAddr, ea, na, hello1SessionID)
 	sig, err := signHelloBySuite(suiteID, n.PrivKey, pqPriv, sigInput)
 	if err != nil {
 		eph.Destroy()
@@ -189,6 +190,8 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 		Type:            proto.MsgTypeHello1,
 		FromNodeID:      hex.EncodeToString(fromID[:]),
 		FromPub:         hex.EncodeToString(n.PubKey),
+		ListenAddr:      listenAddr,
+		FromAddr:        listenAddr,
 		ToNodeID:        hex.EncodeToString(toID[:]),
 		SuiteID:         int(suiteID),
 		SupportedSuites: encodeSupportedSuites(supports),
@@ -239,6 +242,7 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	if toID != n.ID {
 		return proto.Hello2Msg{}, errors.New("hello1 to_id mismatch")
 	}
+	listenAddr := advertisedListenAddr(m.ListenAddr, m.FromAddr)
 	peerSupports := parseSupportedSuites(m.SupportedSuites)
 	selfSupports := supportedSuites()
 	suiteID, err := validateSuiteSelection(byte(m.SuiteID), selfSupports, peerSupports)
@@ -270,7 +274,7 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 		}
 	}
 
-	h1BytesForReplay := hello1TranscriptBytes(suiteID, fromID, toID, ea, na, mlkemPub)
+	h1BytesForReplay := hello1TranscriptBytes(suiteID, fromID, toID, listenAddr, ea, na, mlkemPub)
 	h1TranscriptHash := crypto.SHA3_256(h1BytesForReplay)
 	hello1SessionID, err := decodeSessionIDHex(m.SessionID)
 	if err != nil {
@@ -282,9 +286,9 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	if len(hello1SessionID) > 0 && !bytesEqual(hello1SessionID, expectedHello1SID) {
 		return proto.Hello2Msg{}, errors.New("hello1 session_id mismatch")
 	}
-	sigInput := hello1SigInput(suiteID, fromID, toID, ea, na, hello1SessionID)
+	sigInput := hello1SigInput(suiteID, fromID, toID, listenAddr, ea, na, hello1SessionID)
 	if len(hello1SessionID) == 0 {
-		sigInput = hello1SigInputLegacy(suiteID, fromID, toID, ea, na)
+		sigInput = hello1SigInputLegacy(suiteID, fromID, toID, listenAddr, ea, na)
 	}
 	if !verifyHelloBySuite(suiteID, fromPub, pqPub, sigInput, sig) {
 		return proto.Hello2Msg{}, errors.New("bad hello1 signature")
@@ -300,27 +304,14 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	if err := n.Peers.Upsert(peerInfo, true); err != nil {
 		return proto.Hello2Msg{}, err
 	}
-	observedAddr := senderAddr
-	if observedAddr == "" && m.FromAddr != "" && isAddrParseable(m.FromAddr) {
-		observedAddr = m.FromAddr
-	}
-	if observedAddr != "" {
-		candidateAddr := ""
-		verified := false
-		if m.FromAddr != "" && isAddrParseable(m.FromAddr) && (senderAddr == "" || sameHost(senderAddr, m.FromAddr)) {
-			candidateAddr = m.FromAddr
-			verified = senderAddr != "" && m.FromAddr == senderAddr
-		} else if senderAddr != "" {
-			candidateAddr = senderAddr
-			verified = true
-		}
-		if _, err := n.Peers.ObserveAddr(peerInfo, observedAddr, candidateAddr, verified, true); err != nil {
+	if senderAddr != "" {
+		if _, err := n.Peers.ObserveAddr(peerInfo, senderAddr, "", false, true); err != nil {
 			return proto.Hello2Msg{}, err
 		}
-		if candidateAddr != "" && !verified {
-			if _, err := n.Peers.SetAddrUnverified(peerInfo, candidateAddr, true); err != nil {
-				return proto.Hello2Msg{}, err
-			}
+	}
+	if listenAddr != "" && (senderAddr == "" || sameHost(senderAddr, listenAddr)) {
+		if _, err := n.Peers.SetAddrUnverified(peerInfo, listenAddr, true); err != nil {
+			return proto.Hello2Msg{}, err
 		}
 	}
 	eph, err := crypto.GenerateEphemeral()
@@ -360,10 +351,11 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 			return proto.Hello2Msg{}, err
 		}
 	}
-	h2Bytes := hello2TranscriptBytes(suiteID, n.ID, fromID, eb, nb, mlkemCT)
+	respListenAddr := normalizeListenAddr(n.ListenAddr())
+	h2Bytes := hello2TranscriptBytes(suiteID, n.ID, fromID, respListenAddr, eb, nb, mlkemCT)
 	transcript := crypto.SHA3_256(append(h1BytesForReplay, h2Bytes...))
 	sessionID := sessionIDForHandshake(suiteID, fromID, toID, ea, eb, transcript)
-	sigInput2 := hello2SigInput(suiteID, fromID, toID, ea, eb, na, nb, sessionID)
+	sigInput2 := hello2SigInput(suiteID, fromID, toID, respListenAddr, ea, eb, na, nb, sessionID)
 	sig2, err := signHelloBySuite(suiteID, n.PrivKey, pqPrivResp, sigInput2)
 	if err != nil {
 		eph.Destroy()
@@ -393,6 +385,8 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 		Type:            proto.MsgTypeHello2,
 		FromNodeID:      hex.EncodeToString(n.ID[:]),
 		FromPub:         hex.EncodeToString(n.PubKey),
+		ListenAddr:      respListenAddr,
+		FromAddr:        respListenAddr,
 		ToNodeID:        hex.EncodeToString(fromID[:]),
 		SuiteID:         int(suiteID),
 		SupportedSuites: encodeSupportedSuites(selfSupports),
@@ -465,6 +459,7 @@ func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 			return errors.New("bad pq binding")
 		}
 	}
+	listenAddr := advertisedListenAddr(m.ListenAddr, m.FromAddr)
 	sessionID, err := decodeSessionIDHex(m.SessionID)
 	if err != nil {
 		if !allowLegacyHelloSig() {
@@ -472,16 +467,16 @@ func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 		}
 	}
 	h1Bytes := pending.Hello1Bytes
-	h2Bytes := hello2TranscriptBytes(suiteID, fromID, toID, eb, nb, mlkemCT)
+	h2Bytes := hello2TranscriptBytes(suiteID, fromID, toID, listenAddr, eb, nb, mlkemCT)
 	transcript := crypto.SHA3_256(append(h1Bytes, h2Bytes...))
 	expectedSID := sessionIDForHandshake(suiteID, n.ID, fromID, pending.EA, eb, transcript)
 	if len(sessionID) > 0 && !bytesEqual(sessionID, expectedSID) {
 		pending.Ephemeral.Destroy()
 		return errors.New("hello2 session_id mismatch")
 	}
-	sigInput := hello2SigInput(suiteID, n.ID, fromID, pending.EA, eb, pending.Na, nb, sessionID)
+	sigInput := hello2SigInput(suiteID, n.ID, fromID, listenAddr, pending.EA, eb, pending.Na, nb, sessionID)
 	if len(sessionID) == 0 {
-		sigInput = hello2SigInputLegacy(suiteID, n.ID, fromID, pending.EA, eb, pending.Na, nb)
+		sigInput = hello2SigInputLegacy(suiteID, n.ID, fromID, listenAddr, pending.EA, eb, pending.Na, nb)
 	}
 	if !verifyHelloBySuite(suiteID, fromPub, pqPub, sigInput, sig) {
 		pending.Ephemeral.Destroy()
@@ -492,21 +487,15 @@ func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 		return err
 	}
 	if senderAddr != "" {
-		candidateAddr := ""
-		verified := false
-		if m.FromAddr != "" && sameHost(senderAddr, m.FromAddr) {
-			candidateAddr = m.FromAddr
-			verified = m.FromAddr == senderAddr
-		}
-		if _, err := n.Peers.ObserveAddr(peer.Peer{NodeID: fromID, PubKey: fromPub}, senderAddr, candidateAddr, verified, true); err != nil {
+		if _, err := n.Peers.ObserveAddr(peer.Peer{NodeID: fromID, PubKey: fromPub}, senderAddr, "", false, true); err != nil {
 			pending.Ephemeral.Destroy()
 			return err
 		}
-		if candidateAddr != "" && !verified {
-			if _, err := n.Peers.SetAddrUnverified(peer.Peer{NodeID: fromID, PubKey: fromPub}, candidateAddr, true); err != nil {
-				pending.Ephemeral.Destroy()
-				return err
-			}
+	}
+	if listenAddr != "" && (senderAddr == "" || sameHost(senderAddr, listenAddr)) {
+		if _, err := n.Peers.SetAddrUnverified(peer.Peer{NodeID: fromID, PubKey: fromPub}, listenAddr, true); err != nil {
+			pending.Ephemeral.Destroy()
+			return err
 		}
 	}
 	ssX, err := pending.Ephemeral.Shared(eb)
@@ -540,35 +529,38 @@ func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 	return nil
 }
 
-func hello1SigInput(suiteID byte, fromID, toID [32]byte, ea, na, sessionID []byte) []byte {
-	buf := make([]byte, 0, len("web4:h1:v3")+1+32+32+len(ea)+len(na)+len(sessionID))
-	buf = append(buf, []byte("web4:h1:v3")...)
+func hello1SigInput(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na, sessionID []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v4")+1+32+32+len(listenAddr)+len(ea)+len(na)+len(sessionID))
+	buf = append(buf, []byte("web4:h1:v4")...)
 	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
+	buf = append(buf, []byte(listenAddr)...)
 	buf = append(buf, ea...)
 	buf = append(buf, na...)
 	buf = append(buf, sessionID...)
 	return buf
 }
 
-func hello1SigInputLegacy(suiteID byte, fromID, toID [32]byte, ea, na []byte) []byte {
-	buf := make([]byte, 0, len("web4:h1:v2")+1+32+32+len(ea)+len(na))
-	buf = append(buf, []byte("web4:h1:v2")...)
+func hello1SigInputLegacy(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na []byte) []byte {
+	buf := make([]byte, 0, len("web4:h1:v3")+1+32+32+len(listenAddr)+len(ea)+len(na))
+	buf = append(buf, []byte("web4:h1:v3")...)
 	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
+	buf = append(buf, []byte(listenAddr)...)
 	buf = append(buf, ea...)
 	buf = append(buf, na...)
 	return buf
 }
 
-func hello2SigInput(suiteID byte, fromID, toID [32]byte, ea, eb, na, nb, sessionID []byte) []byte {
-	buf := make([]byte, 0, len("web4:h2:v3")+1+32+32+len(ea)+len(eb)+len(na)+len(nb)+len(sessionID))
-	buf = append(buf, []byte("web4:h2:v3")...)
+func hello2SigInput(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, eb, na, nb, sessionID []byte) []byte {
+	buf := make([]byte, 0, len("web4:h2:v4")+1+32+32+len(listenAddr)+len(ea)+len(eb)+len(na)+len(nb)+len(sessionID))
+	buf = append(buf, []byte("web4:h2:v4")...)
 	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
+	buf = append(buf, []byte(listenAddr)...)
 	buf = append(buf, ea...)
 	buf = append(buf, eb...)
 	buf = append(buf, na...)
@@ -577,12 +569,13 @@ func hello2SigInput(suiteID byte, fromID, toID [32]byte, ea, eb, na, nb, session
 	return buf
 }
 
-func hello2SigInputLegacy(suiteID byte, fromID, toID [32]byte, ea, eb, na, nb []byte) []byte {
-	buf := make([]byte, 0, len("web4:h2:v2")+1+32+32+len(ea)+len(eb)+len(na)+len(nb))
-	buf = append(buf, []byte("web4:h2:v2")...)
+func hello2SigInputLegacy(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, eb, na, nb []byte) []byte {
+	buf := make([]byte, 0, len("web4:h2:v3")+1+32+32+len(listenAddr)+len(ea)+len(eb)+len(na)+len(nb))
+	buf = append(buf, []byte("web4:h2:v3")...)
 	buf = append(buf, suiteID)
 	buf = append(buf, fromID[:]...)
 	buf = append(buf, toID[:]...)
+	buf = append(buf, []byte(listenAddr)...)
 	buf = append(buf, ea...)
 	buf = append(buf, eb...)
 	buf = append(buf, na...)
@@ -616,20 +609,22 @@ func zero32() []byte {
 	return make([]byte, 32)
 }
 
-func hello1TranscriptBytes(suiteID byte, fromID, toID [32]byte, ea, na, mlkemPub []byte) []byte {
+func hello1TranscriptBytes(suiteID byte, fromID, toID [32]byte, listenAddr string, ea, na, mlkemPub []byte) []byte {
 	base := proto.Hello1Bytes(fromID, toID, ea, na)
-	out := make([]byte, 0, len(base)+1+len(mlkemPub))
+	out := make([]byte, 0, len(base)+1+len(listenAddr)+len(mlkemPub))
 	out = append(out, base...)
 	out = append(out, suiteID)
+	out = append(out, []byte(listenAddr)...)
 	out = append(out, mlkemPub...)
 	return out
 }
 
-func hello2TranscriptBytes(suiteID byte, fromID, toID [32]byte, eb, nb, mlkemCT []byte) []byte {
+func hello2TranscriptBytes(suiteID byte, fromID, toID [32]byte, listenAddr string, eb, nb, mlkemCT []byte) []byte {
 	base := proto.Hello2Bytes(fromID, toID, eb, nb)
-	out := make([]byte, 0, len(base)+1+len(mlkemCT))
+	out := make([]byte, 0, len(base)+1+len(listenAddr)+len(mlkemCT))
 	out = append(out, base...)
 	out = append(out, suiteID)
+	out = append(out, []byte(listenAddr)...)
 	out = append(out, mlkemCT...)
 	return out
 }
@@ -816,4 +811,16 @@ func sameHost(a, b string) bool {
 func isAddrParseable(addr string) bool {
 	_, _, err := net.SplitHostPort(addr)
 	return err == nil
+}
+
+func normalizeListenAddr(addr string) string {
+	if !isAddrParseable(addr) {
+		return ""
+	}
+	return addr
+}
+
+func advertisedListenAddr(listenAddr, legacyFromAddr string) string {
+	_ = legacyFromAddr
+	return normalizeListenAddr(listenAddr)
 }

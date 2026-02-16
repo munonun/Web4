@@ -169,6 +169,71 @@ func TestStoreUnverifiedUpgradesToVerifiedOnMatch(t *testing.T) {
 	}
 }
 
+func TestObserveAddrDoesNotOverrideDialAddrFromRemote(t *testing.T) {
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	pub := pubWithByte(6)
+	id := node.DeriveNodeID(pub)
+	if err := st.Upsert(peer.Peer{NodeID: id, PubKey: pub}, true); err != nil {
+		t.Fatalf("upsert failed: %v", err)
+	}
+	if _, err := st.SetAddrUnverified(peer.Peer{NodeID: id, PubKey: pub}, "127.0.0.1:46043", true); err != nil {
+		t.Fatalf("set unverified addr failed: %v", err)
+	}
+	if _, err := st.ObserveAddr(peer.Peer{NodeID: id, PubKey: pub}, "127.0.0.1:32790", "", false, true); err != nil {
+		t.Fatalf("observe addr #1 failed: %v", err)
+	}
+	if _, err := st.ObserveAddr(peer.Peer{NodeID: id, PubKey: pub}, "127.0.0.1:32791", "", false, true); err != nil {
+		t.Fatalf("observe addr #2 failed: %v", err)
+	}
+	p, ok := findPeer(st.List(), id)
+	if !ok {
+		t.Fatalf("peer missing")
+	}
+	if p.Addr != "127.0.0.1:46043" {
+		t.Fatalf("dial addr changed unexpectedly: %q", p.Addr)
+	}
+	if p.ObservedAddr != "127.0.0.1:32791" {
+		t.Fatalf("expected last observed addr to track remote endpoint, got %q", p.ObservedAddr)
+	}
+}
+
+func TestSetAddrUnverifiedRejectsLoopbackWhenEnabled(t *testing.T) {
+	t.Setenv("WEB4_REJECT_LOOPBACK_DIAL_ADDR", "1")
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	pub := pubWithByte(7)
+	id := node.DeriveNodeID(pub)
+	if err := st.Upsert(peer.Peer{NodeID: id, PubKey: pub}, true); err != nil {
+		t.Fatalf("upsert failed: %v", err)
+	}
+	changed, err := st.SetAddrUnverified(peer.Peer{NodeID: id, PubKey: pub}, "127.0.0.1:46043", true)
+	if !errors.Is(err, peer.ErrAddrLoopback) {
+		t.Fatalf("expected loopback reject, got changed=%v err=%v", changed, err)
+	}
+	p, ok := findPeer(st.List(), id)
+	if !ok {
+		t.Fatalf("peer missing")
+	}
+	if p.Addr != "" {
+		t.Fatalf("expected empty dial addr after loopback reject, got %q", p.Addr)
+	}
+}
+
 func pubWithByte(b byte) []byte {
 	_ = b
 	pub, _, err := crypto.GenKeypair()

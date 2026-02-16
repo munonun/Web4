@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,14 @@ const (
 	defaultOutboundExplore = 2
 	defaultMaxBackoffSec   = 300
 	defaultPexIntervalSec  = 20
+	defaultRecoveryGrace   = 8
+	defaultRecoveryWindow  = 30
+	defaultRecoveryStable  = 10
+	defaultRecoveryPexSec  = 2
+	defaultRecoveryMinOut  = 1
+	defaultRecoveryBackoff = 10
+	defaultRecoveryPanicS  = 1
+	defaultRecoveryPanicN  = 2
 	defaultPeertableMax    = 2048
 	defaultSubnetMax       = 32
 	outboundSuccessWindow  = 60 * time.Second
@@ -47,6 +56,17 @@ type connMan struct {
 	bootPeers []bootstrapPeer
 	dialLog   map[[32]byte]time.Time
 	addrLog   map[string]time.Time
+	recovery  connManRecovery
+}
+
+type connManRecovery struct {
+	active         bool
+	isolatedSince  time.Time
+	healthySince   time.Time
+	boostUntil     time.Time
+	enterTotal     uint64
+	exitTotal      uint64
+	lastDebugLogAt time.Time
 }
 
 func startConnMan(ctx context.Context, r *Runner, devTLS bool) {
@@ -56,13 +76,18 @@ func startConnMan(ctx context.Context, r *Runner, devTLS bool) {
 	cm := newConnMan(r, devTLS)
 	go cm.run(ctx)
 	go cm.runPex(ctx)
+	go cm.runRecoveryPanic(ctx)
 }
 
 func newConnMan(r *Runner, devTLS bool) *connMan {
 	devTLSCA := ""
 	if devTLS {
 		path := filepath.Join(r.Root, "devtls_ca.pem")
-		if envPath := os.Getenv("WEB4_DEVTLS_CA_PATH"); envPath != "" {
+		if envPath := strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_CERT_PATH")); envPath != "" {
+			path = envPath
+		} else if envPath := strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_BUNDLE_PATH")); envPath != "" {
+			path = envPath
+		} else if envPath := os.Getenv("WEB4_DEVTLS_CA_PATH"); envPath != "" {
 			path = envPath
 		}
 		if fi, err := os.Stat(path); err == nil {
@@ -107,14 +132,14 @@ func (c *connMan) run(ctx context.Context) {
 }
 
 func (c *connMan) runPex(ctx context.Context) {
-	interval := pexInterval()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for {
+		wait := c.currentPexInterval()
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			c.tickPex(ctx)
 		}
 	}
@@ -161,9 +186,13 @@ func (c *connMan) tickOutbound(ctx context.Context) {
 	}
 	now := time.Now()
 	c.pruneOutbound(now)
+	c.updateRecoveryState(now)
 
 	target := outboundTarget()
 	explore := outboundExplore()
+	if c.isRecoveryActive() && explore < target {
+		explore = target
+	}
 	need := target - c.outboundCount()
 	if need < 0 {
 		need = 0
@@ -216,16 +245,37 @@ func (c *connMan) tickSeeds(ctx context.Context) {
 	if c.self.Peers == nil {
 		return
 	}
-	if len(c.self.Peers.ListPeersRanked(1, peer.PeerFilter{AllowNoAddr: false, Source: "pex"})) > 0 {
+	if c.isRecoveryActive() {
+		c.sendPeerExchangePlain(ctx, c.bootstrap)
 		return
 	}
-	if len(c.self.Peers.ListPeersRanked(1, peer.PeerFilter{AllowNoAddr: false, Source: "manual"})) > 0 {
+	if !c.shouldDialSeeds() {
+		if c.metrics != nil {
+			c.metrics.IncSeedDialSkippedTotal()
+		}
 		return
 	}
 	c.sendPeerExchangePlain(ctx, c.bootstrap)
 }
 
+func (c *connMan) shouldDialSeeds() bool {
+	if c.isRecoveryActive() {
+		return true
+	}
+	if len(c.self.Peers.ListPeersRanked(1, peer.PeerFilter{AllowNoAddr: false, Source: "pex"})) > 0 {
+		return false
+	}
+	if len(c.self.Peers.ListPeersRanked(1, peer.PeerFilter{AllowNoAddr: false, Source: "manual"})) > 0 {
+		return false
+	}
+	return true
+}
+
 func (c *connMan) pickAndConnect(ctx context.Context, peers []peer.Peer, count int, explore bool) {
+	c.pickAndConnectWithMode(ctx, peers, count, explore, false, "normal")
+}
+
+func (c *connMan) pickAndConnectWithMode(ctx context.Context, peers []peer.Peer, count int, explore bool, force bool, reason string) {
 	if count <= 0 {
 		return
 	}
@@ -236,26 +286,55 @@ func (c *connMan) pickAndConnect(ctx context.Context, peers []peer.Peer, count i
 	}
 	for i := 0; i < len(candidates) && count > 0; i++ {
 		p := candidates[i]
-		if p.Addr == "" || isZeroNodeID(p.NodeID) {
+		addr := peerDialAddr(p)
+		if addr == "" || isZeroNodeID(p.NodeID) {
 			continue
 		}
-		if !c.shouldTry(p.NodeID, now) {
+		if c.metrics != nil {
+			c.metrics.IncCandidateAvailable()
+		}
+		if !c.shouldTry(p.NodeID, now, force) {
+			if c.metrics != nil && !force {
+				c.metrics.IncBackoffBlocked()
+			}
 			continue
 		}
 		if c.isOutboundConnected(p.NodeID) {
 			continue
 		}
-		if err := c.handshake(ctx, p.NodeID, p.Addr); err != nil {
+		dialReason := dialReason(reason, p.Source)
+		if force {
+			c.logForcedDialDecision(dialReason, p, c.nextTryAt(p.NodeID), "attempt", "")
+			if c.metrics != nil {
+				c.metrics.IncRecoveryPanicDialsTotal()
+			}
+		}
+		if c.metrics != nil {
+			c.metrics.IncDialAttemptByReason(dialReason)
+		}
+		if err := c.handshake(ctx, p.NodeID, addr, dialReason, force); err != nil {
 			c.logDialError(p.NodeID, err)
+			if force {
+				c.logForcedDialDecision(dialReason, p, c.nextTryAt(p.NodeID), "fail", err.Error())
+			}
+			if c.metrics != nil {
+				c.metrics.IncDialFailByReason(dialReason)
+			}
 			c.markFailure(p.NodeID)
 			continue
 		}
 		c.markSuccess(p.NodeID)
+		if c.metrics != nil {
+			c.metrics.IncDialSuccessByReason(dialReason)
+		}
+		if force {
+			c.logForcedDialDecision(dialReason, p, c.nextTryAt(p.NodeID), "success", "")
+		}
 		count--
 	}
 }
 
-func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string) error {
+func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string, dialReason string, force bool) error {
 	if c.self == nil {
 		return fmt.Errorf("missing node")
 	}
@@ -280,23 +359,53 @@ func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string) e
 	defer cancel()
 	respData, err := network.ExchangeOnceWithContext(ctx, addr, data, false, c.devTLS, c.devTLSCA)
 	if err != nil {
-		return err
+		if force {
+			c.logForcedDialStage(dialReason, peerID, addr, "dial", "fail", err)
+		}
+		return fmt.Errorf("dial: %w", err)
+	}
+	if force {
+		c.logForcedDialStage(dialReason, peerID, addr, "dial", "ok", nil)
 	}
 	if c.metrics != nil {
 		c.metrics.IncDialSuccessTotal()
+		c.metrics.IncQuicConnectSuccessTotal()
 	}
 	resp, err := proto.DecodeHello2Msg(respData)
 	if err != nil {
-		return err
+		if c.metrics != nil {
+			c.metrics.IncHelloRejectByReason("decode")
+			c.metrics.IncHelloHandshakeFailByReason("decode")
+		}
+		if force {
+			c.logForcedDialStage(dialReason, peerID, addr, "hello_decode", "reject", err)
+		}
+		return fmt.Errorf("hello_decode: %w", err)
 	}
 	if err := c.self.HandleHello2(resp); err != nil {
-		return err
+		reason := classifyHelloReject(err)
+		if c.metrics != nil {
+			c.metrics.IncHelloRejectByReason(reason)
+			c.metrics.IncHelloHandshakeFailByReason(reason)
+		}
+		if force {
+			c.logForcedDialStage(dialReason, peerID, addr, "hello", "reject", err)
+		}
+		return fmt.Errorf("hello_reject: %w", err)
+	}
+	if c.metrics != nil {
+		c.metrics.IncHelloSuccessTotal()
+		c.metrics.IncHelloHandshakeSuccessTotal()
+	}
+	if force {
+		c.logForcedDialStage(dialReason, peerID, addr, "hello", "ok", nil)
 	}
 	return nil
 }
 
 func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
-	if p.Addr == "" || isZeroNodeID(p.NodeID) {
+	addr := peerDialAddr(p)
+	if addr == "" || isZeroNodeID(p.NodeID) {
 		return fmt.Errorf("missing peer addr")
 	}
 	if c.self == nil {
@@ -304,7 +413,7 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	}
 	c.ensurePubKey()
 	if !c.self.Sessions.Has(p.NodeID) {
-		if err := c.handshake(ctx, p.NodeID, p.Addr); err != nil {
+		if err := c.handshake(ctx, p.NodeID, addr, dialReason("pex_handshake", p.Source), false); err != nil {
 			c.markFailure(p.NodeID)
 			return err
 		}
@@ -342,7 +451,7 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout())
 	defer cancel()
-	respData, err := network.ExchangeOnceWithContext(ctx, p.Addr, secureReq, false, c.devTLS, c.devTLSCA)
+	respData, err := network.ExchangeOnceWithContext(ctx, addr, secureReq, false, c.devTLS, c.devTLSCA)
 	if err != nil {
 		c.markFailure(p.NodeID)
 		return err
@@ -369,7 +478,7 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	if _, err := applyPeerExchangeResp(c.self, resp); err != nil {
 		return err
 	}
-	c.promoteSeed(resp, p.Addr)
+	c.promoteSeed(resp, addr)
 	return nil
 }
 
@@ -378,6 +487,7 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		return
 	}
 	c.ensurePubKey()
+	reason := dialReason("seed_plain", "seed")
 	for _, addr := range addrs {
 		if !isValidAddr(addr) {
 			continue
@@ -386,6 +496,7 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			c.metrics.IncPexRequestsTotal()
 			c.metrics.IncPexReqSentTotal()
 			c.metrics.IncDialAttemptsTotal()
+			c.metrics.IncDialAttemptByReason(reason)
 		}
 		reqK := defaultPeerExchangeK
 		if cap := peerExchangeCap(); reqK > cap {
@@ -410,14 +521,22 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		respData, err := network.ExchangeOnceWithContext(reqCtx, addr, data, false, c.devTLS, c.devTLSCA)
 		cancel()
 		if err != nil {
+			if c.metrics != nil {
+				c.metrics.IncDialFailByReason(reason)
+			}
 			c.logPexError(addr, err)
 			continue
 		}
 		if c.metrics != nil {
 			c.metrics.IncDialSuccessTotal()
+			c.metrics.IncQuicConnectSuccessTotal()
+			c.metrics.IncDialSuccessByReason(reason)
 		}
 		resp, err := proto.DecodePeerExchangeResp(respData)
 		if err != nil {
+			if c.metrics != nil {
+				c.metrics.IncDialFailByReason(reason + ":decode")
+			}
 			c.logPexError(addr, err)
 			continue
 		}
@@ -426,6 +545,9 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			c.metrics.IncPexRespRecvTotal()
 		}
 		if _, err := applyPeerExchangeResp(c.self, resp); err != nil {
+			if c.metrics != nil {
+				c.metrics.IncDialFailByReason(reason + ":apply")
+			}
 			continue
 		}
 		c.promoteSeed(resp, addr)
@@ -448,7 +570,11 @@ func (c *connMan) promoteSeed(resp proto.PeerExchangeRespMsg, seedAddr string) {
 		return
 	}
 	for _, msg := range resp.Peers {
-		if msg.Addr != seedAddr {
+		msgAddr := strings.TrimSpace(msg.ListenAddr)
+		if msgAddr == "" {
+			msgAddr = strings.TrimSpace(msg.Addr)
+		}
+		if msgAddr != seedAddr {
 			continue
 		}
 		p, err := decodePeerExchangePeer(msg)
@@ -456,8 +582,9 @@ func (c *connMan) promoteSeed(resp proto.PeerExchangeRespMsg, seedAddr string) {
 			continue
 		}
 		p.Source = "seed"
-		p.SubnetKey = peer.SubnetKeyForAddr(p.Addr)
-		_, _ = c.self.Peers.SetAddrUnverified(p, p.Addr, true)
+		addr := peerDialAddr(p)
+		p.SubnetKey = peer.SubnetKeyForAddr(addr)
+		_, _ = c.self.Peers.SetAddrUnverified(p, addr, true)
 		_ = c.self.Peers.Upsert(p, true)
 		return
 	}
@@ -531,13 +658,16 @@ func (c *connMan) markFailure(id [32]byte) {
 		c.self.Peers.PeerFail(id)
 	}
 	now := time.Now()
-	backoff := nextBackoffDuration(c.self, id, c.rng)
+	backoff := nextBackoffDurationWithCap(c.self, id, c.rng, c.currentMaxBackoff())
 	c.mu.Lock()
 	c.nextTry[id] = now.Add(backoff)
 	c.mu.Unlock()
 }
 
-func (c *connMan) shouldTry(id [32]byte, now time.Time) bool {
+func (c *connMan) shouldTry(id [32]byte, now time.Time, force bool) bool {
+	if force {
+		return true
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	next, ok := c.nextTry[id]
@@ -548,6 +678,10 @@ func (c *connMan) shouldTry(id [32]byte, now time.Time) bool {
 }
 
 func nextBackoffDuration(self *node.Node, id [32]byte, rng *rand.Rand) time.Duration {
+	return nextBackoffDurationWithCap(self, id, rng, maxBackoff())
+}
+
+func nextBackoffDurationWithCap(self *node.Node, id [32]byte, rng *rand.Rand, cap time.Duration) time.Duration {
 	failCount := 0
 	if self != nil && self.Peers != nil {
 		if p, ok := self.Peers.Get(id); ok {
@@ -564,10 +698,17 @@ func nextBackoffDuration(self *node.Node, id [32]byte, rng *rand.Rand) time.Dura
 	backoff := backoffBase * time.Duration(1<<shift)
 	jitter := time.Duration(rng.Int63n(int64(backoffJitter)))
 	raw := backoff + jitter
-	if raw > maxBackoff() {
-		return maxBackoff()
+	if raw > cap {
+		return cap
 	}
 	return raw
+}
+
+func (c *connMan) currentMaxBackoff() time.Duration {
+	if c.isRecoveryActive() {
+		return recoveryBackoffCap()
+	}
+	return maxBackoff()
 }
 
 func outboundTarget() int {
@@ -589,6 +730,13 @@ func maxBackoff() time.Duration {
 		return time.Duration(v) * time.Second
 	}
 	return time.Duration(defaultMaxBackoffSec) * time.Second
+}
+
+func recoveryBackoffCap() time.Duration {
+	if v, ok := envInt("WEB4_RECOVERY_BACKOFF_CAP_SEC"); ok && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return time.Duration(defaultRecoveryBackoff) * time.Second
 }
 
 var connManDialHook func()
@@ -653,6 +801,16 @@ func pexInterval() time.Duration {
 	return time.Duration(defaultPexIntervalSec) * time.Second
 }
 
+func (c *connMan) currentPexInterval() time.Duration {
+	if c.isRecoveryActive() {
+		if v, ok := envInt("WEB4_RECOVERY_PEX_INTERVAL_SEC"); ok && v > 0 {
+			return time.Duration(v) * time.Second
+		}
+		return time.Duration(defaultRecoveryPexSec) * time.Second
+	}
+	return pexInterval()
+}
+
 func connManTickDuration() time.Duration {
 	if v, ok := envInt("WEB4_CONNMAN_TICK_MS"); ok && v > 0 {
 		return time.Duration(v) * time.Millisecond
@@ -679,6 +837,283 @@ func subnetMax() int {
 		return v
 	}
 	return defaultSubnetMax
+}
+
+func recoveryMinOutbound() int {
+	if v, ok := envInt("WEB4_RECOVERY_MIN_OUTBOUND"); ok && v > 0 {
+		return v
+	}
+	return defaultRecoveryMinOut
+}
+
+func recoveryGraceDuration() time.Duration {
+	if v, ok := envInt("WEB4_RECOVERY_GRACE_SEC"); ok && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return time.Duration(defaultRecoveryGrace) * time.Second
+}
+
+func recoveryWindowDuration() time.Duration {
+	if v, ok := envInt("WEB4_RECOVERY_WINDOW_SEC"); ok && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return time.Duration(defaultRecoveryWindow) * time.Second
+}
+
+func recoveryStableDuration() time.Duration {
+	if v, ok := envInt("WEB4_RECOVERY_STABLE_SEC"); ok && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return time.Duration(defaultRecoveryStable) * time.Second
+}
+
+func recoveryPanicInterval() time.Duration {
+	if v, ok := envInt("WEB4_RECOVERY_PANIC_INTERVAL_SEC"); ok && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return time.Duration(defaultRecoveryPanicS) * time.Second
+}
+
+func recoveryPanicDialCount() int {
+	if v, ok := envInt("WEB4_RECOVERY_PANIC_DIALS"); ok && v > 0 {
+		return v
+	}
+	return defaultRecoveryPanicN
+}
+
+func (c *connMan) isRecoveryActive() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.recovery.active
+}
+
+func (c *connMan) inRecoveryBoostWindow(now time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.recovery.active && (c.recovery.boostUntil.IsZero() || now.Before(c.recovery.boostUntil))
+}
+
+func (c *connMan) updateRecoveryState(now time.Time) {
+	minOut := recoveryMinOutbound()
+	out := c.outboundCount()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if out < minOut {
+		c.recovery.healthySince = time.Time{}
+		if c.recovery.isolatedSince.IsZero() {
+			c.recovery.isolatedSince = now
+		}
+		if !c.recovery.active && now.Sub(c.recovery.isolatedSince) >= recoveryGraceDuration() {
+			c.recovery.active = true
+			c.recovery.boostUntil = now.Add(recoveryWindowDuration())
+			c.recovery.enterTotal++
+			if c.metrics != nil {
+				c.metrics.SetRecoveryModeActive(true)
+				c.metrics.IncRecoveryEnterTotal()
+			}
+			c.logRecoveryState("enter", now, out, minOut)
+		}
+		if c.recovery.active && now.After(c.recovery.boostUntil) {
+			c.recovery.boostUntil = now.Add(recoveryWindowDuration())
+			c.logRecoveryState("extend", now, out, minOut)
+		}
+		return
+	}
+
+	c.recovery.isolatedSince = time.Time{}
+	if c.recovery.healthySince.IsZero() {
+		c.recovery.healthySince = now
+	}
+	if c.recovery.active && now.Sub(c.recovery.healthySince) >= recoveryStableDuration() {
+		c.recovery.active = false
+		c.recovery.boostUntil = time.Time{}
+		c.recovery.exitTotal++
+		if c.metrics != nil {
+			c.metrics.SetRecoveryModeActive(false)
+			c.metrics.IncRecoveryExitTotal()
+		}
+		c.logRecoveryState("exit", now, out, minOut)
+	}
+}
+
+func (c *connMan) logRecoveryState(event string, now time.Time, out, minOut int) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	if now.Sub(c.recovery.lastDebugLogAt) < 2*time.Second && event == "extend" {
+		return
+	}
+	c.recovery.lastDebugLogAt = now
+	fmt.Fprintf(os.Stderr, "connman recovery %s outbound=%d min=%d active=%t\n", event, out, minOut, c.recovery.active)
+}
+
+func (c *connMan) runRecoveryPanic(ctx context.Context) {
+	ticker := time.NewTicker(recoveryPanicInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.panicDialTick(ctx)
+		}
+	}
+}
+
+func (c *connMan) panicDialTick(ctx context.Context) {
+	if c.self == nil || c.self.Peers == nil {
+		return
+	}
+	now := time.Now()
+	if !c.inRecoveryBoostWindow(now) {
+		return
+	}
+	if c.outboundCount() >= recoveryMinOutbound() {
+		return
+	}
+	remaining := recoveryPanicDialCount()
+	if remaining <= 0 {
+		return
+	}
+
+	// First, force-dial known bootstrap identities.
+	for _, bp := range c.bootPeers {
+		if remaining <= 0 {
+			break
+		}
+		if bp.addr == "" || isZeroNodeID(bp.id) || !isValidAddr(bp.addr) {
+			continue
+		}
+		if c.isOutboundConnected(bp.id) {
+			continue
+		}
+		p := peer.Peer{NodeID: bp.id, Addr: bp.addr, Source: "seed"}
+		reason := dialReason("panic", "seed")
+		c.logForcedDialDecision(reason, p, c.nextTryAt(bp.id), "attempt", "")
+		if c.metrics != nil {
+			c.metrics.IncRecoveryPanicDialsTotal()
+			c.metrics.IncDialAttemptByReason(reason)
+		}
+		if err := c.handshake(ctx, bp.id, bp.addr, reason, true); err != nil {
+			c.logForcedDialDecision(reason, p, c.nextTryAt(bp.id), "fail", err.Error())
+			c.logDialError(bp.id, err)
+			if c.metrics != nil {
+				c.metrics.IncDialFailByReason(reason)
+			}
+			c.markFailure(bp.id)
+		} else {
+			c.markSuccess(bp.id)
+			if c.metrics != nil {
+				c.metrics.IncDialSuccessByReason(reason)
+			}
+			c.logForcedDialDecision(reason, p, c.nextTryAt(bp.id), "success", "")
+			if c.outboundCount() >= recoveryMinOutbound() {
+				return
+			}
+		}
+		remaining--
+	}
+
+	// If still isolated, force one plain bootstrap query to rediscover live peers.
+	if remaining > 0 && len(c.bootstrap) > 0 {
+		addr := c.bootstrap[0]
+		var zero [32]byte
+		p := peer.Peer{NodeID: zero, Addr: addr, Source: "seed"}
+		c.logForcedDialDecision(dialReason("panic", "seed_plain"), p, c.nextTryAt(zero), "attempt", "")
+		if c.metrics != nil {
+			c.metrics.IncRecoveryPanicDialsTotal()
+		}
+		c.sendPeerExchangePlain(ctx, []string{addr})
+		remaining--
+	}
+
+	if remaining <= 0 {
+		return
+	}
+	peers := c.self.Peers.ListPeersRanked(0, peer.PeerFilter{AllowNoAddr: false})
+	c.pickAndConnectWithMode(ctx, peers, remaining, false, true, "panic")
+}
+
+func (c *connMan) nextTryAt(id [32]byte) time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nextTry[id]
+}
+
+func dialReason(mode, source string) string {
+	m := strings.TrimSpace(mode)
+	if m == "" {
+		m = "normal"
+	}
+	s := strings.TrimSpace(source)
+	if s == "" {
+		s = "unknown"
+	}
+	return m + ":" + s
+}
+
+func peerDialAddr(p peer.Peer) string {
+	if strings.TrimSpace(p.DialAddr) != "" {
+		return strings.TrimSpace(p.DialAddr)
+	}
+	return strings.TrimSpace(p.Addr)
+}
+
+func classifyHelloReject(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "to_id mismatch"):
+		return "to_id_mismatch"
+	case strings.Contains(msg, "signature"):
+		return "bad_signature"
+	case strings.Contains(msg, "session"):
+		return "session"
+	case strings.Contains(msg, "suite"):
+		return "suite"
+	default:
+		return "other"
+	}
+}
+
+func (c *connMan) logForcedDialDecision(reason string, p peer.Peer, nextTry time.Time, outcome string, errMsg string) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	if reason == "" {
+		reason = "recovery:unknown"
+	}
+	next := "immediate"
+	if !nextTry.IsZero() {
+		next = strconv.FormatInt(nextTry.Unix(), 10)
+	}
+	if errMsg != "" {
+		fmt.Fprintf(
+			os.Stderr,
+			"connman forced_dial reason=%s force=true node=%x addr=%s source=%s score=%.3f fail_count=%d next_try=%s outcome=%s err=%s\n",
+			reason, p.NodeID[:], p.Addr, p.Source, p.Score, p.FailCount, next, outcome, errMsg,
+		)
+		return
+	}
+	fmt.Fprintf(
+		os.Stderr,
+		"connman forced_dial reason=%s force=true node=%x addr=%s source=%s score=%.3f fail_count=%d next_try=%s outcome=%s\n",
+		reason, p.NodeID[:], p.Addr, p.Source, p.Score, p.FailCount, next, outcome,
+	)
+}
+
+func (c *connMan) logForcedDialStage(reason string, id [32]byte, addr, stage, outcome string, err error) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "connman forced_dial_stage reason=%s node=%x addr=%s stage=%s outcome=%s err=%v\n", reason, id[:], addr, stage, outcome, err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "connman forced_dial_stage reason=%s node=%x addr=%s stage=%s outcome=%s\n", reason, id[:], addr, stage, outcome)
 }
 
 func bootstrapAddrs() []string {

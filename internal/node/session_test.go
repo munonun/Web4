@@ -179,11 +179,11 @@ func TestHello1FromAddrPersistsUnverifiedHint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new node B failed: %v", err)
 	}
+	nodeA.SetListenAddr("127.0.0.1:46043")
 	hello1, err := nodeA.BuildHello1(nodeB.ID)
 	if err != nil {
 		t.Fatalf("build hello1 failed: %v", err)
 	}
-	hello1.FromAddr = "127.0.0.1:46043"
 	if _, err := nodeB.HandleHello1From(hello1, "127.0.0.1:32790"); err != nil {
 		t.Fatalf("handle hello1 failed: %v", err)
 	}

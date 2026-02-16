@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -33,7 +34,39 @@ func (zeroReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
+type devTLSPaths struct {
+	certPath   string
+	keyPath    string
+	bundlePath string
+}
+
+func resolveDevTLSPaths() devTLSPaths {
+	p := devTLSPaths{
+		certPath:   strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_CERT_PATH")),
+		keyPath:    strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_KEY_PATH")),
+		bundlePath: strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_BUNDLE_PATH")),
+	}
+	if legacy := strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_PATH")); legacy != "" {
+		if p.certPath == "" {
+			p.certPath = legacy
+		}
+	}
+	if p.bundlePath != "" {
+		if p.certPath == "" {
+			p.certPath = p.bundlePath
+		}
+		if p.keyPath == "" {
+			p.keyPath = p.bundlePath
+		}
+	}
+	return p
+}
+
 func devTLSCert() (tls.Certificate, []byte, error) {
+	return devTLSCertWithIPs(devTLSCertIPs())
+}
+
+func devTLSCertWithIPs(ips []net.IP) (tls.Certificate, []byte, error) {
 	seed := sha256.Sum256([]byte("web4-quic-dev-key"))
 	priv := ed25519.NewKeyFromSeed(seed[:])
 	now := time.Now()
@@ -44,7 +77,7 @@ func devTLSCert() (tls.Certificate, []byte, error) {
 		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		IPAddresses:  ips,
 	}
 	der, err := x509.CreateCertificate(zeroReader{}, &template, &template, priv.Public(), priv)
 	if err != nil {
@@ -57,10 +90,47 @@ func devTLSCert() (tls.Certificate, []byte, error) {
 	return cert, der, nil
 }
 
+func devTLSCertIPs() []net.IP {
+	seen := map[string]struct{}{}
+	out := make([]net.IP, 0, 3)
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		ip := net.ParseIP(s)
+		if ip == nil {
+			return
+		}
+		key := ip.String()
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, ip)
+	}
+	add("127.0.0.1")
+	for _, part := range strings.Split(os.Getenv("WEB4_DEVTLS_CERT_IPS"), ",") {
+		add(part)
+	}
+	return out
+}
+
 func serverTLSConfig(devTLS bool) (*tls.Config, error) {
-	cert, _, err := devTLSCert()
-	if err != nil {
-		return nil, err
+	var cert tls.Certificate
+	if devTLS {
+		if loaded, ok, err := loadDevTLSCertFromConfiguredPaths(); err != nil {
+			return nil, err
+		} else if ok {
+			cert = loaded
+		}
+	}
+	if len(cert.Certificate) == 0 {
+		var err error
+		cert, _, err = devTLSCert()
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -76,10 +146,14 @@ func clientTLSConfig(insecure bool, devTLS bool, devTLSCAPath string) (*tls.Conf
 		}, nil
 	}
 	if devTLS {
+		paths := resolveDevTLSPaths()
 		if envPath := os.Getenv("WEB4_DEVTLS_CA_PATH"); envPath != "" {
 			if fi, err := os.Stat(envPath); err == nil && fi.Size() > 0 {
 				devTLSCAPath = envPath
 			}
+		}
+		if devTLSCAPath == "" && paths.certPath != "" {
+			devTLSCAPath = paths.certPath
 		}
 		var pool *x509.CertPool
 		var err error
@@ -630,11 +704,22 @@ func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, re
 }
 
 func ensureDevTLSCA() error {
+	if _, ok, err := loadDevTLSCertFromConfiguredPaths(); err != nil {
+		return err
+	} else if ok {
+		return nil
+	}
 	_, der, err := devTLSCert()
 	if err != nil {
 		return err
 	}
-	return persistDevTLSCert(der)
+	seed := sha256.Sum256([]byte("web4-quic-dev-key"))
+	priv := ed25519.NewKeyFromSeed(seed[:])
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	return persistDevTLSMaterial(der, keyDER)
 }
 
 func Send(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath string) error {
@@ -654,6 +739,13 @@ func Exchange(addr string, data []byte, insecure bool, devTLS bool, devTLSCAPath
 }
 
 func devTLSCertPath() (string, error) {
+	paths := resolveDevTLSPaths()
+	if paths.certPath != "" {
+		return paths.certPath, nil
+	}
+	if paths.bundlePath != "" {
+		return paths.bundlePath, nil
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -661,7 +753,22 @@ func devTLSCertPath() (string, error) {
 	return filepath.Join(home, ".web4mvp", "devtls_ca.pem"), nil
 }
 
-func persistDevTLSCert(der []byte) error {
+func devTLSKeyPath() (string, error) {
+	paths := resolveDevTLSPaths()
+	if paths.keyPath != "" {
+		return paths.keyPath, nil
+	}
+	if paths.bundlePath != "" {
+		return paths.bundlePath, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".web4mvp", "devtls_ca_key.pem"), nil
+}
+
+func persistDevTLSMaterial(certDER []byte, keyDER []byte) error {
 	path, err := devTLSCertPath()
 	if err != nil {
 		return err
@@ -669,8 +776,33 @@ func persistDevTLSCert(der []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	return os.WriteFile(path, pemBytes, 0600)
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	if err := os.WriteFile(path, certPEM, 0600); err != nil {
+		return err
+	}
+	keyPath, err := devTLSKeyPath()
+	if err != nil {
+		return err
+	}
+	if keyPath == path {
+		bundle := append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})...)
+		return os.WriteFile(path, bundle, 0600)
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0700); err != nil {
+		return err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	return os.WriteFile(keyPath, keyPEM, 0600)
+}
+
+func persistDevTLSCert(der []byte) error {
+	seed := sha256.Sum256([]byte("web4-quic-dev-key"))
+	priv := ed25519.NewKeyFromSeed(seed[:])
+	keyDER, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		return err
+	}
+	return persistDevTLSMaterial(der, keyDER)
 }
 
 func loadDevTLSCertPool() (*x509.CertPool, error) {
@@ -683,6 +815,87 @@ func loadDevTLSCertPool() (*x509.CertPool, error) {
 
 func loadDevTLSCertPoolFromPath(path string) (*x509.CertPool, error) {
 	return loadDevTLSCertPoolWithFallback(path, false)
+}
+
+func loadDevTLSCertFromConfiguredPaths() (tls.Certificate, bool, error) {
+	paths := resolveDevTLSPaths()
+	if paths.certPath == "" && paths.keyPath == "" && paths.bundlePath == "" {
+		return tls.Certificate{}, false, nil
+	}
+	certPath := paths.certPath
+	keyPath := paths.keyPath
+	if certPath == "" {
+		return tls.Certificate{}, false, fmt.Errorf("devtls ca not ready: missing cert path")
+	}
+	if keyPath == "" {
+		return tls.Certificate{}, false, fmt.Errorf("devtls ca not ready: missing key path")
+	}
+	if fi, err := os.Stat(certPath); err != nil || fi.Size() == 0 {
+		return tls.Certificate{}, false, fmt.Errorf("devtls ca not ready: cert missing")
+	}
+	if fi, err := os.Stat(keyPath); err != nil || fi.Size() == 0 {
+		return tls.Certificate{}, false, fmt.Errorf("devtls ca not ready: key missing")
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return tls.Certificate{}, false, fmt.Errorf("devtls ca not ready: %w", err)
+	}
+	return cert, true, nil
+}
+
+func parseCertIPsCSV(csv string) []net.IP {
+	seen := map[string]struct{}{}
+	out := make([]net.IP, 0, 8)
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return
+		}
+		ip := net.ParseIP(s)
+		if ip == nil {
+			return
+		}
+		key := ip.String()
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, ip)
+	}
+	add("127.0.0.1")
+	for _, part := range strings.Split(csv, ",") {
+		add(part)
+	}
+	return out
+}
+
+func GenerateDeterministicDevTLSCA(outDir string, ipsCSV string) (string, string, error) {
+	if strings.TrimSpace(outDir) == "" {
+		return "", "", fmt.Errorf("missing out dir")
+	}
+	if err := os.MkdirAll(outDir, 0700); err != nil {
+		return "", "", err
+	}
+	ips := parseCertIPsCSV(ipsCSV)
+	cert, der, err := devTLSCertWithIPs(ips)
+	if err != nil {
+		return "", "", err
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(cert.PrivateKey)
+	if err != nil {
+		return "", "", err
+	}
+	certPath := filepath.Join(outDir, "ca_cert.pem")
+	keyPath := filepath.Join(outDir, "ca_key.pem")
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		return "", "", err
+	}
+	return certPath, keyPath, nil
 }
 
 func loadDevTLSCertPoolWithFallback(path string, allowFallback bool) (*x509.CertPool, error) {

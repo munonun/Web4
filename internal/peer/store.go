@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,8 @@ type Peer struct {
 	NodeID          [32]byte
 	PubKey          []byte
 	Addr            string
+	DialAddr        string
+	ObservedAddr    string
 	LastSeenUnix    int64
 	LastSuccessUnix int64
 	FailCount       int
@@ -88,6 +91,8 @@ type addrObservation struct {
 type diskPeer struct {
 	NodeID          string  `json:"node_id"`
 	PubKey          string  `json:"pubkey"`
+	DialAddr        string  `json:"dial_addr,omitempty"`
+	ObservedAddr    string  `json:"observed_addr,omitempty"`
 	Addr            string  `json:"addr,omitempty"`
 	LastSeenUnix    int64   `json:"last_seen_unix,omitempty"`
 	LastSuccessUnix int64   `json:"last_success_unix,omitempty"`
@@ -102,6 +107,7 @@ var (
 	ErrAddrConflict = errors.New("addr conflict")
 	ErrAddrMuted    = errors.New("addr muted")
 	ErrAddrCooldown = errors.New("addr cooldown")
+	ErrAddrLoopback = errors.New("addr loopback rejected")
 )
 
 func NewStore(path string, opts Options) (*Store, error) {
@@ -159,6 +165,7 @@ func NewStore(path string, opts Options) (*Store, error) {
 }
 
 func (s *Store) Upsert(p Peer, persist bool) error {
+	ensureAddrCompat(&p)
 	if isZeroNodeID(p.NodeID) {
 		return fmt.Errorf("missing node_id")
 	}
@@ -176,15 +183,16 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	s.pruneLocked()
 	now := time.Now()
 	if p.Addr != "" && !s.allowAddrFromUpsert {
-		p.Addr = ""
+		setDialAddr(&p, "")
 	}
 	var existing *entry
 	var existingEl *list.Element
 	if el, ok := s.hot[key]; ok {
 		existingEl = el
 		existing = el.Value.(*entry)
+		ensureAddrCompat(&existing.peer)
 		if p.Addr == "" {
-			p.Addr = existing.peer.Addr
+			setDialAddr(&p, dialAddrOf(existing.peer))
 		}
 		if len(p.PubKey) == 0 {
 			p.PubKey = existing.peer.PubKey
@@ -198,7 +206,7 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	derived := s.deriveNodeID(p.PubKey)
 	if derived != p.NodeID {
 		s.mu.Unlock()
-		fmt.Fprintf(os.Stderr, "peer upsert rejected: node_id/pubkey mismatch node_id=%x pub_node_id=%x addr=%s\n", p.NodeID[:], derived[:], p.Addr)
+		fmt.Fprintf(os.Stderr, "peer upsert rejected: node_id/pubkey mismatch node_id=%x pub_node_id=%x addr=%s\n", p.NodeID[:], derived[:], dialAddrOf(p))
 		return fmt.Errorf("node_id/pubkey mismatch")
 	}
 	pub := make([]byte, len(p.PubKey))
@@ -206,15 +214,16 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	p.PubKey = pub
 	if existing != nil {
 		if p.Addr == "" {
-			p.Addr = existing.peer.Addr
-		} else if p.Addr != existing.peer.Addr {
+			setDialAddr(&p, dialAddrOf(existing.peer))
+		} else if p.Addr != dialAddrOf(existing.peer) {
 			if err := s.setAddrLocked(existing, p.Addr, now, false, false); err != nil {
 				s.mu.Unlock()
 				return err
 			}
-			p.Addr = existing.peer.Addr
+			setDialAddr(&p, dialAddrOf(existing.peer))
 		}
 		existing.peer = p
+		ensureAddrCompat(&existing.peer)
 		existing.expiresAt = now.Add(s.ttl)
 		s.order.MoveToFront(existingEl)
 		s.mu.Unlock()
@@ -225,7 +234,9 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 		rec := diskPeer{
 			NodeID:          hex.EncodeToString(p.NodeID[:]),
 			PubKey:          hex.EncodeToString(p.PubKey),
-			Addr:            p.Addr,
+			DialAddr:        dialAddrOf(p),
+			ObservedAddr:    p.ObservedAddr,
+			Addr:            dialAddrOf(p),
 			LastSeenUnix:    p.LastSeenUnix,
 			LastSuccessUnix: p.LastSuccessUnix,
 			FailCount:       p.FailCount,
@@ -239,8 +250,8 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	if s.cap > 0 && len(s.hot) >= s.cap {
 		s.evictLocked(len(s.hot) - s.cap + 1)
 	}
-	addr := p.Addr
-	p.Addr = ""
+	addr := dialAddrOf(p)
+	setDialAddr(&p, "")
 	ent := &entry{key: key, peer: p, expiresAt: now.Add(s.ttl)}
 	if addr != "" {
 		if err := s.setAddrLocked(ent, addr, now, false, false); err != nil {
@@ -259,7 +270,9 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	rec := diskPeer{
 		NodeID:          hex.EncodeToString(p.NodeID[:]),
 		PubKey:          hex.EncodeToString(p.PubKey),
-		Addr:            p.Addr,
+		DialAddr:        dialAddrOf(p),
+		ObservedAddr:    p.ObservedAddr,
+		Addr:            dialAddrOf(p),
 		LastSeenUnix:    p.LastSeenUnix,
 		LastSuccessUnix: p.LastSuccessUnix,
 		FailCount:       p.FailCount,
@@ -274,6 +287,7 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 // UpsertUnverified stores a peer without requiring a pubkey. It never persists to disk.
 // Intended for bootstrap/PEX discovery before keys are known.
 func (s *Store) UpsertUnverified(p Peer) error {
+	ensureAddrCompat(&p)
 	if isZeroNodeID(p.NodeID) {
 		return fmt.Errorf("missing node_id")
 	}
@@ -287,6 +301,7 @@ func (s *Store) UpsertUnverified(p Peer) error {
 	if el, ok := s.hot[key]; ok {
 		entEl = el
 		ent = el.Value.(*entry)
+		ensureAddrCompat(&ent.peer)
 	}
 	if ent == nil {
 		if s.cap > 0 && len(s.hot) >= s.cap {
@@ -318,6 +333,7 @@ func (s *Store) UpsertUnverified(p Peer) error {
 }
 
 func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, verified bool, persist bool) (bool, error) {
+	ensureAddrCompat(&p)
 	if observedAddr == "" {
 		return false, nil
 	}
@@ -333,6 +349,7 @@ func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, v
 	if el, ok := s.hot[key]; ok {
 		entEl = el
 		ent = el.Value.(*entry)
+		ensureAddrCompat(&ent.peer)
 		if len(p.PubKey) == 0 {
 			p.PubKey = ent.peer.PubKey
 		}
@@ -354,6 +371,7 @@ func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, v
 			s.evictLocked(len(s.hot) - s.cap + 1)
 		}
 		ent = &entry{key: key, peer: Peer{NodeID: p.NodeID, PubKey: pub}, expiresAt: now.Add(s.ttl)}
+		ensureAddrCompat(&ent.peer)
 		entEl = s.order.PushFront(ent)
 		s.hot[key] = entEl
 	} else {
@@ -363,6 +381,7 @@ func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, v
 		s.order.MoveToFront(entEl)
 	}
 	ent.peer.LastSeenUnix = now.Unix()
+	ent.peer.ObservedAddr = observedAddr
 	host := hostForAddr(observedAddr)
 	obsByHost := s.addrObs[p.NodeID]
 	if obsByHost == nil {
@@ -398,7 +417,9 @@ func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, v
 	rec := diskPeer{
 		NodeID:          hex.EncodeToString(ent.peer.NodeID[:]),
 		PubKey:          hex.EncodeToString(ent.peer.PubKey),
-		Addr:            ent.peer.Addr,
+		DialAddr:        dialAddrOf(ent.peer),
+		ObservedAddr:    ent.peer.ObservedAddr,
+		Addr:            dialAddrOf(ent.peer),
 		LastSeenUnix:    ent.peer.LastSeenUnix,
 		LastSuccessUnix: ent.peer.LastSuccessUnix,
 		FailCount:       ent.peer.FailCount,
@@ -418,6 +439,7 @@ func (s *Store) List() []Peer {
 	for el := s.order.Front(); el != nil; el = el.Next() {
 		ent := el.Value.(*entry)
 		p := ent.peer
+		ensureAddrCompat(&p)
 		pub := make([]byte, len(p.PubKey))
 		copy(pub, p.PubKey)
 		cp := p
@@ -443,6 +465,7 @@ func (s *Store) Get(id [32]byte) (Peer, bool) {
 	}
 	ent := el.Value.(*entry)
 	p := ent.peer
+	ensureAddrCompat(&p)
 	pub := make([]byte, len(p.PubKey))
 	copy(pub, p.PubKey)
 	p.PubKey = pub
@@ -452,8 +475,12 @@ func (s *Store) Get(id [32]byte) (Peer, bool) {
 }
 
 func (s *Store) SetAddrUnverified(p Peer, addr string, persist bool) (bool, error) {
+	ensureAddrCompat(&p)
 	if addr == "" || isZeroNodeID(p.NodeID) || len(p.PubKey) == 0 {
 		return false, nil
+	}
+	if rejectLoopbackDialAddr() && isLoopbackAddr(addr) {
+		return false, ErrAddrLoopback
 	}
 	derived := s.deriveNodeID(p.PubKey)
 	if derived != p.NodeID {
@@ -478,6 +505,7 @@ func (s *Store) SetAddrUnverified(p Peer, addr string, persist bool) (bool, erro
 	if el, ok := s.hot[key]; ok {
 		entEl = el
 		ent = el.Value.(*entry)
+		ensureAddrCompat(&ent.peer)
 	}
 	if ent == nil {
 		if s.cap > 0 && len(s.hot) >= s.cap {
@@ -508,7 +536,7 @@ func (s *Store) SetAddrUnverified(p Peer, addr string, persist bool) (bool, erro
 		}
 	}
 	changed := ent.peer.Addr != addr
-	ent.peer.Addr = addr
+	setDialAddr(&ent.peer, addr)
 	ent.peer.SubnetKey = subnetKeyForAddr(addr)
 	s.addrVerified[p.NodeID] = false
 	s.addrHints[p.NodeID] = addr
@@ -523,7 +551,9 @@ func (s *Store) SetAddrUnverified(p Peer, addr string, persist bool) (bool, erro
 	rec := diskPeer{
 		NodeID:          hex.EncodeToString(ent.peer.NodeID[:]),
 		PubKey:          hex.EncodeToString(ent.peer.PubKey),
-		Addr:            ent.peer.Addr,
+		DialAddr:        dialAddrOf(ent.peer),
+		ObservedAddr:    ent.peer.ObservedAddr,
+		Addr:            dialAddrOf(ent.peer),
 		LastSeenUnix:    ent.peer.LastSeenUnix,
 		LastSuccessUnix: ent.peer.LastSuccessUnix,
 		FailCount:       ent.peer.FailCount,
@@ -583,6 +613,7 @@ func (s *Store) EvictToMax(max int, subnetMax int) int {
 	subnetCount := make(map[string]int)
 	for el := s.order.Front(); el != nil; el = el.Next() {
 		ent := el.Value.(*entry)
+		ensureAddrCompat(&ent.peer)
 		key := ent.peer.SubnetKey
 		if key == "" && ent.peer.Addr != "" {
 			key = subnetKeyForAddr(ent.peer.Addr)
@@ -594,6 +625,7 @@ func (s *Store) EvictToMax(max int, subnetMax int) int {
 	candidates := make([]candidate, 0, len(s.hot))
 	for el := s.order.Front(); el != nil; el = el.Next() {
 		ent := el.Value.(*entry)
+		ensureAddrCompat(&ent.peer)
 		key := ent.peer.SubnetKey
 		if key == "" && ent.peer.Addr != "" {
 			key = subnetKeyForAddr(ent.peer.Addr)
@@ -694,13 +726,14 @@ func (s *Store) pruneLocked() {
 	for el := s.order.Back(); el != nil; {
 		prev := el.Prev()
 		ent := el.Value.(*entry)
+		ensureAddrCompat(&ent.peer)
 		if ent.expiresAt.After(now) {
 			el = prev
 			continue
 		}
-		if ent.peer.Addr != "" {
-			if owner, ok := s.addrIndex[ent.peer.Addr]; ok && owner == ent.peer.NodeID {
-				delete(s.addrIndex, ent.peer.Addr)
+		if dialAddr := dialAddrOf(ent.peer); dialAddr != "" {
+			if owner, ok := s.addrIndex[dialAddr]; ok && owner == ent.peer.NodeID {
+				delete(s.addrIndex, dialAddr)
 			}
 		}
 		delete(s.addrVerified, ent.peer.NodeID)
@@ -728,9 +761,10 @@ func (s *Store) removeEntryLocked(el *list.Element) {
 		return
 	}
 	ent := el.Value.(*entry)
-	if ent.peer.Addr != "" {
-		if owner, ok := s.addrIndex[ent.peer.Addr]; ok && owner == ent.peer.NodeID {
-			delete(s.addrIndex, ent.peer.Addr)
+	ensureAddrCompat(&ent.peer)
+	if dialAddr := dialAddrOf(ent.peer); dialAddr != "" {
+		if owner, ok := s.addrIndex[dialAddr]; ok && owner == ent.peer.NodeID {
+			delete(s.addrIndex, dialAddr)
 		}
 	}
 	delete(s.addrVerified, ent.peer.NodeID)
@@ -776,7 +810,9 @@ func (s *Store) loadLast(limit int) error {
 		_ = s.loadRecord(Peer{
 			NodeID:          id,
 			PubKey:          pub,
-			Addr:            rec.Addr,
+			DialAddr:        firstNonEmpty(rec.DialAddr, rec.Addr),
+			Addr:            firstNonEmpty(rec.DialAddr, rec.Addr),
+			ObservedAddr:    rec.ObservedAddr,
 			LastSeenUnix:    rec.LastSeenUnix,
 			LastSuccessUnix: rec.LastSuccessUnix,
 			FailCount:       rec.FailCount,
@@ -838,7 +874,33 @@ func keyForPeer(p Peer) string {
 	return hex.EncodeToString(p.NodeID[:])
 }
 
+func ensureAddrCompat(p *Peer) {
+	if p == nil {
+		return
+	}
+	if p.DialAddr == "" {
+		p.DialAddr = p.Addr
+	}
+	p.Addr = p.DialAddr
+}
+
+func dialAddrOf(p Peer) string {
+	if p.DialAddr != "" {
+		return p.DialAddr
+	}
+	return p.Addr
+}
+
+func setDialAddr(p *Peer, addr string) {
+	if p == nil {
+		return
+	}
+	p.DialAddr = addr
+	p.Addr = addr
+}
+
 func (s *Store) loadRecord(p Peer) error {
+	ensureAddrCompat(&p)
 	if isZeroNodeID(p.NodeID) || len(p.PubKey) == 0 {
 		return fmt.Errorf("invalid peer")
 	}
@@ -873,8 +935,9 @@ func (s *Store) loadRecord(p Peer) error {
 		s.order.MoveToFront(entEl)
 	}
 	mergePeerMeta(&ent.peer, p, now)
-	if p.Addr != "" {
-		_ = s.setAddrLocked(ent, p.Addr, now, true, true)
+	ent.peer.ObservedAddr = p.ObservedAddr
+	if dialAddrOf(p) != "" {
+		_ = s.setAddrLocked(ent, dialAddrOf(p), now, true, true)
 	}
 	s.mu.Unlock()
 	return nil
@@ -884,6 +947,10 @@ func (s *Store) setAddrLocked(ent *entry, addr string, now time.Time, ignoreCool
 	if addr == "" {
 		return nil
 	}
+	if rejectLoopbackDialAddr() && isLoopbackAddr(addr) {
+		return ErrAddrLoopback
+	}
+	ensureAddrCompat(&ent.peer)
 	if until, ok := s.mutedAddrs[addr]; ok && until.After(now) {
 		return ErrAddrMuted
 	}
@@ -891,7 +958,8 @@ func (s *Store) setAddrLocked(ent *entry, addr string, now time.Time, ignoreCool
 		s.mutedAddrs[addr] = now.Add(DefaultAddrMuteDuration)
 		return ErrAddrConflict
 	}
-	if ent.peer.Addr == addr {
+	currentAddr := dialAddrOf(ent.peer)
+	if currentAddr == addr {
 		if verified && !s.addrVerified[ent.peer.NodeID] {
 			s.addrIndex[addr] = ent.peer.NodeID
 			s.addrVerified[ent.peer.NodeID] = true
@@ -905,8 +973,8 @@ func (s *Store) setAddrLocked(ent *entry, addr string, now time.Time, ignoreCool
 		}
 		return nil
 	}
-	if ent.peer.Addr != "" && !ignoreCooldown {
-		currentHost := hostForAddr(ent.peer.Addr)
+	if currentAddr != "" && !ignoreCooldown {
+		currentHost := hostForAddr(currentAddr)
 		newHost := hostForAddr(addr)
 		if currentHost == "" || newHost == "" || currentHost != newHost {
 			if last, ok := s.addrChange[ent.peer.NodeID]; ok && now.Sub(last) < s.addrCooldown {
@@ -914,12 +982,12 @@ func (s *Store) setAddrLocked(ent *entry, addr string, now time.Time, ignoreCool
 			}
 		}
 	}
-	if ent.peer.Addr != "" && verified {
-		if owner, ok := s.addrIndex[ent.peer.Addr]; ok && owner == ent.peer.NodeID {
-			delete(s.addrIndex, ent.peer.Addr)
+	if currentAddr != "" && verified {
+		if owner, ok := s.addrIndex[currentAddr]; ok && owner == ent.peer.NodeID {
+			delete(s.addrIndex, currentAddr)
 		}
 	}
-	ent.peer.Addr = addr
+	setDialAddr(&ent.peer, addr)
 	ent.peer.SubnetKey = subnetKeyForAddr(addr)
 	if verified {
 		s.addrIndex[addr] = ent.peer.NodeID
@@ -957,9 +1025,10 @@ func (s *Store) PeerSeen(id [32]byte, addr string) {
 		return
 	}
 	ent := el.Value.(*entry)
+	ensureAddrCompat(&ent.peer)
 	ent.peer.LastSeenUnix = now.Unix()
 	if addr != "" {
-		_ = s.setAddrLocked(ent, addr, now, true, false)
+		ent.peer.ObservedAddr = addr
 	}
 	s.order.MoveToFront(el)
 	_ = s.persistPeer(ent.peer)
@@ -979,6 +1048,7 @@ func (s *Store) PeerSuccess(id [32]byte, rttMs int) {
 		return
 	}
 	ent := el.Value.(*entry)
+	ensureAddrCompat(&ent.peer)
 	ent.peer.LastSuccessUnix = now.Unix()
 	ent.peer.LastSeenUnix = now.Unix()
 	ent.peer.FailCount = 0
@@ -1003,6 +1073,7 @@ func (s *Store) PeerFail(id [32]byte) {
 		return
 	}
 	ent := el.Value.(*entry)
+	ensureAddrCompat(&ent.peer)
 	ent.peer.FailCount++
 	ent.peer.LastSeenUnix = now.Unix()
 	s.order.MoveToFront(el)
@@ -1014,6 +1085,7 @@ func (s *Store) ListPeersRanked(limit int, filter PeerFilter) []Peer {
 	now := time.Now()
 	filtered := make([]Peer, 0, len(peers))
 	for _, p := range peers {
+		ensureAddrCompat(&p)
 		if !filter.AllowNoAddr && p.Addr == "" {
 			continue
 		}
@@ -1053,11 +1125,14 @@ func (s *Store) persistPeer(p Peer) error {
 	if len(p.PubKey) == 0 {
 		return nil
 	}
+	ensureAddrCompat(&p)
 	p.Score = scoreForPeer(p, time.Now())
 	rec := diskPeer{
 		NodeID:          hex.EncodeToString(p.NodeID[:]),
 		PubKey:          hex.EncodeToString(p.PubKey),
-		Addr:            p.Addr,
+		DialAddr:        dialAddrOf(p),
+		ObservedAddr:    p.ObservedAddr,
+		Addr:            dialAddrOf(p),
 		LastSeenUnix:    p.LastSeenUnix,
 		LastSuccessUnix: p.LastSuccessUnix,
 		FailCount:       p.FailCount,
@@ -1095,6 +1170,8 @@ func SubnetKeyForAddr(addr string) string {
 }
 
 func mergePeerMeta(dst *Peer, src Peer, now time.Time) {
+	ensureAddrCompat(dst)
+	ensureAddrCompat(&src)
 	if dst.LastSeenUnix == 0 {
 		dst.LastSeenUnix = src.LastSeenUnix
 	}
@@ -1113,8 +1190,8 @@ func mergePeerMeta(dst *Peer, src Peer, now time.Time) {
 	if dst.SubnetKey == "" {
 		dst.SubnetKey = src.SubnetKey
 	}
-	if dst.SubnetKey == "" && dst.Addr != "" {
-		dst.SubnetKey = subnetKeyForAddr(dst.Addr)
+	if dst.SubnetKey == "" && dialAddrOf(*dst) != "" {
+		dst.SubnetKey = subnetKeyForAddr(dialAddrOf(*dst))
 	}
 	if dst.LastSeenUnix == 0 {
 		dst.LastSeenUnix = now.Unix()
@@ -1165,4 +1242,29 @@ func sourcePriority(s string) int {
 func isZeroNodeID(id [32]byte) bool {
 	var zero [32]byte
 	return id == zero
+}
+
+func firstNonEmpty(v ...string) string {
+	for _, s := range v {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func rejectLoopbackDialAddr() bool {
+	return strings.TrimSpace(os.Getenv("WEB4_REJECT_LOOPBACK_DIAL_ADDR")) == "1"
+}
+
+func isLoopbackAddr(addr string) bool {
+	host := hostForAddr(addr)
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
