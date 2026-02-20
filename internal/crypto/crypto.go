@@ -12,9 +12,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"sync"
 
 	"github.com/cloudflare/circl/kem/mlkem/mlkem768"
-	"github.com/cloudflare/circl/sign/slhdsa"
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/sha3"
 )
@@ -37,7 +40,30 @@ const (
 	MLKEM768SharedKeySize  = mlkem768.SharedKeySize
 )
 
-var slhDSAParam = slhdsa.SHAKE_128s
+type mldsaSignReq struct {
+	priv []byte
+	msg  []byte
+	resp chan mldsaSignResp
+}
+
+type mldsaSignResp struct {
+	sig []byte
+	err error
+}
+
+type mldsaVerifyReq struct {
+	pub  []byte
+	msg  []byte
+	sig  []byte
+	resp chan bool
+}
+
+var (
+	mldsaSignOnce   sync.Once
+	mldsaVerifyOnce sync.Once
+	mldsaSignQ      chan mldsaSignReq
+	mldsaVerifyQ    chan mldsaVerifyReq
+)
 
 const (
 	// XChaCha20-Poly1305 sizes
@@ -320,8 +346,8 @@ func IsRSAPrivateKey(priv []byte) bool {
 	return err == nil
 }
 
-func GenSLHDSAKeypair() ([]byte, []byte, error) {
-	pub, priv, err := slhdsa.GenerateKey(rand.Reader, slhDSAParam)
+func GenMLDSAKeypair() ([]byte, []byte, error) {
+	pub, priv, err := mldsa65.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -336,20 +362,116 @@ func GenSLHDSAKeypair() ([]byte, []byte, error) {
 	return pubBin, privBin, nil
 }
 
-func SLHDSASign(priv, msg []byte) ([]byte, error) {
-	key := slhdsa.PrivateKey{ID: slhDSAParam}
+func MLDSASign(priv, msg []byte) ([]byte, error) {
+	if len(priv) == 0 {
+		return nil, errors.New("missing ml-dsa private key")
+	}
+	initMLDSASignPool()
+	req := mldsaSignReq{
+		priv: append([]byte(nil), priv...),
+		msg:  append([]byte(nil), msg...),
+		resp: make(chan mldsaSignResp, 1),
+	}
+	mldsaSignQ <- req
+	out := <-req.resp
+	return out.sig, out.err
+}
+
+func signMLDSADirect(priv, msg []byte) ([]byte, error) {
+	key := mldsa65.PrivateKey{}
 	if err := key.UnmarshalBinary(priv); err != nil {
 		return nil, err
 	}
-	return slhdsa.SignRandomized(&key, rand.Reader, slhdsa.NewMessage(msg), nil)
+	sig := make([]byte, mldsa65.SignatureSize)
+	if err := mldsa65.SignTo(&key, msg, nil, true, sig); err != nil {
+		return nil, err
+	}
+	return sig, nil
 }
 
-func SLHDSAVerify(pub, msg, sig []byte) bool {
-	key := slhdsa.PublicKey{ID: slhDSAParam}
+func MLDSAVerify(pub, msg, sig []byte) bool {
+	if len(pub) == 0 || len(sig) == 0 {
+		return false
+	}
+	initMLDSAVerifyPool()
+	req := mldsaVerifyReq{
+		pub:  append([]byte(nil), pub...),
+		msg:  append([]byte(nil), msg...),
+		sig:  append([]byte(nil), sig...),
+		resp: make(chan bool, 1),
+	}
+	mldsaVerifyQ <- req
+	return <-req.resp
+}
+
+func verifyMLDSADirect(pub, msg, sig []byte) bool {
+	key := mldsa65.PublicKey{}
 	if err := key.UnmarshalBinary(pub); err != nil {
 		return false
 	}
-	return slhdsa.Verify(&key, slhdsa.NewMessage(msg), sig, nil)
+	return mldsa65.Verify(&key, msg, nil, sig)
+}
+
+func initMLDSASignPool() {
+	mldsaSignOnce.Do(func() {
+		workers := envPositiveIntCompat("WEB4_MLDSA_SIGN_WORKERS", "WEB4_SLH_SIGN_WORKERS", runtime.GOMAXPROCS(0))
+		if workers < 1 {
+			workers = 1
+		}
+		qsize := envPositiveIntCompat("WEB4_MLDSA_SIGN_QUEUE", "WEB4_SLH_SIGN_QUEUE", workers*8)
+		if qsize < workers {
+			qsize = workers
+		}
+		mldsaSignQ = make(chan mldsaSignReq, qsize)
+		for i := 0; i < workers; i++ {
+			go func() {
+				for req := range mldsaSignQ {
+					sig, err := signMLDSADirect(req.priv, req.msg)
+					req.resp <- mldsaSignResp{sig: sig, err: err}
+				}
+			}()
+		}
+	})
+}
+
+func initMLDSAVerifyPool() {
+	mldsaVerifyOnce.Do(func() {
+		workers := envPositiveIntCompat("WEB4_MLDSA_VERIFY_WORKERS", "WEB4_SLH_VERIFY_WORKERS", runtime.GOMAXPROCS(0)*2)
+		if workers < 1 {
+			workers = 1
+		}
+		qsize := envPositiveIntCompat("WEB4_MLDSA_VERIFY_QUEUE", "WEB4_SLH_VERIFY_QUEUE", workers*8)
+		if qsize < workers {
+			qsize = workers
+		}
+		mldsaVerifyQ = make(chan mldsaVerifyReq, qsize)
+		for i := 0; i < workers; i++ {
+			go func() {
+				for req := range mldsaVerifyQ {
+					req.resp <- verifyMLDSADirect(req.pub, req.msg, req.sig)
+				}
+			}()
+		}
+	})
+}
+
+func envPositiveInt(name string, def int) int {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return v
+}
+
+func envPositiveIntCompat(primary, fallback string, def int) int {
+	if v := envPositiveInt(primary, -1); v > 0 {
+		return v
+	}
+	return envPositiveInt(fallback, def)
 }
 
 func GenMLKEM768Keypair() ([]byte, []byte, error) {

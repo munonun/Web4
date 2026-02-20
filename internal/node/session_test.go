@@ -2,7 +2,9 @@ package node
 
 import (
 	"bytes"
+	"encoding/hex"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -373,6 +375,72 @@ func TestRecvSeqRejectsReplay(t *testing.T) {
 	}
 }
 
+func TestMLDSAKeypairPersistsAcrossHandshakes(t *testing.T) {
+	t.Setenv("WEB4_HANDSHAKE_DISABLE_SUITE0", "")
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	nodeA, err := NewNode(dirA, Options{})
+	if err != nil {
+		t.Fatalf("new node A failed: %v", err)
+	}
+	nodeB, err := NewNode(dirB, Options{})
+	if err != nil {
+		t.Fatalf("new node B failed: %v", err)
+	}
+	h1a, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 a failed: %v", err)
+	}
+	h1b, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 b failed: %v", err)
+	}
+	if h1a.SuiteID != int(SuiteHybridMLKEMMLDSA) || h1b.SuiteID != int(SuiteHybridMLKEMMLDSA) {
+		t.Fatalf("expected hybrid suite for ml-dsa path")
+	}
+	if h1a.PQPub == "" || h1b.PQPub == "" {
+		t.Fatalf("missing pq pub in hello messages")
+	}
+	if h1a.PQPub != h1b.PQPub {
+		t.Fatalf("expected persisted pq pub across handshakes")
+	}
+	if fi, err := os.Stat(filepath.Join(dirA, mldsaPubFile)); err != nil || fi.Size() == 0 {
+		t.Fatalf("missing persisted ml-dsa pub file: %v", err)
+	}
+	if fi, err := os.Stat(filepath.Join(dirA, mldsaPrivFile)); err != nil || fi.Size() == 0 {
+		t.Fatalf("missing persisted ml-dsa priv file: %v", err)
+	}
+}
+
+func TestHelloSignatureCacheUsesExactSignedBytes(t *testing.T) {
+	n, err := NewNode(t.TempDir(), Options{})
+	if err != nil {
+		t.Fatalf("new node failed: %v", err)
+	}
+	fromID := n.ID
+	toID := fromID
+	input := hello1SigInput(SuiteLegacyX25519RSA, fromID, toID, "127.0.0.1:1", []byte("ea"), []byte("na"), []byte("sid"))
+	sig1, err := n.signHelloBySuiteCached(SuiteLegacyX25519RSA, n.PrivKey, nil, input)
+	if err != nil {
+		t.Fatalf("sign 1 failed: %v", err)
+	}
+	sig2, err := n.signHelloBySuiteCached(SuiteLegacyX25519RSA, n.PrivKey, nil, input)
+	if err != nil {
+		t.Fatalf("sign 2 failed: %v", err)
+	}
+	if !bytes.Equal(sig1, sig2) {
+		t.Fatalf("expected cached signature for same exact bytes\nsig1=%s\nsig2=%s", hex.EncodeToString(sig1), hex.EncodeToString(sig2))
+	}
+	changed := hello1SigInput(SuiteLegacyX25519RSA, fromID, toID, "127.0.0.1:2", []byte("ea"), []byte("na"), []byte("sid"))
+	sig3, err := n.signHelloBySuiteCached(SuiteLegacyX25519RSA, n.PrivKey, nil, changed)
+	if err != nil {
+		t.Fatalf("sign 3 failed: %v", err)
+	}
+	if bytes.Equal(sig1, sig3) {
+		t.Fatalf("expected different signature for different exact signed bytes")
+	}
+}
+
 func findPeer(peers []peer.Peer, id [32]byte) (peer.Peer, bool) {
 	for _, p := range peers {
 		if p.NodeID == id {
@@ -380,4 +448,24 @@ func findPeer(peers []peer.Peer, id [32]byte) (peer.Peer, bool) {
 		}
 	}
 	return peer.Peer{}, false
+}
+
+func BenchmarkBuildHello1(b *testing.B) {
+	b.Setenv("WEB4_HANDSHAKE_DISABLE_SUITE0", "")
+	dirA := b.TempDir()
+	dirB := b.TempDir()
+	nodeA, err := NewNode(dirA, Options{})
+	if err != nil {
+		b.Fatalf("new node A failed: %v", err)
+	}
+	nodeB, err := NewNode(dirB, Options{})
+	if err != nil {
+		b.Fatalf("new node B failed: %v", err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := nodeA.BuildHello1(nodeB.ID); err != nil {
+			b.Fatalf("BuildHello1 failed: %v", err)
+		}
+	}
 }

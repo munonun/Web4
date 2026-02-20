@@ -12,6 +12,7 @@ import (
 )
 
 type Node struct {
+	Home       string
 	ID         [32]byte
 	PubKey     []byte
 	PrivKey    []byte
@@ -24,6 +25,10 @@ type Node struct {
 	Field      *state.Field
 	listenMu   sync.RWMutex
 	listenAddr string
+	pqMu       sync.Mutex
+	pqPub      []byte
+	pqPriv     []byte
+	sigCache   *helloSigCache
 }
 
 type Options struct {
@@ -124,6 +129,7 @@ func NewNode(home string, opts Options) (*Node, error) {
 	}
 	candidates := peer.NewCandidatePool(opts.CandidateCap, opts.CandidateTTL)
 	return &Node{
+		Home:       home,
 		ID:         id,
 		PubKey:     pub,
 		PrivKey:    priv,
@@ -134,6 +140,7 @@ func NewNode(home string, opts Options) (*Node, error) {
 		Candidates: candidates,
 		Sessions:   NewSessionStore(),
 		Field:      state.NewField(),
+		sigCache:   newHelloSigCache(),
 	}, nil
 }
 

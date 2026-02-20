@@ -38,6 +38,15 @@ Run P2P stress harness (separate from smoke):
 ./scripts/p2p_stress.sh
 ```
 
+Optional pprof (disabled by default):
+
+```bash
+WEB4_PPROF=1 WEB4_PPROF_ADDR=127.0.0.1:6060 web4-node run --devtls --addr 127.0.0.1:25050
+go tool pprof "http://127.0.0.1:6060/debug/pprof/profile?seconds=30"
+# heap:
+go tool pprof "http://127.0.0.1:6060/debug/pprof/heap"
+```
+
 If tests and smoke pass, behavior matches current design.
 
 ## CLI Basics

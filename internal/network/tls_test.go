@@ -42,7 +42,28 @@ func TestClientTLSConfigUsesExplicitDevTLSCAPath(t *testing.T) {
 	}
 }
 
-func TestLoadDevTLSCertFromConfiguredPathsFailsWithoutKey(t *testing.T) {
+func TestLoadDevTLSCertFromConfiguredPathsNonStrictSkipsLegacyCertOnlyConfig(t *testing.T) {
+	_, der, err := devTLSCert()
+	if err != nil {
+		t.Fatalf("devTLSCert: %v", err)
+	}
+	tmp := t.TempDir()
+	certPath := filepath.Join(tmp, "ca_cert.pem")
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	if err := os.WriteFile(certPath, pemBytes, 0600); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	t.Setenv("WEB4_DEVTLS_CA_PATH", certPath)
+	cert, ok, err := loadDevTLSCertFromConfiguredPaths()
+	if err != nil {
+		t.Fatalf("expected non-strict cert-only config to be skipped, got err=%v", err)
+	}
+	if ok || len(cert.Certificate) != 0 {
+		t.Fatalf("expected non-strict cert-only config to be ignored, ok=%v", ok)
+	}
+}
+
+func TestLoadDevTLSCertFromConfiguredPathsStrictFailsWithoutKey(t *testing.T) {
 	_, der, err := devTLSCert()
 	if err != nil {
 		t.Fatalf("devTLSCert: %v", err)
@@ -55,8 +76,9 @@ func TestLoadDevTLSCertFromConfiguredPathsFailsWithoutKey(t *testing.T) {
 	}
 	t.Setenv("WEB4_DEVTLS_CA_CERT_PATH", certPath)
 	t.Setenv("WEB4_DEVTLS_CA_KEY_PATH", "")
+	t.Setenv("WEB4_DEVTLS_STRICT_CA", "1")
 	if _, ok, err := loadDevTLSCertFromConfiguredPaths(); err == nil || ok {
-		t.Fatalf("expected configured cert without key to fail, ok=%v err=%v", ok, err)
+		t.Fatalf("expected strict cert-only config to fail, ok=%v err=%v", ok, err)
 	}
 }
 

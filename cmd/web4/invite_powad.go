@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -49,6 +50,9 @@ func resetInvitePoWaDState() {
 }
 
 func inviteChallengeTTL() time.Duration {
+	if v, ok := envInt("WEB4_POWAD_TTL_SEC"); ok && v > 0 {
+		return time.Duration(v) * time.Second
+	}
 	if v, ok := envInt("WEB4_POWAD_CHALLENGE_TTL_SEC"); ok && v > 0 {
 		return time.Duration(v) * time.Second
 	}
@@ -113,23 +117,35 @@ func (s *invitePoWaDState) clearBackoff(key string) {
 
 func (s *invitePoWaDState) putChallenge(c pendingPoWaDChallenge) {
 	s.mu.Lock()
-	s.challenges[hex.EncodeToString(c.InviteID)] = c
+	key := hex.EncodeToString(c.InviteID)
+	s.challenges[key] = c
 	s.mu.Unlock()
+	if os.Getenv("WEB4_DEBUG") == "1" {
+		fmt.Fprintf(os.Stderr, "powad challenge stored key=%s now=%d expiry=%d\n", key, time.Now().Unix(), c.ExpiresAt)
+	}
 }
 
-func (s *invitePoWaDState) getChallenge(inviteID []byte, now time.Time) (pendingPoWaDChallenge, bool) {
+type inviteChallengeLookup int
+
+const (
+	inviteChallengeFound inviteChallengeLookup = iota
+	inviteChallengeMissing
+	inviteChallengeExpired
+)
+
+func (s *invitePoWaDState) getChallenge(inviteID []byte, now time.Time) (pendingPoWaDChallenge, inviteChallengeLookup) {
 	key := hex.EncodeToString(inviteID)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c, ok := s.challenges[key]
 	if !ok {
-		return pendingPoWaDChallenge{}, false
+		return pendingPoWaDChallenge{}, inviteChallengeMissing
 	}
 	if c.ExpiresAt < uint64(now.Unix()) {
 		delete(s.challenges, key)
-		return pendingPoWaDChallenge{}, false
+		return pendingPoWaDChallenge{}, inviteChallengeExpired
 	}
-	return c, true
+	return c, inviteChallengeFound
 }
 
 func (s *invitePoWaDState) deleteChallenge(inviteID []byte) {
@@ -296,10 +312,20 @@ func handlePoWaDSolution(self *node.Node, data []byte) ([]byte, error) {
 	if !invitePoWaD.allowBackoff(key, now) {
 		return nil, fmt.Errorf("backoff active")
 	}
-	chal, ok := invitePoWaD.getChallenge(inviteID, now)
-	if !ok {
+	chal, lookup := invitePoWaD.getChallenge(inviteID, now)
+	if lookup != inviteChallengeFound {
 		invitePoWaD.failBackoff(key, now)
-		return nil, fmt.Errorf("challenge missing or expired")
+		switch lookup {
+		case inviteChallengeExpired:
+			return nil, fmt.Errorf("challenge expired")
+		default:
+			return nil, fmt.Errorf("challenge missing")
+		}
+	}
+	expectedInviteID := deriveInviteID(fromID, toID, msg.Scope, msg.ChallengeNonce, msg.ExpiresAt)
+	if !bytes.Equal(expectedInviteID, inviteID) {
+		invitePoWaD.failBackoff(key, now)
+		return nil, fmt.Errorf("challenge key mismatch expected=%s got=%s", hex.EncodeToString(expectedInviteID), hex.EncodeToString(inviteID))
 	}
 	if chal.FromID != fromID || chal.ToID != toID || chal.Scope != msg.Scope ||
 		chal.ChallengeNonce != msg.ChallengeNonce || chal.ExpiresAt != msg.ExpiresAt ||

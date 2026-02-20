@@ -32,6 +32,7 @@ import (
 	"web4mvp/internal/network"
 	"web4mvp/internal/node"
 	"web4mvp/internal/peer"
+	"web4mvp/internal/pprofutil"
 	"web4mvp/internal/proto"
 	"web4mvp/internal/state"
 	"web4mvp/internal/store"
@@ -387,7 +388,7 @@ func verifyHelloBySuite(suiteID byte, rsaPub, pqPub, input, sig []byte) bool {
 		if len(pqPub) == 0 || len(sig) < 64 {
 			return false
 		}
-		return crypto.SLHDSAVerify(pqPub, digest, sig)
+		return crypto.MLDSAVerify(pqPub, digest, sig)
 	}
 	return crypto.VerifyDigest(rsaPub, digest, sig)
 }
@@ -2594,6 +2595,36 @@ func normalizeListenAddr(addr string) string {
 	return addr
 }
 
+func handshakeSuiteDefault() int {
+	raw := strings.TrimSpace(os.Getenv("WEB4_HANDSHAKE_SUITE"))
+	if raw == "" {
+		return int(node.SuiteHybridMLKEMMLDSA)
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return int(node.SuiteHybridMLKEMMLDSA)
+	}
+	return v
+}
+
+func applyHandshakeSuiteSelection(v int) (func(), error) {
+	if v < 0 || v > 255 {
+		return nil, fmt.Errorf("suite must be 0..255")
+	}
+	prev, hadPrev := os.LookupEnv("WEB4_HANDSHAKE_SUITE")
+	if err := os.Setenv("WEB4_HANDSHAKE_SUITE", strconv.Itoa(v)); err != nil {
+		return nil, err
+	}
+	restore := func() {
+		if hadPrev {
+			_ = os.Setenv("WEB4_HANDSHAKE_SUITE", prev)
+			return
+		}
+		_ = os.Unsetenv("WEB4_HANDSHAKE_SUITE")
+	}
+	return restore, nil
+}
+
 func advertisedListenAddr(listenAddr, legacyFromAddr string) string {
 	_ = legacyFromAddr
 	return normalizeListenAddr(listenAddr)
@@ -2970,6 +3001,9 @@ func ensureSignedOutgoing(data []byte, self *node.Node) ([]byte, error) {
 	return data, nil
 }
 func main() {
+	if err := pprofutil.StartFromEnv(os.Stderr); err != nil {
+		die("pprof startup failed", err)
+	}
 	if len(os.Args) < 2 {
 		fmt.Println("usage: web4 <keygen|open|list|close|ack|recv|devtls-ca-gen|quic-listen|quic-send|quic-send-secure|node|gossip>")
 		os.Exit(1)
@@ -3808,6 +3842,7 @@ func main() {
 			outPath := fs.String("out", "", "write Hello1Msg to file and exit")
 			toIDHex := fs.String("to-id", "", "target node id (hex)")
 			advertiseAddr := fs.String("advertise-addr", "", "advertise addr (host:port)")
+			suite := fs.Int("suite", handshakeSuiteDefault(), "handshake suite id (default: WEB4_HANDSHAKE_SUITE or 0)")
 			devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
 			devTLSCA := fs.String("devtls-ca", "", "dev TLS CA PEM path")
 			_ = fs.Parse(os.Args[3:])
@@ -3835,6 +3870,14 @@ func main() {
 			if err != nil {
 				fail("load node failed", err)
 			}
+			restoreSuite, err := applyHandshakeSuiteSelection(*suite)
+			if err != nil {
+				fail("invalid --suite", err)
+			}
+			defer restoreSuite()
+			if *advertiseAddr != "" {
+				self.SetListenAddr(*advertiseAddr)
+			}
 			var toID [32]byte
 			if *toIDHex != "" {
 				toBytes, err := hex.DecodeString(*toIDHex)
@@ -3857,7 +3900,6 @@ func main() {
 				if err != nil {
 					fail("build hello1 failed", err)
 				}
-				msg.FromAddr = *advertiseAddr
 				data, err := proto.EncodeHello1Msg(msg)
 				if err != nil {
 					fail("encode hello1 failed", err)
@@ -3876,7 +3918,6 @@ func main() {
 				if err != nil {
 					fail("build hello1 failed", err)
 				}
-				msg.FromAddr = *advertiseAddr
 				data, err := proto.EncodeHello1Msg(msg)
 				if err != nil {
 					fail("encode hello1 failed", err)
@@ -3905,6 +3946,7 @@ func main() {
 			addr := fs.String("addr", "", "target addr (host:port)")
 			k := fs.Int("k", defaultPeerExchangeK, "max peers to request")
 			toIDHex := fs.String("to-id", "", "target node id (hex)")
+			suite := fs.Int("suite", handshakeSuiteDefault(), "handshake suite id (default: WEB4_HANDSHAKE_SUITE or 0)")
 			devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
 			devTLSCA := fs.String("devtls-ca", "", "dev TLS CA PEM path")
 			_ = fs.Parse(os.Args[3:])
@@ -3932,6 +3974,11 @@ func main() {
 			if err != nil {
 				fail("load node failed", err)
 			}
+			restoreSuite, err := applyHandshakeSuiteSelection(*suite)
+			if err != nil {
+				fail("invalid --suite", err)
+			}
+			defer restoreSuite()
 			var p peer.Peer
 			if *toIDHex != "" {
 				toBytes, err := hex.DecodeString(*toIDHex)

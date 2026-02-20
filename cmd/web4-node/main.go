@@ -28,11 +28,16 @@ import (
 	"web4mvp/internal/network"
 	"web4mvp/internal/node"
 	"web4mvp/internal/peer"
+	"web4mvp/internal/pprofutil"
 	"web4mvp/internal/proto"
 	"web4mvp/internal/wallet"
 )
 
 func main() {
+	if err := pprofutil.StartFromEnv(os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "pprof startup failed: %v\n", err)
+		os.Exit(1)
+	}
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
 }
 
@@ -80,7 +85,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  members")
 	fmt.Fprintln(w, "  delta recent [--n 20]")
 	fmt.Fprintln(w, "  field show")
-	fmt.Fprintln(w, "  pay --to <nodeid> --amount <v> [--scope <s>] [--send] [--devtls] [--devtls-ca <path>]")
+	fmt.Fprintln(w, "  pay --to <nodeid> --amount <v> [--addr <host:port>] [--scope <s>] [--send] [--devtls] [--devtls-ca <path>]")
 	fmt.Fprintln(w, "  wallet show")
 	fmt.Fprintln(w, "  wallet list")
 	fmt.Fprintln(w, "  wallet new --force")
@@ -663,6 +668,35 @@ func sendDeltaBToPeers(self *node.Node, toID [32]byte, toAddr string, payload []
 	if self == nil || self.Peers == nil {
 		return fmt.Errorf("peer store unavailable")
 	}
+	devTLSCAPath := devTLSCA
+	if devTLSCAPath == "" {
+		devTLSCAPath = filepath.Join(homeDir(), "devtls_ca.pem")
+	}
+	// Fast path for wallet pay: when caller already resolved recipient id+addr,
+	// send directly to that endpoint to avoid stale peer-table selection.
+	if toAddr != "" && !isZeroNodeID(toID) {
+		if !self.Sessions.Has(toID) {
+			if err := handshakeWithPeer(context.Background(), self, toID, toAddr, devTLS, devTLSCAPath); err != nil {
+				return err
+			}
+		}
+		out, err := daemon.SealSecureEnvelope(self, toID, proto.MsgTypeDeltaB, "", payload)
+		if err != nil {
+			return err
+		}
+		// Force a one-shot client connection for pay send path.
+		prevDisablePool, hadDisablePool := os.LookupEnv("WEB4_DISABLE_CLIENT_POOL")
+		_ = os.Setenv("WEB4_DISABLE_CLIENT_POOL", "1")
+		defer func() {
+			if hadDisablePool {
+				_ = os.Setenv("WEB4_DISABLE_CLIENT_POOL", prevDisablePool)
+			} else {
+				_ = os.Unsetenv("WEB4_DISABLE_CLIENT_POOL")
+			}
+		}()
+		return network.Send(toAddr, out, false, devTLS, devTLSCAPath)
+	}
+
 	_ = self.Peers.Refresh()
 	peers := self.Peers.List()
 	var targets []peer.Peer
@@ -685,10 +719,6 @@ func sendDeltaBToPeers(self *node.Node, toID [32]byte, toAddr string, payload []
 	}
 	if len(targets) == 0 {
 		return fmt.Errorf("no peers to send")
-	}
-	devTLSCAPath := devTLSCA
-	if devTLSCAPath == "" {
-		devTLSCAPath = filepath.Join(homeDir(), "devtls_ca.pem")
 	}
 	for _, p := range targets {
 		if p.Addr == "" {
@@ -802,6 +832,7 @@ func runPay(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("pay", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	to := fs.String("to", "", "recipient node id hex")
+	toAddrFlag := fs.String("addr", "", "recipient listen addr (host:port)")
 	amount := fs.Int64("amount", 0, "amount to transfer")
 	scope := fs.String("scope", "", "optional scope hint (unused in v0)")
 	send := fs.Bool("send", false, "gossip delta to peers")
@@ -828,9 +859,11 @@ func runPay(args []string, stdout, stderr io.Writer) int {
 		color.New(color.FgRed).Fprintf(stderr, "pay: %v\n", err)
 		return 1
 	}
-	toAddr := ""
-	if p, ok := findPeerByNodeID(self.Peers.List(), toID); ok {
-		toAddr = p.Addr
+	toAddr := strings.TrimSpace(*toAddrFlag)
+	if toAddr == "" {
+		if p, ok := findPeerByNodeID(self.Peers.List(), toID); ok {
+			toAddr = p.Addr
+		}
 	}
 	color.New(color.FgHiBlack).Fprintf(stdout, "Sender: %s\n", hex.EncodeToString(self.ID[:]))
 	claim, _, canonBytes, _, _, _, err := preparePayDelta(self, toID, *amount)
@@ -861,10 +894,12 @@ func runPay(args []string, stdout, stderr io.Writer) int {
 			color.New(color.FgRed).Fprintf(stderr, "pay: send failed: %v\n", err)
 			return 1
 		}
-		if err := sendPeerExchangeToPeers(self, toID, toAddr, *devTLS, *devTLSCA); err != nil && os.Getenv("WEB4_DEBUG") == "1" {
-			color.New(color.FgYellow).Fprintf(stderr, "pay: peer exchange skipped: %v\n", err)
+		if os.Getenv("WEB4_PAY_DISABLE_PEX") != "1" {
+			if err := sendPeerExchangeToPeers(self, toID, toAddr, *devTLS, *devTLSCA); err != nil && os.Getenv("WEB4_DEBUG") == "1" {
+				color.New(color.FgYellow).Fprintf(stderr, "pay: peer exchange skipped: %v\n", err)
+			}
 		}
-		color.New(color.FgGreen).Fprintln(stdout, "OK delta_b sent (local observation)")
+		color.New(color.FgGreen).Fprintf(stdout, "OK delta_b sent over network addr=%s\n", toAddr)
 	}
 	return 0
 }
@@ -1014,7 +1049,7 @@ func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool) 
 			fmt.Fprintln(w, "  delta recent [--n N]")
 			fmt.Fprintln(w, "  field show")
 			fmt.Fprintln(w, "  wallet show|list|new --force|export --out <file>|import --in <file> [--force]")
-			fmt.Fprintln(w, "  pay --to <nodeid> --amount <n> [--send]")
+			fmt.Fprintln(w, "  pay --to <nodeid> --amount <n> [--addr <host:port>] [--send]")
 			fmt.Fprintln(w, "  quit | exit")
 		},
 		status: func() {

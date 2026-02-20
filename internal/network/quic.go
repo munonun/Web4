@@ -62,6 +62,16 @@ func resolveDevTLSPaths() devTLSPaths {
 	return p
 }
 
+func devTLSStrictCA() bool {
+	return strings.TrimSpace(os.Getenv("WEB4_DEVTLS_STRICT_CA")) == "1"
+}
+
+func devTLSHasExplicitSharedCAEnv() bool {
+	return strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_CERT_PATH")) != "" ||
+		strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_KEY_PATH")) != "" ||
+		strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_BUNDLE_PATH")) != ""
+}
+
 func devTLSCert() (tls.Certificate, []byte, error) {
 	return devTLSCertWithIPs(devTLSCertIPs())
 }
@@ -820,6 +830,12 @@ func loadDevTLSCertPoolFromPath(path string) (*x509.CertPool, error) {
 func loadDevTLSCertFromConfiguredPaths() (tls.Certificate, bool, error) {
 	paths := resolveDevTLSPaths()
 	if paths.certPath == "" && paths.keyPath == "" && paths.bundlePath == "" {
+		return tls.Certificate{}, false, nil
+	}
+	// Backward-compatible behavior:
+	// - Legacy cert-only path (WEB4_DEVTLS_CA_PATH) should not force key-pair mode.
+	// - Enforce cert+key only in explicit shared-CA mode or strict mode.
+	if !devTLSStrictCA() && !devTLSHasExplicitSharedCAEnv() {
 		return tls.Certificate{}, false, nil
 	}
 	certPath := paths.certPath

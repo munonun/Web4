@@ -1929,6 +1929,7 @@ func TestInviteRequestWithoutPoWaDSolutionIssuesNoCert(t *testing.T) {
 
 func TestInviteRequestValidPoWaDSolutionIssuesCertAndUpgradesMembership(t *testing.T) {
 	resetInvitePoWaDState()
+	t.Setenv("WEB4_POWAD_TTL_SEC", "600")
 	origNodeLimiter := recvNodeLimiter
 	recvNodeLimiter = newRateLimiter(1000, time.Second)
 	defer func() { recvNodeLimiter = origNodeLimiter }()
@@ -2241,6 +2242,53 @@ func TestQuicNodeHello(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("expected sender session")
+}
+
+func TestNodeHelloOutSuiteSelection(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	selfB, err := node.NewNode(filepath.Join(homeB, ".web4mvp"), node.Options{})
+	if err != nil {
+		t.Fatalf("load node B failed: %v", err)
+	}
+	toID := hex.EncodeToString(selfB.ID[:])
+
+	outDefault := filepath.Join(t.TempDir(), "hello_default.json")
+	if err := runWithHome(homeA, "node", "hello", "--out", outDefault, "--to-id", toID); err != nil {
+		t.Fatalf("node hello --out default failed: %v", err)
+	}
+	rawDefault, err := os.ReadFile(outDefault)
+	if err != nil {
+		t.Fatalf("read hello1 default failed: %v", err)
+	}
+	msgDefault, err := proto.DecodeHello1Msg(rawDefault)
+	if err != nil {
+		t.Fatalf("decode hello1 default failed: %v", err)
+	}
+	if msgDefault.SuiteID != int(node.SuiteHybridMLKEMMLDSA) {
+		t.Fatalf("expected default suite %d, got %d", node.SuiteHybridMLKEMMLDSA, msgDefault.SuiteID)
+	}
+
+	t.Setenv("WEB4_HANDSHAKE_SUITE", "1")
+	outLegacy := filepath.Join(t.TempDir(), "hello_legacy.json")
+	if err := runWithHome(homeA, "node", "hello", "--out", outLegacy, "--to-id", toID); err != nil {
+		t.Fatalf("node hello --out suite=1 failed: %v", err)
+	}
+	rawLegacy, err := os.ReadFile(outLegacy)
+	if err != nil {
+		t.Fatalf("read hello1 suite=1 failed: %v", err)
+	}
+	msgLegacy, err := proto.DecodeHello1Msg(rawLegacy)
+	if err != nil {
+		t.Fatalf("decode hello1 suite=1 failed: %v", err)
+	}
+	if msgLegacy.SuiteID != int(node.SuiteLegacyX25519RSA) {
+		t.Fatalf("expected suite %d, got %d", node.SuiteLegacyX25519RSA, msgLegacy.SuiteID)
+	}
 }
 
 func TestNodeExchange(t *testing.T) {

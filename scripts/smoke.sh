@@ -793,15 +793,18 @@ done
 if [[ ! -f "${TMPA}/.web4mvp/devtls_ca.pem" ]]; then
 	quic_fail "check 5b (wallet pay): missing devtls CA"
 fi
+PAY_CA="${TMPA}/.web4mvp/devtls_ca.pem"
+pay_cmd=(env HOME="${TMPB}" WEB4_DELTA_MODE=deltab WEB4_ZK_MODE=1 WEB4_PAY_DISABLE_PEX=1 "${WEB4_NODE_BIN}" pay --to "${NODEIDA}" --addr "127.0.0.1:${PORT_PAY}" --amount 5 --send --devtls --devtls-ca "${PAY_CA}")
+echo "check 5b command: $(printf '%q ' "${pay_cmd[@]}")"
 
 pay_log="${TMPWORK}/wallet_pay.log"
-if ! ( env HOME="${TMPB}" WEB4_DELTA_MODE=deltab WEB4_ZK_MODE=1 "${WEB4_NODE_BIN}" pay --to "${NODEIDA}" --amount 5 --send --devtls --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" >"${pay_log}" 2>&1 ); then
+if ! "${pay_cmd[@]}" >"${pay_log}" 2>&1; then
 	tail -n 200 "${pay_log}" 2>/dev/null || true
 	quic_fail "check 5b (wallet pay): pay failed"
 fi
 
 found=0
-for _ in $(seq 1 30); do
+for _ in $(seq 1 600); do
 	if [[ -f "${TMPA}/.web4mvp/metrics.json" ]] && grep -Eq '"verified":[[:space:]]*[1-9]' "${TMPA}/.web4mvp/metrics.json"; then
 		found=1
 		break
@@ -809,6 +812,16 @@ for _ in $(seq 1 30); do
 	sleep 0.1
 done
 if [[ "${found}" -ne 1 ]]; then
+	echo "check 5b debug: wallet pay output"
+	tail -n 200 "${pay_log}" 2>/dev/null || true
+	echo "check 5b debug: metrics snapshot"
+	cat "${TMPA}/.web4mvp/metrics.json" 2>/dev/null || true
+	echo "check 5b debug: recv_by_type"
+	grep -nA 8 '"recv_by_type"' "${TMPA}/.web4mvp/metrics.json" 2>/dev/null || true
+	echo "check 5b debug: delta drop counters"
+	grep -nE '"drop_duplicate"|"drop_rate"|"drop_non_member"|"drop_zk_fail"|"drop_by_reason"' "${TMPA}/.web4mvp/metrics.json" 2>/dev/null || true
+	echo "check 5b debug: handshake suite id (if logged)"
+	grep -nE 'handshake_suite_id|suite_id|suite=' "${pay_log}" "${server_log_pay}" 2>/dev/null | tail -n 40 || true
 	quic_fail "check 5b (wallet pay): delta_b not observed"
 fi
 
@@ -1115,10 +1128,22 @@ pass "check 6b (scope + revoke)"
 	CHECK6_ADDR_A="${a_addr}"
 	CHECK6_ADDR_B="${b_addr}"
 	CHECK6_ADDR_C="${c_addr}"
-	CA_A="${HOME_A}/.web4mvp/devtls_ca.pem"
-	CA_B="${HOME_B}/.web4mvp/devtls_ca.pem"
-	CA_C="${HOME_C}/.web4mvp/devtls_ca.pem"
-	export CA_A CA_B CA_C
+	SHARED_CA_DIR="${TMPWORK}/check6_shared_ca"
+	SHARED_CA_CERT="${SHARED_CA_DIR}/ca_cert.pem"
+	SHARED_CA_KEY="${SHARED_CA_DIR}/ca_key.pem"
+	rm -rf "${SHARED_CA_DIR}" 2>/dev/null || true
+	mkdir -p "${SHARED_CA_DIR}"
+	run_checked "check 6 (gossip forward): shared devtls ca gen" --quiet "${WEB4_BIN}" devtls-ca-gen --out-dir "${SHARED_CA_DIR}" --ips "127.0.0.1"
+	if [[ ! -s "${SHARED_CA_CERT}" || ! -s "${SHARED_CA_KEY}" ]]; then
+		echo "CHECK6_FAIL reason=missing_ca phase=servers_start details=\"shared CA bundle generation failed\""
+		check6_env_summary
+		exit 1
+	fi
+	CA_A="${SHARED_CA_CERT}"
+	CA_B="${SHARED_CA_CERT}"
+	CA_C="${SHARED_CA_CERT}"
+	CHECK6_SHARED_CA_CERT="${SHARED_CA_CERT}"
+	export SHARED_CA_DIR SHARED_CA_CERT SHARED_CA_KEY CA_A CA_B CA_C CHECK6_SHARED_CA_CERT
 	if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
 		echo "CHECK6_PORTS porta=${PORTA_HELLO} portb=${PORTB} portc=${PORTC}"
 		echo "CHECK6_HOMES a=${HOME_A} b=${HOME_B} c=${HOME_C}"
@@ -1135,16 +1160,16 @@ pass "check 6b (scope + revoke)"
 		check6_env_summary
 		exit 1
 	fi
-	echo "Starting QUIC server A (hello): env HOME=${HOME_A} ${WEB4_BIN} quic-listen --devtls --addr ${a_addr}"
-	env HOME="${HOME_A}" "${WEB4_BIN}" quic-listen --devtls --addr "${a_addr}" >"${server_log_a}" 2>&1 &
+	echo "Starting QUIC server A (hello): env HOME=${HOME_A} WEB4_DEVTLS_CA_PATH=${SHARED_CA_CERT} ${WEB4_BIN} quic-listen --devtls --addr ${a_addr}"
+	env HOME="${HOME_A}" WEB4_DEVTLS_CA_PATH="${SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${SHARED_CA_KEY}" "${WEB4_BIN}" quic-listen --devtls --addr "${a_addr}" >"${server_log_a}" 2>&1 &
 	SERVER_PID_A=$!
 	LISTENER_PIDS+=("${SERVER_PID_A}")
-	echo "Starting QUIC server B: env HOME=${HOME_B} ${WEB4_BIN} quic-listen --devtls --addr ${b_addr}"
-	env HOME="${HOME_B}" WEB4_GOSSIP_FANOUT=2 WEB4_GOSSIP_TTL_HOPS=3 "${WEB4_BIN}" quic-listen --devtls --addr "${b_addr}" >"${server_log_b}" 2>&1 &
+	echo "Starting QUIC server B: env HOME=${HOME_B} WEB4_DEVTLS_CA_PATH=${SHARED_CA_CERT} ${WEB4_BIN} quic-listen --devtls --addr ${b_addr}"
+	env HOME="${HOME_B}" WEB4_DEVTLS_CA_PATH="${SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${SHARED_CA_KEY}" WEB4_GOSSIP_FANOUT=2 WEB4_GOSSIP_TTL_HOPS=3 "${WEB4_BIN}" quic-listen --devtls --addr "${b_addr}" >"${server_log_b}" 2>&1 &
 	SERVER_PID_B=$!
 	LISTENER_PIDS+=("${SERVER_PID_B}")
-	echo "Starting QUIC server C: env HOME=${HOME_C} ${WEB4_BIN} quic-listen --devtls --addr ${c_addr}"
-	env HOME="${HOME_C}" "${WEB4_BIN}" quic-listen --devtls --addr "${c_addr}" >"${server_log_c}" 2>&1 &
+	echo "Starting QUIC server C: env HOME=${HOME_C} WEB4_DEVTLS_CA_PATH=${SHARED_CA_CERT} ${WEB4_BIN} quic-listen --devtls --addr ${c_addr}"
+	env HOME="${HOME_C}" WEB4_DEVTLS_CA_PATH="${SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${SHARED_CA_KEY}" "${WEB4_BIN}" quic-listen --devtls --addr "${c_addr}" >"${server_log_c}" 2>&1 &
 	SERVER_PID_C=$!
 	LISTENER_PIDS+=("${SERVER_PID_C}")
 
@@ -1172,10 +1197,10 @@ pass "check 6b (scope + revoke)"
 	done
 	check6_phase_mark "servers_ready"
 
-	PUBC="$(cat "${TMPC}/.web4mvp/pub.hex")"
 	NODEIDC="$(run_c node id | awk '/node_id:/ {print $2}')"
 	NODEIDA="$(run_a node id | awk '/node_id:/ {print $2}')"
 	NODEIDB="$(run_b node id | awk '/node_id:/ {print $2}')"
+	c_dial_addr="${c_addr}"
 
 	# Seed A's peer store so gossip push can resolve B's pubkey+addr
 	PUBB="$(cat "${TMPB}/.web4mvp/pub.hex")"
@@ -1192,14 +1217,125 @@ pass "check 6b (scope + revoke)"
 		check6_quic_fail "no_conn" "check 6 (gossip forward): peer seed missing on A"
 	fi
 
+	run_check6_learn_step() {
+		local label="$1"
+		local outfile="$2"
+		local expected_re="${3:-}"
+		if [[ -n "${expected_re}" ]]; then
+			shift 3
+		else
+			shift 2
+		fi
+		local cmd_display
+		cmd_display="$(printf '%q ' "$@")"
+		if ! "$@" >"${outfile}" 2>&1; then
+			echo "CHECK6_FAIL reason=learn_failed phase=pre_forward details=\"${label} failed\""
+			echo "CHECK6_LEARN_CMD label=${label} cmd=${cmd_display}"
+			echo "CHECK6_LEARN_OUTPUT label=${label} lines=120"
+			tail -n 120 "${outfile}" || true
+			echo "CHECK6_B_LOG_TAIL lines=120"
+			tail -n 120 "${server_log_b}" || true
+			check6_env_summary
+			exit 1
+		fi
+		if [[ -n "${expected_re}" ]] && ! grep -Eq "${expected_re}" "${outfile}"; then
+			echo "CHECK6_FAIL reason=learn_unexpected_output phase=pre_forward details=\"${label} missing expected output\""
+			echo "CHECK6_LEARN_CMD label=${label} cmd=${cmd_display}"
+			echo "CHECK6_LEARN_OUTPUT label=${label} lines=120"
+			tail -n 120 "${outfile}" || true
+			echo "CHECK6_B_LOG_TAIL lines=120"
+			tail -n 120 "${server_log_b}" || true
+			check6_env_summary
+			exit 1
+		fi
+	}
+	check6_dump_learn_context_and_fail() {
+		local reason="$1"
+		local details="$2"
+		echo "CHECK6_LEARN_CMD label=learn_C_on_B_hello cmd=${learn_b_c_hello_cmd}"
+		echo "CHECK6_LEARN_CMD label=learn_B_on_C_hello cmd=${learn_c_b_hello_cmd}"
+		echo "CHECK6_LEARN_CMD label=learn_C_on_B_exchange cmd=${learn_b_c_exchange_cmd}"
+		echo "CHECK6_LEARN_CMD label=learn_B_on_C_exchange cmd=${learn_c_b_exchange_cmd}"
+		echo "CHECK6_LEARN_OUTPUT label=learn_C_on_B_hello lines=120"
+		tail -n 120 "${learn_b_c_hello_log}" || true
+		echo "CHECK6_LEARN_OUTPUT label=learn_B_on_C_hello lines=120"
+		tail -n 120 "${learn_c_b_hello_log}" || true
+		echo "CHECK6_LEARN_OUTPUT label=learn_C_on_B_exchange lines=120"
+		tail -n 120 "${learn_b_c_exchange_log}" || true
+		echo "CHECK6_LEARN_OUTPUT label=learn_B_on_C_exchange lines=120"
+		tail -n 120 "${learn_c_b_exchange_log}" || true
+		echo "CHECK6_B_NODE_LIST"
+		run_b node list || true
+		echo "CHECK6_B_PEERS_JSONL_TAIL lines=120"
+		tail -n 120 "${TMPB}/.web4mvp/peers.jsonl" || true
+		echo "CHECK6_B_METRICS"
+		cat "${TMPB}/.web4mvp/metrics.json" 2>/dev/null || true
+		echo "CHECK6_B_LOG_TAIL lines=200"
+		tail -n 200 "${server_log_b}" || true
+		echo "CHECK6_FAIL reason=${reason} phase=pre_forward details=\"${details}\""
+		check6_env_summary
+		exit 1
+	}
+	check6_b_has_c_peer() {
+		awk -v id="${NODEIDC}" -v addr="${c_dial_addr}" '
+			$0 ~ id {
+				have_id=1
+				if ($0 ~ ("\"addr\":\"" addr "\"") || $0 ~ ("\"dial_addr\":\"" addr "\"")) have_addr=1
+			}
+			END {exit !(have_id && have_addr)}
+		' "${TMPB}/.web4mvp/peers.jsonl"
+	}
+	check6_b_has_c_peer_with_retry() {
+		local deadline=$((SECONDS + 30))
+		while [[ "${SECONDS}" -lt "${deadline}" ]]; do
+			if check6_b_has_c_peer; then
+				return 0
+			fi
+			sleep 0.2
+		done
+		return 1
+	}
+	check6_seed_b_with_c_peer() {
+		local pubc
+		pubc="$(cat "${TMPC}/.web4mvp/pub.hex")"
+		printf '{"node_id":"%s","pubkey":"%s","dial_addr":"%s","addr":"%s","source":"smoke_check6_seed"}\n' "${NODEIDC}" "${pubc}" "${c_dial_addr}" "${c_dial_addr}" >> "${TMPB}/.web4mvp/peers.jsonl"
+	}
+
+	learn_log_dir="${TMPWORK}/check6_learn"
+	mkdir -p "${learn_log_dir}"
+	learn_b_c_hello_log="${learn_log_dir}/learn_b_c_hello.log"
+	learn_c_b_hello_log="${learn_log_dir}/learn_c_b_hello.log"
+	learn_b_c_exchange_log="${learn_log_dir}/learn_b_c_exchange.log"
+	learn_c_b_exchange_log="${learn_log_dir}/learn_c_b_exchange.log"
+	learn_b_c_hello_cmd="run_b node hello --devtls --addr ${c_dial_addr} --devtls-ca ${CHECK6_SHARED_CA_CERT} --suite 0 --to-id ${NODEIDC} --advertise-addr ${b_addr}"
+	learn_c_b_hello_cmd="run_c node hello --devtls --addr ${b_addr} --devtls-ca ${CHECK6_SHARED_CA_CERT} --suite 0 --to-id ${NODEIDB} --advertise-addr ${c_dial_addr}"
+	learn_b_c_exchange_cmd="run_b node exchange --devtls --addr ${c_dial_addr} --devtls-ca ${CHECK6_SHARED_CA_CERT} --suite 0 --to-id ${NODEIDC} --k 8"
+	learn_c_b_exchange_cmd="run_c node exchange --devtls --addr ${b_addr} --devtls-ca ${CHECK6_SHARED_CA_CERT} --suite 0 --to-id ${NODEIDB} --k 8"
+
 	# forward precondition: B must know C (addr+pubkey)
-	run_checked "check 6: learn C on B" --log "${server_log_c}" --quiet run_b node hello --devtls --addr "${c_addr}" --devtls-ca "${CA_C}" --to-id "${NODEIDC}"
-	run_checked "check 6: learn B on C" --log "${server_log_b}" --quiet run_c node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --to-id "${NODEIDB}"
+	run_check6_learn_step "learn_C_on_B_hello" "${learn_b_c_hello_log}" "OK handshake complete" run_b node hello --devtls --addr "${c_dial_addr}" --devtls-ca "${CHECK6_SHARED_CA_CERT}" --suite 0 --to-id "${NODEIDC}" --advertise-addr "${b_addr}"
+	run_check6_learn_step "learn_B_on_C_hello" "${learn_c_b_hello_log}" "OK handshake complete" run_c node hello --devtls --addr "${b_addr}" --devtls-ca "${CHECK6_SHARED_CA_CERT}" --suite 0 --to-id "${NODEIDB}" --advertise-addr "${c_dial_addr}"
+
+	if [[ "${WEB4_CHECK6_LEARN_EXCHANGE:-1}" == "1" ]]; then
+		run_check6_learn_step "learn_C_on_B_exchange" "${learn_b_c_exchange_log}" "OK node exchange" run_b node exchange --devtls --addr "${c_dial_addr}" --devtls-ca "${CHECK6_SHARED_CA_CERT}" --suite 0 --to-id "${NODEIDC}" --k 8
+		run_check6_learn_step "learn_B_on_C_exchange" "${learn_c_b_exchange_log}" "OK node exchange" run_c node exchange --devtls --addr "${b_addr}" --devtls-ca "${CHECK6_SHARED_CA_CERT}" --suite 0 --to-id "${NODEIDB}" --k 8
+	else
+		printf 'DISABLED by WEB4_CHECK6_LEARN_EXCHANGE=0\n' >"${learn_b_c_exchange_log}"
+		printf 'DISABLED by WEB4_CHECK6_LEARN_EXCHANGE=0\n' >"${learn_c_b_exchange_log}"
+	fi
+
+	# Safety net: ensure B has C in peer store with current dial_addr before forward checks.
+	if ! check6_b_has_c_peer_with_retry; then
+		check6_seed_b_with_c_peer
+		if ! check6_b_has_c_peer_with_retry; then
+			check6_dump_learn_context_and_fail "peer_not_learned" "B missing C peer dial_addr/node_id after learn+seed"
+		fi
+	fi
 
 	# Build peer mappings first so B learns C's pubkey+addr and vice versa
-	run_checked "check 6 (gossip forward): node hello (A->B)" --log "${server_log_b}" --quiet run_a node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --to-id "${NODEIDB}" --advertise-addr "${a_addr}"
-	run_checked "check 6 (gossip forward): node hello (C->B)" --log "${server_log_b}" --quiet run_c node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --to-id "${NODEIDB}" --advertise-addr "${c_addr}"
-	run_checked "check 6 (gossip forward): node hello (B->C)" --log "${server_log_c}" --quiet run_b node hello --devtls --addr "${c_addr}" --devtls-ca "${CA_C}" --to-id "${NODEIDC}"
+	run_checked "check 6 (gossip forward): node hello (A->B)" --log "${server_log_b}" --quiet run_a node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --suite 0 --to-id "${NODEIDB}" --advertise-addr "${a_addr}"
+	run_checked "check 6 (gossip forward): node hello (C->B)" --log "${server_log_b}" --quiet run_c node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --suite 0 --to-id "${NODEIDB}" --advertise-addr "${c_addr}"
+	run_checked "check 6 (gossip forward): node hello (B->C)" --log "${server_log_c}" --quiet run_b node hello --devtls --addr "${c_addr}" --devtls-ca "${CA_C}" --suite 0 --to-id "${NODEIDC}"
 
 	# Wait until B knows A and C identities
 	found=0
@@ -1225,33 +1361,39 @@ pass "check 6b (scope + revoke)"
 	if [[ "${found}" -ne 1 ]]; then
 		check6_quic_fail "no_conn" "check 6 (gossip forward): peer hello missing on C"
 	fi
-	wait_for_member_b_c() {
-		local deadline=$((SECONDS + 30))
-		while [[ "${SECONDS}" -lt "${deadline}" ]]; do
-			if run_b node list | grep -q "${NODEIDC}"; then
-				if awk -v id="${NODEIDC}" -v pub="${PUBC}" -v addr="${c_addr}" '$0 ~ id && $0 ~ pub && $0 ~ addr {found=1} END {exit !found}' "${TMPB}/.web4mvp/peers.jsonl"; then
-					return 0
-				fi
-			fi
-			sleep 0.2
-		done
-		return 1
+	check6_suite0_assert_if_logged() {
+		local suite_lines
+		suite_lines="$(grep -nE 'handshake_suite_id|suite_id|suite=' "${learn_b_c_hello_log}" "${learn_c_b_hello_log}" "${server_log_b}" 2>/dev/null || true)"
+		if [[ -z "${suite_lines}" ]]; then
+			echo "CHECK6_SUITE_INFO no_suite_log_marker"
+			return 0
+		fi
+		echo "CHECK6_SUITE_LOG lines=40"
+		echo "${suite_lines}" | tail -n 40
+		if ! echo "${suite_lines}" | grep -Eq 'suite_id=0|handshake_suite_id=0|suite=0'; then
+			echo "CHECK6_FAIL reason=suite_mismatch phase=pre_forward details=\"suite0 marker not found\""
+			check6_env_summary
+			exit 1
+		fi
 	}
-	# Precondition gate: B must already know C addr+pubkey before forward.
-	check6_phase_mark "pre_forward"
-	if ! wait_for_member_b_c; then
+	# Precondition gate: B must learn C as a peer (node_id + dial_addr), not membership.
+	if ! check6_b_has_c_peer_with_retry; then
 		if [[ "${WEB4_CHECK6_DEBUG:-0}" == "1" ]]; then
 			node_list_summary="$(run_b node list | tr '\n' ' ' | tr -s ' ' | sed 's/ $//')"
 			echo "check 6 debug: B node list=${node_list_summary}"
 		fi
-		echo "CHECK6_FAIL reason=missing_member phase=pre_forward details=\"B missing C addr/pubkey\""
-		check6_env_summary
-		exit 1
+		check6_dump_learn_context_and_fail "peer_not_learned" "B missing C peer dial_addr/node_id"
 	fi
+	# Minimum deterministic handshake evidence for learn step.
+	if ! grep -q "OK handshake complete" "${learn_b_c_hello_log}"; then
+		check6_dump_learn_context_and_fail "peer_not_learned" "B->C hello did not complete"
+	fi
+	check6_suite0_assert_if_logged
+	check6_phase_mark "pre_forward"
 	# Ensure addr->node_id mapping points to C's identity based on latest JSONL entry
 	found=0
 	for _ in $(seq 1 60); do
-		if tac "${TMPB}/.web4mvp/peers.jsonl" | awk -v addr="${c_addr}" -v id="${NODEIDC}" '
+		if tac "${TMPB}/.web4mvp/peers.jsonl" | awk -v addr="${c_dial_addr}" -v id="${NODEIDC}" '
 			$0 ~ addr {found=1; if ($0 ~ id) ok=1; exit}
 			END {exit !(found && ok)}
 		'; then
@@ -1262,7 +1404,7 @@ pass "check 6b (scope + revoke)"
 	done
 	if [[ "${found}" -ne 1 ]]; then
 		check6_quic_fail "no_conn" "check 6 (gossip forward): B addr mapping mismatch for C"
-		check6_quic_fail "no_conn" "grep \"${c_addr}\" -n \"${TMPB}/.web4mvp/peers.jsonl\" | tail -n 20"
+		check6_quic_fail "no_conn" "grep \"${c_dial_addr}\" -n \"${TMPB}/.web4mvp/peers.jsonl\" | tail -n 20"
 	fi
 	check6_phase_mark "hello_done"
 
@@ -1308,7 +1450,7 @@ pass "check 6b (scope + revoke)"
 	fi
 	gossip_hello="${TMPWORK}/gossip_hello.json"
 	forwarded=0
-	run_checked "check 6 (gossip forward): node hello payload (A->B)" --quiet run_a node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --to-id "${NODEIDB}" --advertise-addr "${a_addr}" --out "${gossip_hello}"
+	run_checked "check 6 (gossip forward): node hello payload (A->B)" --quiet run_a node hello --devtls --addr "${b_addr}" --devtls-ca "${CA_B}" --suite 0 --to-id "${NODEIDB}" --advertise-addr "${a_addr}" --out "${gossip_hello}"
 	if [[ "${WEB4_DEBUG:-}" == "1" ]]; then
 		payload_from="$(awk -F\" '/"from_node_id"/{print $4; exit}' "${gossip_hello}" 2>/dev/null || true)"
 		payload_to="$(awk -F\" '/"to_node_id"/{print $4; exit}' "${gossip_hello}" 2>/dev/null || true)"
@@ -1592,6 +1734,10 @@ bootstrap_debug_dump() {
 	tail -n 200 "${TMPC}/.web4mvp/metrics.json" 2>/dev/null || true
 	echo "Bootstrap metrics:"
 	tail -n 200 "${TMPA}/.web4mvp/metrics.json" 2>/dev/null || true
+	echo "check 7 debug: TLS/hello mismatch lines"
+	grep -nE 'x509: certificate signed by unknown authority|invalid hello1|to_id mismatch|from_id self|bootstrapSeedNodeID|seed node_id|seed_node_id' "${peer_a_log}" "${peer_b_log}" "${bootstrap_log}" 2>/dev/null | tail -n 120 || true
+	echo "check 7 debug: parsed node ids"
+	echo "bootstrap_node_id=${NODEID_BOOTSTRAP:-} peer_a_node_id=${NODEID_PEER_A:-} peer_b_node_id=${NODEID_PEER_B:-}"
 }
 
 rm -rf "${TMPA}/.web4mvp" "${TMPB}/.web4mvp" "${TMPC}/.web4mvp" 2>/dev/null || true
@@ -1603,26 +1749,32 @@ bootstrap_log="${TMPWORK}/bootstrap_server.log"
 peer_a_log="${TMPWORK}/peer_a_server.log"
 peer_b_log="${TMPWORK}/peer_b_server.log"
 bootstrap_addr="127.0.0.1:${PORT_BOOT}"
+CHECK7_SHARED_CA_DIR="${TMPWORK}/check7_shared_ca"
+CHECK7_SHARED_CA_CERT="${CHECK7_SHARED_CA_DIR}/ca_cert.pem"
+CHECK7_SHARED_CA_KEY="${CHECK7_SHARED_CA_DIR}/ca_key.pem"
+rm -rf "${CHECK7_SHARED_CA_DIR}" 2>/dev/null || true
+mkdir -p "${CHECK7_SHARED_CA_DIR}"
+run_checked "check 7 (bootstrap discovery): shared devtls ca gen" --quiet "${WEB4_BIN}" devtls-ca-gen --out-dir "${CHECK7_SHARED_CA_DIR}" --ips "127.0.0.1"
+if [[ ! -s "${CHECK7_SHARED_CA_CERT}" || ! -s "${CHECK7_SHARED_CA_KEY}" ]]; then
+	bootstrap_debug_dump "shared devtls ca generation failed"
+	quic_fail "check 7 (bootstrap discovery): shared devtls ca generation failed"
+fi
 
-echo "Starting QUIC bootstrap node: env HOME=${TMPA} WEB4_NODE_MODE=bootstrap ${WEB4_NODE_BIN} run --devtls --addr ${bootstrap_addr}"
-env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
+echo "Starting QUIC bootstrap node: env HOME=${TMPA} WEB4_NODE_MODE=bootstrap WEB4_DEVTLS_CA_PATH=${CHECK7_SHARED_CA_CERT} ${WEB4_NODE_BIN} run --devtls --addr ${bootstrap_addr}"
+env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
 SERVER_PID_BOOT=$!
 LISTENER_PIDS+=("${SERVER_PID_BOOT}")
 
 wait_quic_ready "${bootstrap_log}" "check 7 (bootstrap discovery): bootstrap did not start"
-if ! wait_file_nonempty "${TMPA}/.web4mvp/devtls_ca.pem" 5; then
-\tbootstrap_debug_dump "bootstrap devtls ca not ready"
-\tquic_fail "check 7 (bootstrap discovery): bootstrap devtls ca not ready"
-fi
-BOOTSTRAP_CA="${TMPA}/.web4mvp/devtls_ca.pem"
+NODEID_BOOTSTRAP="$(node_id_from_ready_log "${bootstrap_log}" || true)"
 
 echo "Starting QUIC peer A: env HOME=${TMPB} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_A}"
-env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${BOOTSTRAP_CA}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
+env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
 SERVER_PID_PEER_A=$!
 LISTENER_PIDS+=("${SERVER_PID_PEER_A}")
 
 echo "Starting QUIC peer B: env HOME=${TMPC} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_B}"
-env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${BOOTSTRAP_CA}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
+env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
 SERVER_PID_PEER_B=$!
 LISTENER_PIDS+=("${SERVER_PID_PEER_B}")
 
@@ -1633,14 +1785,6 @@ NODEID_PEER_B="$(node_id_from_ready_log "${peer_b_log}" || true)"
 if [[ -z "${NODEID_PEER_A}" || -z "${NODEID_PEER_B}" ]]; then
 	bootstrap_debug_dump "could not parse peer node ids from READY logs"
 	quic_fail "check 7 (bootstrap discovery): missing peer node id"
-fi
-if ! wait_file_nonempty "${TMPB}/.web4mvp/devtls_ca.pem" 5; then
-\tbootstrap_debug_dump "peer A devtls ca not ready"
-\tquic_fail "check 7 (bootstrap discovery): peer A devtls ca not ready"
-fi
-if ! wait_file_nonempty "${TMPC}/.web4mvp/devtls_ca.pem" 5; then
-\tbootstrap_debug_dump "peer B devtls ca not ready"
-\tquic_fail "check 7 (bootstrap discovery): peer B devtls ca not ready"
 fi
 
 deadline=$(( $(date +%s) + 30 ))

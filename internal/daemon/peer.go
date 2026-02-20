@@ -302,6 +302,9 @@ func waitDevTLSCA(ctx context.Context, root string, timeout time.Duration) error
 	explicitKeyPair := strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_CERT_PATH")) != "" ||
 		strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_KEY_PATH")) != "" ||
 		strings.TrimSpace(os.Getenv("WEB4_DEVTLS_CA_BUNDLE_PATH")) != ""
+	if strings.TrimSpace(os.Getenv("WEB4_DEVTLS_STRICT_CA")) == "1" {
+		explicitKeyPair = true
+	}
 	deadline := time.Now().Add(timeout)
 	for {
 		if fi, err := os.Stat(certPath); err == nil && fi.Size() > 0 {
@@ -3253,7 +3256,7 @@ func verifyHelloBySuite(suiteID byte, rsaPub, pqPub, input, sig []byte) bool {
 		if len(pqPub) == 0 || len(sig) < 64 {
 			return false
 		}
-		return crypto.SLHDSAVerify(pqPub, digest, sig)
+		return crypto.MLDSAVerify(pqPub, digest, sig)
 	}
 	return crypto.VerifyDigest(rsaPub, digest, sig)
 }

@@ -32,6 +32,9 @@ cd "${REPO_ROOT}"
 : "${P2P_STRESS_POISON_PEERS:=120}"
 : "${P2P_STRESS_TIMEOUT_SEC:=240}"
 : "${P2P_STRESS_SCENARIOS:=all}"
+: "${P2P_STRESS_PPROF:=0}"
+: "${P2P_STRESS_PPROF_ADDR:=127.0.0.1:6060}"
+: "${P2P_STRESS_KEEPALIVE:=0}"
 
 START_TS="$(date +%s)"
 
@@ -89,6 +92,7 @@ IPTABLES_PARTITION_APPLIED=0
 SHARED_CA_PATH=""
 SHARED_CA_CERT_PATH=""
 SHARED_CA_KEY_PATH=""
+KEEPALIVE_STOP=0
 
 cleanup_tc() {
   :
@@ -136,6 +140,29 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+keepalive_wait_if_enabled() {
+  if [[ "${P2P_STRESS_PPROF}" != "1" || "${P2P_STRESS_KEEPALIVE}" != "1" ]]; then
+    return 0
+  fi
+  if [[ -n "${NODE_NS[0]:-}" ]]; then
+    echo "KEEPALIVE: node[0] running in netns=${NODE_NS[0]}, press Enter to stop"
+    echo "KEEPALIVE: collect pprof with:"
+    echo "  sudo ip netns exec ${NODE_NS[0]} go tool pprof \"http://${P2P_STRESS_PPROF_ADDR}/debug/pprof/profile?seconds=30\""
+  else
+    echo "KEEPALIVE: node[0] running, press Enter to stop"
+  fi
+  KEEPALIVE_STOP=0
+  trap 'KEEPALIVE_STOP=1' INT TERM
+  if [[ -t 0 ]]; then
+    read -r || true
+    KEEPALIVE_STOP=1
+  fi
+  while (( KEEPALIVE_STOP == 0 )); do
+    sleep 1
+  done
+  trap cleanup EXIT
+}
 
 wipe_stale_partition_state() {
   if ! command -v ip >/dev/null 2>&1; then
@@ -817,6 +844,9 @@ start_node() {
   if [[ -n "${bootstrap_addr}" ]]; then
     envs+=("WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr}")
   fi
+  if [[ "${idx}" == "0" && "${P2P_STRESS_PPROF}" == "1" ]]; then
+    envs+=("WEB4_PPROF=1" "WEB4_PPROF_ADDR=${P2P_STRESS_PPROF_ADDR}")
+  fi
   if [[ -n "${netns}" ]]; then
     ip netns exec "${netns}" env "${envs[@]}" "${WEB4_NODE_BIN}" run --devtls --addr "${addr}" >"${log}" 2>&1 &
   else
@@ -837,6 +867,14 @@ start_node() {
   NODE_ID[$idx]="$(extract_node_id "${log}")"
   if [[ -z "${NODE_ID[$idx]}" ]]; then
     fail "node[$idx] missing node id"
+  fi
+  if [[ "${idx}" == "0" && "${P2P_STRESS_PPROF}" == "1" ]]; then
+    if [[ -n "${NODE_NS[$idx]:-}" ]]; then
+      echo "P2P_STRESS_PPROF: node[0] pprof=http://${P2P_STRESS_PPROF_ADDR}/debug/pprof/ (netns=${NODE_NS[$idx]})"
+      echo "P2P_STRESS_PPROF: use -> sudo ip netns exec ${NODE_NS[$idx]} go tool pprof \"http://${P2P_STRESS_PPROF_ADDR}/debug/pprof/profile?seconds=30\""
+    else
+      echo "P2P_STRESS_PPROF: node[0] pprof=http://${P2P_STRESS_PPROF_ADDR}/debug/pprof/"
+    fi
   fi
 }
 
@@ -1282,3 +1320,4 @@ if (( need_partition == 1 )); then
 fi
 
 echo "ALL P2P STRESS SCENARIOS COMPLETED"
+keepalive_wait_if_enabled

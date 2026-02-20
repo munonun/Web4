@@ -42,8 +42,10 @@ type PendingHandshake struct {
 }
 
 const (
-	SuiteHybridMLKEMSPHINCS byte = 0
-	SuiteLegacyX25519RSA    byte = 1
+	SuiteHybridMLKEMMLDSA byte = 0
+	SuiteLegacyX25519RSA  byte = 1
+	// Deprecated alias retained for backward compatibility.
+	SuiteHybridMLKEMSPHINCS = SuiteHybridMLKEMMLDSA
 )
 
 type SessionStore struct {
@@ -163,7 +165,7 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 			eph.Destroy()
 			return proto.Hello1Msg{}, err
 		}
-		pqPub, pqPriv, err = crypto.GenSLHDSAKeypair()
+		pqPub, pqPriv, err = n.loadOrCreateMLDSAKeypair()
 		if err != nil {
 			eph.Destroy()
 			return proto.Hello1Msg{}, err
@@ -181,7 +183,7 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 	h1TranscriptHash := crypto.SHA3_256(h1Bytes)
 	hello1SessionID := sessionIDForHandshake(suiteID, fromID, toID, ea, zero32(), h1TranscriptHash)
 	sigInput := hello1SigInput(suiteID, fromID, toID, listenAddr, ea, na, hello1SessionID)
-	sig, err := signHelloBySuite(suiteID, n.PrivKey, pqPriv, sigInput)
+	sig, err := n.signHelloBySuiteCached(suiteID, n.PrivKey, pqPriv, sigInput)
 	if err != nil {
 		eph.Destroy()
 		return proto.Hello1Msg{}, err
@@ -293,9 +295,8 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	if !verifyHelloBySuite(suiteID, fromPub, pqPub, sigInput, sig) {
 		return proto.Hello2Msg{}, errors.New("bad hello1 signature")
 	}
-	h1HashBytes := crypto.SHA3_256(h1BytesForReplay)
 	var h1Hash [32]byte
-	copy(h1Hash[:], h1HashBytes)
+	copy(h1Hash[:], h1TranscriptHash)
 	if n.Sessions.IsHello1Replay(fromID, h1Hash) {
 		return proto.Hello2Msg{}, errors.New("hello1 replay")
 	}
@@ -337,7 +338,7 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 			return proto.Hello2Msg{}, err
 		}
 	}
-	pqPubResp, pqPrivResp, err := maybeGenPQForSuite(suiteID)
+	pqPubResp, pqPrivResp, err := n.maybeGenPQForSuite(suiteID)
 	if err != nil {
 		eph.Destroy()
 		return proto.Hello2Msg{}, err
@@ -356,7 +357,7 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	transcript := crypto.SHA3_256(append(h1BytesForReplay, h2Bytes...))
 	sessionID := sessionIDForHandshake(suiteID, fromID, toID, ea, eb, transcript)
 	sigInput2 := hello2SigInput(suiteID, fromID, toID, respListenAddr, ea, eb, na, nb, sessionID)
-	sig2, err := signHelloBySuite(suiteID, n.PrivKey, pqPrivResp, sigInput2)
+	sig2, err := n.signHelloBySuiteCached(suiteID, n.PrivKey, pqPrivResp, sigInput2)
 	if err != nil {
 		eph.Destroy()
 		return proto.Hello2Msg{}, err
@@ -706,7 +707,22 @@ func supportsSuite(suites []byte, suite byte) bool {
 	return false
 }
 
+func preferredInitiatorSuite() (byte, bool) {
+	raw := strings.TrimSpace(os.Getenv("WEB4_HANDSHAKE_SUITE"))
+	if raw == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 0 || n > 255 {
+		return 0, false
+	}
+	return byte(n), true
+}
+
 func selectInitiatorSuite(supports []byte) byte {
+	if preferred, ok := preferredInitiatorSuite(); ok && supportsSuite(supports, preferred) {
+		return preferred
+	}
 	if supportsSuite(supports, SuiteHybridMLKEMSPHINCS) {
 		return SuiteHybridMLKEMSPHINCS
 	}
@@ -743,9 +759,28 @@ func signHelloBySuite(suiteID byte, rsaPriv, pqPriv, input []byte) ([]byte, erro
 		if len(pqPriv) == 0 {
 			return nil, errors.New("missing pq private key")
 		}
-		return crypto.SLHDSASign(pqPriv, digest)
+		return crypto.MLDSASign(pqPriv, digest)
 	}
 	return crypto.SignDigest(rsaPriv, digest)
+}
+
+func (n *Node) signHelloBySuiteCached(suiteID byte, rsaPriv, pqPriv, input []byte) ([]byte, error) {
+	keyBytes := crypto.SHA3_256(input)
+	var key [32]byte
+	copy(key[:], keyBytes)
+	if n != nil && n.sigCache != nil {
+		if cached, ok := n.sigCache.get(key); ok {
+			return cached, nil
+		}
+	}
+	sig, err := signHelloBySuite(suiteID, rsaPriv, pqPriv, input)
+	if err != nil {
+		return nil, err
+	}
+	if n != nil && n.sigCache != nil {
+		n.sigCache.put(key, sig)
+	}
+	return sig, nil
 }
 
 func verifyHelloBySuite(suiteID byte, rsaPub, pqPub, input, sig []byte) bool {
@@ -754,16 +789,16 @@ func verifyHelloBySuite(suiteID byte, rsaPub, pqPub, input, sig []byte) bool {
 		if len(pqPub) == 0 || len(sig) < 64 {
 			return false
 		}
-		return crypto.SLHDSAVerify(pqPub, digest, sig)
+		return crypto.MLDSAVerify(pqPub, digest, sig)
 	}
 	return crypto.VerifyDigest(rsaPub, digest, sig)
 }
 
-func maybeGenPQForSuite(suiteID byte) ([]byte, []byte, error) {
+func (n *Node) maybeGenPQForSuite(suiteID byte) ([]byte, []byte, error) {
 	if suiteID != SuiteHybridMLKEMSPHINCS {
 		return nil, nil, nil
 	}
-	return crypto.GenSLHDSAKeypair()
+	return n.loadOrCreateMLDSAKeypair()
 }
 
 func decodeHexOptional(v string) ([]byte, error) {
