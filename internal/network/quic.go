@@ -22,6 +22,7 @@ import (
 
 	quic "github.com/quic-go/quic-go"
 
+	"web4mvp/internal/debuglog"
 	"web4mvp/internal/proto"
 )
 
@@ -941,14 +942,11 @@ func loadDevTLSCertPoolWithFallback(path string, allowFallback bool) (*x509.Cert
 }
 
 func logInfo(format string, args ...any) {
-	_, _ = fmt.Fprintf(os.Stderr, format+"\n", args...)
+	debuglog.Logf(format, args...)
 }
 
 func debugLog(format string, args ...any) {
-	if os.Getenv("WEB4_DEBUG") != "1" {
-		return
-	}
-	logInfo(format, args...)
+	debuglog.Debugf(format, args...)
 }
 
 func previewBytes(b []byte, max int) string {

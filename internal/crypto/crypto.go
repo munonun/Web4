@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cloudflare/circl/kem/mlkem/mlkem768"
 	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
@@ -63,6 +64,8 @@ var (
 	mldsaVerifyOnce sync.Once
 	mldsaSignQ      chan mldsaSignReq
 	mldsaVerifyQ    chan mldsaVerifyReq
+	signTotalMLDSA  atomic.Uint64
+	signTotalRSA    atomic.Uint64
 )
 
 const (
@@ -290,11 +293,51 @@ func SignDigest(priv []byte, digest []byte) ([]byte, error) {
 	if len(digest) != 32 {
 		return nil, errors.New("bad digest size")
 	}
-	key, err := ParseRSAPrivateKey(priv)
-	if err != nil {
-		return nil, err
+	if IsMLDSAPrivateKey(priv) {
+		sig, err := MLDSASign(priv, digest)
+		if err != nil {
+			return nil, err
+		}
+		return sig, nil
 	}
-	return rsa.SignPSS(rand.Reader, key, crypto.SHA3_256, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+	key, err := ParseRSAPrivateKey(priv)
+	if err == nil {
+		if !allowRSAPSS() {
+			return nil, errors.New("rsa-pss signing disabled; set WEB4_ALLOW_RSA_PSS=1 to allow legacy rsa private keys")
+		}
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintln(os.Stderr, "WEB4_DEBUG: using RSA-PSS signing (legacy key, WEB4_ALLOW_RSA_PSS=1)")
+		}
+		sig, signErr := rsa.SignPSS(rand.Reader, key, crypto.SHA3_256, digest, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+		if signErr != nil {
+			return nil, signErr
+		}
+		signTotalRSA.Add(1)
+		return sig, nil
+	}
+	if _, mldsaErr := parseMLDSAPrivateKey(priv); mldsaErr == nil {
+		// Defensive path; IsMLDSAPrivateKey should have matched above.
+		sig, signErr := MLDSASign(priv, digest)
+		if signErr != nil {
+			return nil, signErr
+		}
+		return sig, nil
+	}
+	if len(priv) == 0 {
+		return nil, errors.New("missing private key")
+	}
+	return nil, errors.New("unsupported private key type")
+}
+
+func allowRSAPSS() bool {
+	return os.Getenv("WEB4_ALLOW_RSA_PSS") == "1"
+}
+
+func SignTotalByAlg() map[string]uint64 {
+	return map[string]uint64{
+		"mldsa": signTotalMLDSA.Load(),
+		"rsa":   signTotalRSA.Load(),
+	}
 }
 
 func Verify(pub []byte, digest []byte, sig []byte) bool {
@@ -304,6 +347,9 @@ func Verify(pub []byte, digest []byte, sig []byte) bool {
 func VerifyDigest(pub []byte, digest []byte, sig []byte) bool {
 	if len(digest) != 32 {
 		return false
+	}
+	if IsMLDSAPublicKey(pub) {
+		return MLDSAVerify(pub, digest, sig)
 	}
 	key, err := ParseRSAPublicKey(pub)
 	if err != nil {
@@ -346,6 +392,28 @@ func IsRSAPrivateKey(priv []byte) bool {
 	return err == nil
 }
 
+func parseMLDSAPublicKey(pub []byte) (mldsa65.PublicKey, error) {
+	key := mldsa65.PublicKey{}
+	err := key.UnmarshalBinary(pub)
+	return key, err
+}
+
+func parseMLDSAPrivateKey(priv []byte) (mldsa65.PrivateKey, error) {
+	key := mldsa65.PrivateKey{}
+	err := key.UnmarshalBinary(priv)
+	return key, err
+}
+
+func IsMLDSAPublicKey(pub []byte) bool {
+	_, err := parseMLDSAPublicKey(pub)
+	return err == nil
+}
+
+func IsMLDSAPrivateKey(priv []byte) bool {
+	_, err := parseMLDSAPrivateKey(priv)
+	return err == nil
+}
+
 func GenMLDSAKeypair() ([]byte, []byte, error) {
 	pub, priv, err := mldsa65.GenerateKey(rand.Reader)
 	if err != nil {
@@ -374,6 +442,9 @@ func MLDSASign(priv, msg []byte) ([]byte, error) {
 	}
 	mldsaSignQ <- req
 	out := <-req.resp
+	if out.err == nil {
+		signTotalMLDSA.Add(1)
+	}
 	return out.sig, out.err
 }
 

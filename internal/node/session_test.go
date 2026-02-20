@@ -296,6 +296,7 @@ func TestHandshakeRejectsForcedDowngradeWhenBothSupportSuite0(t *testing.T) {
 }
 
 func TestHandshakeAcceptsLegacyWhenPeerLacksSuite0(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	dirA := t.TempDir()
 	dirB := t.TempDir()
 	nodeA, err := NewNode(dirA, Options{})
@@ -413,6 +414,7 @@ func TestMLDSAKeypairPersistsAcrossHandshakes(t *testing.T) {
 }
 
 func TestHelloSignatureCacheUsesExactSignedBytes(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	n, err := NewNode(t.TempDir(), Options{})
 	if err != nil {
 		t.Fatalf("new node failed: %v", err)

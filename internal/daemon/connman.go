@@ -357,7 +357,9 @@ func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string, d
 	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout())
 	defer cancel()
+	hsStarted := time.Now()
 	respData, err := network.ExchangeOnceWithContext(ctx, addr, data, false, c.devTLS, c.devTLSCA)
+	c.metrics.ObserveHandshakeRTT(time.Since(hsStarted))
 	if err != nil {
 		if force {
 			c.logForcedDialStage(dialReason, peerID, addr, "dial", "fail", err)
@@ -451,7 +453,9 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout())
 	defer cancel()
+	pexStarted := time.Now()
 	respData, err := network.ExchangeOnceWithContext(ctx, addr, secureReq, false, c.devTLS, c.devTLSCA)
+	c.metrics.ObservePexRTT(time.Since(pexStarted))
 	if err != nil {
 		c.markFailure(p.NodeID)
 		return err
@@ -518,7 +522,9 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			continue
 		}
 		reqCtx, cancel := context.WithTimeout(ctx, dialTimeout())
+		pexStarted := time.Now()
 		respData, err := network.ExchangeOnceWithContext(reqCtx, addr, data, false, c.devTLS, c.devTLSCA)
+		c.metrics.ObservePexRTT(time.Since(pexStarted))
 		cancel()
 		if err != nil {
 			if c.metrics != nil {

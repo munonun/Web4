@@ -113,3 +113,50 @@ func TestEphemeralDestroyed(t *testing.T) {
 		t.Fatalf("expected error on Shared after destroy")
 	}
 }
+
+func TestSignDigestDefaultUsesMLDSA(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "")
+	pub, priv, err := GenMLDSAKeypair()
+	if err != nil {
+		t.Fatalf("GenMLDSAKeypair failed: %v", err)
+	}
+	digest := SHA3_256([]byte("mldsa-default-signing"))
+	sig, err := SignDigest(priv, digest)
+	if err != nil {
+		t.Fatalf("SignDigest failed for mldsa key: %v", err)
+	}
+	if !VerifyDigest(pub, digest, sig) {
+		t.Fatalf("VerifyDigest failed for mldsa signature")
+	}
+}
+
+func TestSignDigestRejectsRSAWithoutFlag(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "")
+	_, priv, err := GenKeypair()
+	if err != nil {
+		t.Fatalf("GenKeypair failed: %v", err)
+	}
+	_, err = SignDigest(priv, SHA3_256([]byte("rsa-disabled")))
+	if err == nil {
+		t.Fatalf("expected rsa signing to be rejected without WEB4_ALLOW_RSA_PSS")
+	}
+	if !strings.Contains(err.Error(), "WEB4_ALLOW_RSA_PSS=1") {
+		t.Fatalf("expected explicit gate error, got: %v", err)
+	}
+}
+
+func TestSignDigestAllowsRSAWithFlag(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
+	pub, priv, err := GenKeypair()
+	if err != nil {
+		t.Fatalf("GenKeypair failed: %v", err)
+	}
+	digest := SHA3_256([]byte("rsa-enabled"))
+	sig, err := SignDigest(priv, digest)
+	if err != nil {
+		t.Fatalf("SignDigest failed for rsa key with flag: %v", err)
+	}
+	if !VerifyDigest(pub, digest, sig) {
+		t.Fatalf("VerifyDigest failed for rsa signature")
+	}
+}

@@ -28,6 +28,11 @@ import (
 	"web4mvp/internal/store"
 )
 
+func TestMain(m *testing.M) {
+	_ = os.Setenv("WEB4_ALLOW_RSA_PSS", "1")
+	os.Exit(m.Run())
+}
+
 func TestOpenCloseAckFlow(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()
@@ -414,6 +419,7 @@ func TestRecvRejectsBurstUpdates(t *testing.T) {
 }
 
 func TestRecvRejectsMismatchedOpenPayload(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	homeA := t.TempDir()
 	homeB := t.TempDir()
 
@@ -453,6 +459,7 @@ func TestRecvRejectsMismatchedOpenPayload(t *testing.T) {
 }
 
 func TestZKModeRejectsMissingProofOpen(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	t.Setenv("WEB4_ZK_MODE", "1")
 	homeA := t.TempDir()
 	homeB := t.TempDir()
@@ -493,6 +500,7 @@ func TestZKModeRejectsMissingProofOpen(t *testing.T) {
 }
 
 func TestZKModeAcceptsProofOpen(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	t.Setenv("WEB4_ZK_MODE", "1")
 	homeA := t.TempDir()
 	homeB := t.TempDir()
@@ -915,6 +923,7 @@ func TestDeltaBDifferentSendersWithinLimit(t *testing.T) {
 }
 
 func TestRecvRejectsAckWithoutRepayReq(t *testing.T) {
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	homeA := t.TempDir()
 	homeB := t.TempDir()
 
@@ -1499,6 +1508,7 @@ func decodeMsgType(payload []byte) (string, error) {
 
 func buildInviteCert(t *testing.T, inviter *node.Node, inviteePub []byte, inviteID []byte, scope uint32, powBits uint8, issuedAt, expiresAt uint64, powNonce *uint64) ([]byte, proto.InviteCert) {
 	t.Helper()
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	if inviteID == nil {
 		inviteID = bytes.Repeat([]byte{0x11}, 16)
 	}
@@ -1541,6 +1551,7 @@ func buildInviteCert(t *testing.T, inviter *node.Node, inviteePub []byte, invite
 
 func buildRevokeMsg(t *testing.T, revoker *node.Node, targetID [32]byte, revokeID []byte, reason string, issuedAt uint64) []byte {
 	t.Helper()
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	if revokeID == nil {
 		revokeID = bytes.Repeat([]byte{0x22}, 16)
 	}
@@ -1570,6 +1581,7 @@ func buildRevokeMsg(t *testing.T, revoker *node.Node, targetID [32]byte, revokeI
 
 func buildInviteApproval(t *testing.T, approver *node.Node, inviteID []byte, inviteeID [32]byte, expiresAt uint64, scope uint32) proto.InviteApproval {
 	t.Helper()
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 	signBytes, err := proto.InviteApproveSignBytes(inviteID, inviteeID, expiresAt, scope)
 	if err != nil {
 		t.Fatalf("approve sign bytes failed: %v", err)

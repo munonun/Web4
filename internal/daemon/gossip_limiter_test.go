@@ -13,6 +13,7 @@ import (
 func TestGossipHello1RateLimitedBeforeVerify(t *testing.T) {
 	// Keep this test lightweight while validating limiter order on gossip hello1.
 	t.Setenv("WEB4_HANDSHAKE_DISABLE_SUITE0", "1")
+	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 
 	rA, err := NewRunner(t.TempDir(), Options{})
 	if err != nil {

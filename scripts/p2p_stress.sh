@@ -35,6 +35,14 @@ cd "${REPO_ROOT}"
 : "${P2P_STRESS_PPROF:=0}"
 : "${P2P_STRESS_PPROF_ADDR:=127.0.0.1:6060}"
 : "${P2P_STRESS_KEEPALIVE:=0}"
+RTT_METRICS_ENABLED=0
+if [[ "${WEB4_RTT_METRICS:-}" == "1" ]]; then
+  RTT_METRICS_ENABLED=1
+fi
+WEB4_METRICS_DISK_WRITE_SEC_IS_SET=0
+if [[ "${WEB4_METRICS_DISK_WRITE_SEC+x}" == "x" ]]; then
+  WEB4_METRICS_DISK_WRITE_SEC_IS_SET=1
+fi
 
 START_TS="$(date +%s)"
 
@@ -498,6 +506,32 @@ metrics_file() {
   echo "${NODE_HOME[$idx]}/.web4mvp/metrics.json"
 }
 
+print_node0_rtt_buckets() {
+  if (( RTT_METRICS_ENABLED != 1 )); then
+    return 0
+  fi
+  local path
+  path="$(metrics_file 0)"
+  echo "RTT_METRICS_FILE node[0]=${path}"
+  python3 - "$path" <<'PY'
+import json,sys
+path=sys.argv[1]
+try:
+    with open(path,'r',encoding='utf-8') as f:
+        m=json.load(f)
+except Exception as e:
+    print(f"RTT_BUCKETS_READ_ERROR: {e}")
+    raise SystemExit(0)
+def emit(name):
+    v=m.get(name,{})
+    if not isinstance(v,dict):
+        v={}
+    print(f"{name}={json.dumps(v, sort_keys=True)}")
+emit("rtt_buckets_handshake")
+emit("rtt_buckets_pex")
+PY
+}
+
 classify_churn_failure() {
   local idx="$1"
   local path
@@ -846,6 +880,9 @@ start_node() {
   fi
   if [[ "${idx}" == "0" && "${P2P_STRESS_PPROF}" == "1" ]]; then
     envs+=("WEB4_PPROF=1" "WEB4_PPROF_ADDR=${P2P_STRESS_PPROF_ADDR}")
+  fi
+  if [[ "${idx}" == "0" && "${RTT_METRICS_ENABLED}" == "1" && "${WEB4_METRICS_DISK_WRITE_SEC_IS_SET}" != "1" ]]; then
+    envs+=("WEB4_METRICS_DISK_WRITE_SEC=1")
   fi
   if [[ -n "${netns}" ]]; then
     ip netns exec "${netns}" env "${envs[@]}" "${WEB4_NODE_BIN}" run --devtls --addr "${addr}" >"${log}" 2>&1 &
@@ -1319,5 +1356,6 @@ if (( need_partition == 1 )); then
   require_timeout
 fi
 
+print_node0_rtt_buckets
 echo "ALL P2P STRESS SCENARIOS COMPLETED"
 keepalive_wait_if_enabled

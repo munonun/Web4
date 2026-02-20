@@ -1,6 +1,9 @@
 package metrics
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestMetricsCounters(t *testing.T) {
 	m := New()
@@ -93,5 +96,39 @@ func TestMetricsCounters(t *testing.T) {
 	}
 	if snap.OutboundConnected != 4 || snap.InboundConnected != 2 {
 		t.Fatalf("expected outbound/inbound 4/2, got %d/%d", snap.OutboundConnected, snap.InboundConnected)
+	}
+	if _, ok := snap.SignTotalByAlg["mldsa"]; !ok {
+		t.Fatalf("expected sign_total_by_alg.mldsa in snapshot")
+	}
+	if _, ok := snap.SignTotalByAlg["rsa"]; !ok {
+		t.Fatalf("expected sign_total_by_alg.rsa in snapshot")
+	}
+}
+
+func TestRTTBucketsDisabledByDefault(t *testing.T) {
+	t.Setenv("WEB4_RTT_METRICS", "")
+	m := New()
+	m.ObserveHandshakeRTT(12 * time.Millisecond)
+	m.ObservePexRTT(12 * time.Millisecond)
+	snap := m.Snapshot()
+	if len(snap.RTTBucketsHandshake) != 0 {
+		t.Fatalf("expected no handshake RTT buckets, got %+v", snap.RTTBucketsHandshake)
+	}
+	if len(snap.RTTBucketsPex) != 0 {
+		t.Fatalf("expected no pex RTT buckets, got %+v", snap.RTTBucketsPex)
+	}
+}
+
+func TestRTTBucketsEnabled(t *testing.T) {
+	t.Setenv("WEB4_RTT_METRICS", "1")
+	m := New()
+	m.ObserveHandshakeRTT(12 * time.Millisecond)
+	m.ObservePexRTT(600 * time.Millisecond)
+	snap := m.Snapshot()
+	if snap.RTTBucketsHandshake["20ms"] != 1 {
+		t.Fatalf("expected handshake 20ms bucket=1, got %+v", snap.RTTBucketsHandshake)
+	}
+	if snap.RTTBucketsPex["+Inf"] != 1 {
+		t.Fatalf("expected pex +Inf bucket=1, got %+v", snap.RTTBucketsPex)
 	}
 }

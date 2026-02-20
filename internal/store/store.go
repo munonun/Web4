@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
+	"time"
 
 	"web4mvp/internal/proto"
 )
@@ -27,7 +29,29 @@ var (
 	MaxLinesPerFile = 200_000
 	MaxBytesPerFile = 64 << 20
 	MaxRotations    = 3
+	appendersMu     sync.Mutex
+	appenders       = make(map[string]*jsonlAppender)
 )
+
+const (
+	appendBufferSize       = 64 << 10
+	appendFlushInterval    = 200 * time.Millisecond
+	appendFlushEveryWrites = 64
+)
+
+type jsonlAppender struct {
+	path string
+
+	mu                sync.Mutex
+	f                 *os.File
+	w                 *bufio.Writer
+	sizeBytes         int64
+	lines             int
+	writesSinceFlush  int
+	lastRotateCheckAt time.Time
+
+	stopCh chan struct{}
+}
 
 func init() {
 	maxInt := int64(int(^uint(0) >> 1))
@@ -75,6 +99,7 @@ func (s *Store) AddContract(c proto.Contract) error {
 }
 
 func (s *Store) ListContracts() ([]proto.Contract, error) {
+	flushAppender(s.contractsPath)
 	var out []proto.Contract
 	paths := scanPaths(s.contractsPath)
 	for i, path := range paths {
@@ -102,6 +127,7 @@ func (s *Store) ListContracts() ([]proto.Contract, error) {
 }
 
 func (s *Store) MarkClosed(cid [32]byte, forget bool) error {
+	flushAppender(s.contractsPath)
 	cs, err := s.ListContracts()
 	if err != nil {
 		return err
@@ -171,6 +197,7 @@ func (s *Store) AddAckIfNew(a proto.Ack, sigA []byte) error {
 }
 
 func (s *Store) HasAck(contractID string, reqNonce uint64) (bool, error) {
+	flushAppender(s.acksPath)
 	type rec struct {
 		Ack proto.Ack `json:"ack"`
 	}
@@ -218,6 +245,7 @@ func (s *Store) AddRepayReqIfNew(m proto.RepayReqMsg) error {
 }
 
 func (s *Store) HasRepayReq(contractID string, reqNonce uint64) (bool, error) {
+	flushAppender(s.repayReqsPath)
 	paths := scanPaths(s.repayReqsPath)
 	for i, path := range paths {
 		f, err := openRead(path, i == 0)
@@ -247,6 +275,7 @@ func (s *Store) HasRepayReq(contractID string, reqNonce uint64) (bool, error) {
 }
 
 func (s *Store) FindRepayReq(contractID string, reqNonce uint64) (*proto.RepayReqMsg, error) {
+	flushAppender(s.repayReqsPath)
 	paths := scanPaths(s.repayReqsPath)
 	for i, path := range paths {
 		f, err := openRead(path, i == 0)
@@ -276,6 +305,7 @@ func (s *Store) FindRepayReq(contractID string, reqNonce uint64) (*proto.RepayRe
 }
 
 func (s *Store) MaxRepayReqNonce(contractID string) (uint64, bool, error) {
+	flushAppender(s.repayReqsPath)
 	var max uint64
 	var found bool
 	paths := scanPaths(s.repayReqsPath)
@@ -337,18 +367,11 @@ func appendJSONL(path string, v any) error {
 		return err
 	}
 	line = append(line, '\n')
-	if err := rotateIfNeeded(path, len(line)); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	a, err := getJSONLAppender(path)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	if _, err := f.Write(line); err != nil {
-		return err
-	}
-	return syncFile(f)
+	return a.append(line)
 }
 
 func AppendJSONL(path string, v any) error {
@@ -378,6 +401,133 @@ func rotateIfNeeded(path string, addBytes int) error {
 	if (MaxBytesPerFile > 0 && nextBytes > int64(MaxBytesPerFile)) ||
 		(MaxLinesPerFile > 0 && nextLines > MaxLinesPerFile) {
 		return rotateFiles(path)
+	}
+	return nil
+}
+
+func getJSONLAppender(path string) (*jsonlAppender, error) {
+	appendersMu.Lock()
+	defer appendersMu.Unlock()
+	if a, ok := appenders[path]; ok {
+		return a, nil
+	}
+	a := &jsonlAppender{
+		path:              path,
+		lastRotateCheckAt: time.Now(),
+		stopCh:            make(chan struct{}),
+	}
+	if err := a.openAndProbe(); err != nil {
+		return nil, err
+	}
+	go a.flushLoop()
+	appenders[path] = a
+	return a, nil
+}
+
+func flushAppender(path string) {
+	if path == "" {
+		return
+	}
+	appendersMu.Lock()
+	a := appenders[path]
+	appendersMu.Unlock()
+	if a != nil {
+		_ = a.flush()
+	}
+}
+
+func (a *jsonlAppender) flushLoop() {
+	t := time.NewTicker(appendFlushInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			_ = a.flush()
+		case <-a.stopCh:
+			return
+		}
+	}
+}
+
+func (a *jsonlAppender) append(line []byte) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.rotateIfNeededLocked(len(line)); err != nil {
+		return err
+	}
+	if _, err := a.w.Write(line); err != nil {
+		return err
+	}
+	a.sizeBytes += int64(len(line))
+	a.lines++
+	a.writesSinceFlush++
+	if a.writesSinceFlush >= appendFlushEveryWrites {
+		return a.flushLocked()
+	}
+	return nil
+}
+
+func (a *jsonlAppender) flush() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.flushLocked()
+}
+
+func (a *jsonlAppender) flushLocked() error {
+	if a.w == nil {
+		return nil
+	}
+	if err := a.w.Flush(); err != nil {
+		return err
+	}
+	a.writesSinceFlush = 0
+	return nil
+}
+
+func (a *jsonlAppender) openAndProbe() error {
+	f, err := os.OpenFile(a.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	a.f = f
+	a.w = bufio.NewWriterSize(f, appendBufferSize)
+	if info, err := f.Stat(); err == nil {
+		a.sizeBytes = info.Size()
+	}
+	if MaxLinesPerFile > 0 {
+		lines, err := countLinesFast(a.path)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		a.lines = lines
+	}
+	return nil
+}
+
+func (a *jsonlAppender) rotateIfNeededLocked(addBytes int) error {
+	if MaxLinesPerFile <= 0 && MaxBytesPerFile <= 0 {
+		return nil
+	}
+	nextBytes := a.sizeBytes + int64(addBytes)
+	nextLines := a.lines + 1
+	if (MaxBytesPerFile > 0 && nextBytes > int64(MaxBytesPerFile)) ||
+		(MaxLinesPerFile > 0 && nextLines > MaxLinesPerFile) {
+		if err := a.flushLocked(); err != nil {
+			return err
+		}
+		if a.f != nil {
+			_ = a.f.Close()
+		}
+		a.f = nil
+		a.w = nil
+		if err := rotateFiles(a.path); err != nil {
+			return err
+		}
+		if err := a.openAndProbe(); err != nil {
+			return err
+		}
+		a.sizeBytes = 0
+		a.lines = 0
 	}
 	return nil
 }
@@ -426,6 +576,32 @@ func countLines(path string) (int, error) {
 		}
 	}
 	if err := sc.Err(); err != nil {
+		return 0, err
+	}
+	return lines, nil
+}
+
+func countLinesFast(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 64*1024)
+	lines := 0
+	for {
+		_, err := r.ReadSlice('\n')
+		if err == nil {
+			lines++
+			continue
+		}
+		if err == bufio.ErrBufferFull {
+			// Long line: continue consuming until newline/EOF.
+			continue
+		}
+		if err == io.EOF {
+			break
+		}
 		return 0, err
 	}
 	return lines, nil

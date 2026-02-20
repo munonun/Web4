@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"web4mvp/internal/crypto"
+	"web4mvp/internal/debuglog"
 	"web4mvp/internal/math4"
 	"web4mvp/internal/metrics"
 	"web4mvp/internal/network"
@@ -114,9 +115,14 @@ func (r *Runner) StartSnapshotWriter(interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Second
 	}
+	diskWriteEvery := envIntDefaultLocal("WEB4_METRICS_DISK_WRITE_SEC", 1)
+	if diskWriteEvery < 0 {
+		diskWriteEvery = 0
+	}
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		lastDiskWrite := time.Time{}
 		for {
 			select {
 			case <-ticker.C:
@@ -126,13 +132,30 @@ func (r *Runner) StartSnapshotWriter(interval time.Duration) {
 					if r.Self != nil && r.Self.Peers != nil {
 						r.Metrics.SetPeerTableSize(uint64(len(r.Self.Peers.List())))
 					}
+					// Keep snapshots hot in-memory for readers; disk write is throttled separately.
+					_ = r.Metrics.Snapshot()
 				}
-				_ = r.Metrics.WriteSnapshot(r.snapPath)
+				if diskWriteEvery > 0 && (lastDiskWrite.IsZero() || time.Since(lastDiskWrite) >= time.Duration(diskWriteEvery)*time.Second) {
+					_ = r.Metrics.WriteSnapshot(r.snapPath)
+					lastDiskWrite = time.Now()
+				}
 			case <-r.stopSnap:
 				return
 			}
 		}
 	}()
+}
+
+func envIntDefaultLocal(key string, def int) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func (r *Runner) StopSnapshotWriter() {
@@ -201,7 +224,7 @@ func (r *Runner) RunWithContext(ctx context.Context, addr string, devTLS bool, r
 			resp, _, err := r.recvDataWithResponse(data, senderAddr)
 			if err != nil {
 				if os.Getenv("WEB4_DEBUG") == "1" {
-					fmt.Fprintf(os.Stderr, "recv error: %v\n", err)
+					debuglog.RateLimitedf("runner_recv_error", time.Second, "recv error: %v", err)
 				}
 				return nil, err
 			}
@@ -1376,9 +1399,7 @@ func applyNodeModeDefaults(mode string) {
 }
 
 func gossipDebugf(format string, args ...any) {
-	if os.Getenv("WEB4_DEBUG") == "1" {
-		fmt.Fprintf(os.Stderr, format+"\n", args...)
-	}
+	debuglog.Debugf(format, args...)
 }
 
 func nodeIDHexFromPub(pub []byte) string {
@@ -1443,7 +1464,7 @@ func handleGossipPush(data []byte, st *store.Store, self *node.Node, checker mat
 			msg = err.Error()
 		}
 		if os.Getenv("WEB4_DEBUG") == "1" && shouldLogReject(reason) {
-			fmt.Fprintf(os.Stderr, "DROP reason=%s from=%s type=%s err=%s\n", reason, senderAddr, t, msg)
+			debuglog.RateLimitedf("drop_"+reason, time.Second, "DROP reason=%s from=%s type=%s err=%s", reason, senderAddr, t, msg)
 		}
 		debugCount.incDrop(classifyDropReason(reason, err))
 	}

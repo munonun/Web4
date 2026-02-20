@@ -3,9 +3,12 @@ package metrics
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	web4crypto "web4mvp/internal/crypto"
 )
 
 type DeltaHeader struct {
@@ -51,6 +54,9 @@ type Snapshot struct {
 	RecoveryModeActive         bool              `json:"recovery_mode_active"`
 	RecoveryEnterTotal         uint64            `json:"recovery_enter_total"`
 	RecoveryExitTotal          uint64            `json:"recovery_exit_total"`
+	RTTBucketsHandshake        map[string]int64  `json:"rtt_buckets_handshake,omitempty"`
+	RTTBucketsPex              map[string]int64  `json:"rtt_buckets_pex,omitempty"`
+	SignTotalByAlg             map[string]uint64 `json:"sign_total_by_alg,omitempty"`
 }
 
 type DeltaMetrics struct {
@@ -92,6 +98,9 @@ type Metrics struct {
 	recoveryModeActive  atomic.Bool
 	recoveryEnterTotal  atomic.Uint64
 	recoveryExitTotal   atomic.Uint64
+	rttEnabled          bool
+	handshakeRTT        [8]atomic.Int64
+	pexRTT              [8]atomic.Int64
 	recent              *DeltaRecent
 	mu                  sync.Mutex
 	recvByType          map[string]uint64
@@ -106,10 +115,35 @@ type Metrics struct {
 	peertableSize       atomic.Uint64
 	outboundConnected   atomic.Uint64
 	inboundConnected    atomic.Uint64
+	snapMu              sync.RWMutex
+	lastSnap            Snapshot
+	lastSnapAt          time.Time
+}
+
+var rttBucketBounds = [...]time.Duration{
+	5 * time.Millisecond,
+	10 * time.Millisecond,
+	20 * time.Millisecond,
+	50 * time.Millisecond,
+	100 * time.Millisecond,
+	200 * time.Millisecond,
+	500 * time.Millisecond,
+}
+
+var rttBucketLabels = [...]string{
+	"5ms",
+	"10ms",
+	"20ms",
+	"50ms",
+	"100ms",
+	"200ms",
+	"500ms",
+	"+Inf",
 }
 
 func New() *Metrics {
 	return &Metrics{
+		rttEnabled:          strings.TrimSpace(os.Getenv("WEB4_RTT_METRICS")) == "1",
 		recent:              NewDeltaRecent(64),
 		recvByType:          make(map[string]uint64),
 		dropByReason:        make(map[string]uint64),
@@ -119,6 +153,29 @@ func New() *Metrics {
 		helloRejectByReason: make(map[string]uint64),
 		helloHSFailByReason: make(map[string]uint64),
 	}
+}
+
+func (m *Metrics) ObserveHandshakeRTT(d time.Duration) {
+	if m == nil || !m.rttEnabled {
+		return
+	}
+	m.handshakeRTT[rttBucketIndex(d)].Add(1)
+}
+
+func (m *Metrics) ObservePexRTT(d time.Duration) {
+	if m == nil || !m.rttEnabled {
+		return
+	}
+	m.pexRTT[rttBucketIndex(d)].Add(1)
+}
+
+func rttBucketIndex(d time.Duration) int {
+	for i, b := range rttBucketBounds {
+		if d <= b {
+			return i
+		}
+	}
+	return len(rttBucketBounds)
 }
 
 func (m *Metrics) Recent() *DeltaRecent {
@@ -351,6 +408,26 @@ func (m *Metrics) SetInboundConnected(n uint64) {
 }
 
 func (m *Metrics) Snapshot() Snapshot {
+	return m.captureSnapshot(true)
+}
+
+func (m *Metrics) CachedSnapshot(maxAge time.Duration) Snapshot {
+	if m == nil {
+		return Snapshot{}
+	}
+	if maxAge > 0 {
+		m.snapMu.RLock()
+		ok := !m.lastSnapAt.IsZero() && time.Since(m.lastSnapAt) <= maxAge
+		snap := m.lastSnap
+		m.snapMu.RUnlock()
+		if ok {
+			return snap
+		}
+	}
+	return m.captureSnapshot(true)
+}
+
+func (m *Metrics) captureSnapshot(updateCache bool) Snapshot {
 	recent := []DeltaHeader{}
 	if m.recent != nil {
 		recent = m.recent.List()
@@ -362,6 +439,8 @@ func (m *Metrics) Snapshot() Snapshot {
 	dialFailByReason := map[string]uint64{}
 	helloRejectByReason := map[string]uint64{}
 	helloHSFailByReason := map[string]uint64{}
+	rttHandshake := map[string]int64{}
+	rttPex := map[string]int64{}
 	if m != nil {
 		m.mu.Lock()
 		for k, v := range m.recvByType {
@@ -386,8 +465,14 @@ func (m *Metrics) Snapshot() Snapshot {
 			helloHSFailByReason[k] = v
 		}
 		m.mu.Unlock()
+		if m.rttEnabled {
+			for i := range rttBucketLabels {
+				rttHandshake[rttBucketLabels[i]] = m.handshakeRTT[i].Load()
+				rttPex[rttBucketLabels[i]] = m.pexRTT[i].Load()
+			}
+		}
 	}
-	return Snapshot{
+	snap := Snapshot{
 		GeneratedAt: time.Now().UTC(),
 		Delta: DeltaMetrics{
 			Verified:      m.deltaVerified.Load(),
@@ -431,14 +516,24 @@ func (m *Metrics) Snapshot() Snapshot {
 		RecoveryModeActive:         m.recoveryModeActive.Load(),
 		RecoveryEnterTotal:         m.recoveryEnterTotal.Load(),
 		RecoveryExitTotal:          m.recoveryExitTotal.Load(),
+		RTTBucketsHandshake:        rttHandshake,
+		RTTBucketsPex:              rttPex,
+		SignTotalByAlg:             web4crypto.SignTotalByAlg(),
 	}
+	if updateCache {
+		m.snapMu.Lock()
+		m.lastSnap = snap
+		m.lastSnapAt = time.Now()
+		m.snapMu.Unlock()
+	}
+	return snap
 }
 
 func (m *Metrics) WriteSnapshot(path string) error {
 	if path == "" {
 		return nil
 	}
-	snap := m.Snapshot()
+	snap := m.CachedSnapshot(2 * time.Second)
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
 		return err

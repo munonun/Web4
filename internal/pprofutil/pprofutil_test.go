@@ -20,3 +20,20 @@ func TestIsLoopbackBind(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvIntDefault(t *testing.T) {
+	t.Setenv("WEB4_MUTEX_PROFILE_FRACTION", "")
+	if got := envIntDefault("WEB4_MUTEX_PROFILE_FRACTION", 0); got != 0 {
+		t.Fatalf("empty env -> default, got %d", got)
+	}
+
+	t.Setenv("WEB4_MUTEX_PROFILE_FRACTION", "7")
+	if got := envIntDefault("WEB4_MUTEX_PROFILE_FRACTION", 0); got != 7 {
+		t.Fatalf("expected parsed int, got %d", got)
+	}
+
+	t.Setenv("WEB4_MUTEX_PROFILE_FRACTION", "bad")
+	if got := envIntDefault("WEB4_MUTEX_PROFILE_FRACTION", 3); got != 3 {
+		t.Fatalf("bad env -> default, got %d", got)
+	}
+}

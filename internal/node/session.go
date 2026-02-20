@@ -171,7 +171,7 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 			return proto.Hello1Msg{}, err
 		}
 		bind := pqBindInput(n.ID, pqPub)
-		pqBindSig, err = crypto.SignDigest(n.PrivKey, crypto.SHA3_256(bind))
+		pqBindSig, err = crypto.MLDSASign(pqPriv, crypto.SHA3_256(bind))
 		if err != nil {
 			eph.Destroy()
 			return proto.Hello1Msg{}, err
@@ -271,7 +271,7 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 			return proto.Hello2Msg{}, errors.New("missing pq binding")
 		}
 		bindInput := pqBindInput(fromID, pqPub)
-		if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(bindInput), pqBindSig) {
+		if !crypto.MLDSAVerify(pqPub, crypto.SHA3_256(bindInput), pqBindSig) {
 			return proto.Hello2Msg{}, errors.New("bad pq binding")
 		}
 	}
@@ -346,7 +346,7 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	pqBindSigResp := []byte(nil)
 	if suiteID == SuiteHybridMLKEMSPHINCS {
 		bind := pqBindInput(n.ID, pqPubResp)
-		pqBindSigResp, err = crypto.SignDigest(n.PrivKey, crypto.SHA3_256(bind))
+		pqBindSigResp, err = crypto.MLDSASign(pqPrivResp, crypto.SHA3_256(bind))
 		if err != nil {
 			eph.Destroy()
 			return proto.Hello2Msg{}, err
@@ -455,7 +455,7 @@ func (n *Node) HandleHello2From(m proto.Hello2Msg, senderAddr string) error {
 			return errors.New("missing pq hybrid fields")
 		}
 		bindInput := pqBindInput(fromID, pqPub)
-		if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(bindInput), pqBindSig) {
+		if !crypto.MLDSAVerify(pqPub, crypto.SHA3_256(bindInput), pqBindSig) {
 			pending.Ephemeral.Destroy()
 			return errors.New("bad pq binding")
 		}

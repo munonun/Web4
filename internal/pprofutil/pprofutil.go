@@ -7,6 +7,8 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +27,11 @@ func StartFromEnv(logw io.Writer) error {
 		return nil
 	}
 	startOnce.Do(func() {
+		mutexFraction := envIntDefault("WEB4_MUTEX_PROFILE_FRACTION", 0)
+		blockRate := envIntDefault("WEB4_BLOCK_PROFILE_RATE", 0)
+		runtime.SetMutexProfileFraction(mutexFraction)
+		runtime.SetBlockProfileRate(blockRate)
+
 		addr := strings.TrimSpace(os.Getenv("WEB4_PPROF_ADDR"))
 		if addr == "" {
 			addr = defaultAddr
@@ -41,6 +48,7 @@ func StartFromEnv(logw io.Writer) error {
 		}
 		actual := ln.Addr().String()
 		if logw != nil {
+			fmt.Fprintf(logw, "pprof profiler settings: mutex_fraction=%d block_rate=%d\n", mutexFraction, blockRate)
 			fmt.Fprintf(logw, "pprof enabled: http://%s/debug/pprof/\n", actual)
 		}
 		srv := &http.Server{
@@ -53,6 +61,18 @@ func StartFromEnv(logw io.Writer) error {
 		}()
 	})
 	return startErr
+}
+
+func envIntDefault(key string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return def
+	}
+	return v
 }
 
 func isLoopbackBind(addr string) bool {
