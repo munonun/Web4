@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +46,14 @@ type Peer struct {
 	Source          string
 	SubnetKey       string
 	Score           float64
+	Economic        EconomicState
+}
+
+type EconomicState struct {
+	Debt           uint64
+	Credit         uint64
+	LastUpdateUnix int64
+	LastRepayUnix  int64
 }
 
 type Options struct {
@@ -89,18 +99,19 @@ type addrObservation struct {
 }
 
 type diskPeer struct {
-	NodeID          string  `json:"node_id"`
-	PubKey          string  `json:"pubkey"`
-	DialAddr        string  `json:"dial_addr,omitempty"`
-	ObservedAddr    string  `json:"observed_addr,omitempty"`
-	Addr            string  `json:"addr,omitempty"`
-	LastSeenUnix    int64   `json:"last_seen_unix,omitempty"`
-	LastSuccessUnix int64   `json:"last_success_unix,omitempty"`
-	FailCount       int     `json:"fail_count,omitempty"`
-	RTTMs           int     `json:"rtt_ms,omitempty"`
-	Source          string  `json:"source,omitempty"`
-	SubnetKey       string  `json:"subnet_key,omitempty"`
-	Score           float64 `json:"score,omitempty"`
+	NodeID          string        `json:"node_id"`
+	PubKey          string        `json:"pubkey"`
+	DialAddr        string        `json:"dial_addr,omitempty"`
+	ObservedAddr    string        `json:"observed_addr,omitempty"`
+	Addr            string        `json:"addr,omitempty"`
+	LastSeenUnix    int64         `json:"last_seen_unix,omitempty"`
+	LastSuccessUnix int64         `json:"last_success_unix,omitempty"`
+	FailCount       int           `json:"fail_count,omitempty"`
+	RTTMs           int           `json:"rtt_ms,omitempty"`
+	Source          string        `json:"source,omitempty"`
+	SubnetKey       string        `json:"subnet_key,omitempty"`
+	Score           float64       `json:"score,omitempty"`
+	Economic        EconomicState `json:"economic,omitempty"`
 }
 
 var (
@@ -212,6 +223,7 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 	pub := make([]byte, len(p.PubKey))
 	copy(pub, p.PubKey)
 	p.PubKey = pub
+	seedEconomicState(&p.Economic, false, now.Unix())
 	if existing != nil {
 		if p.Addr == "" {
 			setDialAddr(&p, dialAddrOf(existing.peer))
@@ -244,6 +256,7 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 			Source:          p.Source,
 			SubnetKey:       p.SubnetKey,
 			Score:           p.Score,
+			Economic:        p.Economic,
 		}
 		return store.AppendJSONL(s.path, rec)
 	}
@@ -280,6 +293,7 @@ func (s *Store) Upsert(p Peer, persist bool) error {
 		Source:          p.Source,
 		SubnetKey:       p.SubnetKey,
 		Score:           p.Score,
+		Economic:        p.Economic,
 	}
 	return store.AppendJSONL(s.path, rec)
 }
@@ -293,6 +307,7 @@ func (s *Store) UpsertUnverified(p Peer) error {
 	}
 	now := time.Now()
 	p.LastSeenUnix = now.Unix()
+	seedEconomicState(&p.Economic, false, now.Unix())
 	s.mu.Lock()
 	s.pruneLocked()
 	key := keyForPeer(p)
@@ -330,6 +345,171 @@ func (s *Store) UpsertUnverified(p Peer) error {
 	}
 	s.mu.Unlock()
 	return nil
+}
+
+func (s *Store) EnsureEconomicState(id [32]byte, verified bool, persist bool) error {
+	if isZeroNodeID(id) {
+		return fmt.Errorf("missing node_id")
+	}
+	s.mu.Lock()
+	s.pruneLocked()
+	nowUnix := time.Now().Unix()
+	ent := s.ensureEconomicEntryLocked(id, nowUnix)
+	changed := applyEconomicDefault(&ent.peer.Economic, verified, nowUnix)
+	p := ent.peer
+	s.mu.Unlock()
+	if changed && persist {
+		return s.persistPeer(p)
+	}
+	return nil
+}
+
+func (s *Store) ApplyEconomicDelta(selfID [32]byte, deltas map[[32]byte]int64, persist bool) error {
+	if isZeroNodeID(selfID) {
+		return fmt.Errorf("missing self_id")
+	}
+	selfDelta, ok := deltas[selfID]
+	if !ok || selfDelta == 0 {
+		return nil
+	}
+	type peerDelta struct {
+		id  [32]byte
+		amt uint64
+	}
+	updates := make([]peerDelta, 0, len(deltas))
+	if selfDelta > 0 {
+		for id, d := range deltas {
+			if id == selfID || d >= 0 {
+				continue
+			}
+			amt, err := absToUint64(d)
+			if err != nil {
+				return err
+			}
+			updates = append(updates, peerDelta{id: id, amt: amt})
+		}
+	} else {
+		for id, d := range deltas {
+			if id == selfID || d <= 0 {
+				continue
+			}
+			amt, err := absToUint64(d)
+			if err != nil {
+				return err
+			}
+			updates = append(updates, peerDelta{id: id, amt: amt})
+		}
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	nowUnix := time.Now().Unix()
+	s.mu.Lock()
+	s.pruneLocked()
+	changed := make([]Peer, 0, len(updates))
+	for _, u := range updates {
+		ent := s.ensureEconomicEntryLocked(u.id, nowUnix)
+		state := ent.peer.Economic
+		if state.LastUpdateUnix == 0 {
+			seedEconomicState(&state, false, nowUnix)
+		}
+		if selfDelta > 0 {
+			newDebt, overflow := addUint64Overflow(state.Debt, u.amt)
+			if overflow {
+				s.mu.Unlock()
+				return fmt.Errorf("debt overflow")
+			}
+			if newDebt > state.Credit {
+				s.mu.Unlock()
+				return fmt.Errorf("credit exceeded for %x: debt=%d credit=%d", u.id[:], newDebt, state.Credit)
+			}
+			state.Debt = newDebt
+			if state.LastRepayUnix == 0 {
+				state.LastRepayUnix = nowUnix
+			}
+		} else {
+			if u.amt >= state.Debt {
+				state.Debt = 0
+			} else {
+				state.Debt -= u.amt
+			}
+			state.LastRepayUnix = nowUnix
+		}
+		state.LastUpdateUnix = nowUnix
+		ent.peer.Economic = state
+		changed = append(changed, ent.peer)
+	}
+	s.mu.Unlock()
+	if persist {
+		for _, p := range changed {
+			if err := s.persistPeer(p); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) ensureEconomicEntryLocked(id [32]byte, nowUnix int64) *entry {
+	key := hex.EncodeToString(id[:])
+	if el, ok := s.hot[key]; ok {
+		ent := el.Value.(*entry)
+		s.order.MoveToFront(el)
+		return ent
+	}
+	if s.cap > 0 && len(s.hot) >= s.cap {
+		s.evictLocked(len(s.hot) - s.cap + 1)
+	}
+	ent := &entry{
+		key: key,
+		peer: Peer{
+			NodeID:   id,
+			Economic: EconomicState{},
+		},
+		expiresAt: time.Unix(nowUnix, 0).Add(s.ttl),
+	}
+	seedEconomicState(&ent.peer.Economic, false, nowUnix)
+	el := s.order.PushFront(ent)
+	s.hot[key] = el
+	return ent
+}
+
+func (s *Store) EnforceEconomicGrace(now time.Time, persist bool) int {
+	grace := economicGraceSec()
+	if grace <= 0 || s == nil {
+		return 0
+	}
+	nowUnix := now.Unix()
+	s.mu.Lock()
+	s.pruneLocked()
+	changed := make([]Peer, 0)
+	for el := s.order.Front(); el != nil; el = el.Next() {
+		ent := el.Value.(*entry)
+		st := ent.peer.Economic
+		if st.Debt == 0 {
+			continue
+		}
+		last := st.LastRepayUnix
+		if last == 0 {
+			last = st.LastUpdateUnix
+		}
+		if last == 0 {
+			last = nowUnix
+		}
+		if nowUnix-last > grace && st.Credit != 0 {
+			st.Credit = 0
+			st.LastUpdateUnix = nowUnix
+			ent.peer.Economic = st
+			changed = append(changed, ent.peer)
+		}
+	}
+	s.mu.Unlock()
+	if persist {
+		for _, p := range changed {
+			_ = s.persistPeer(p)
+		}
+	}
+	return len(changed)
 }
 
 func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, verified bool, persist bool) (bool, error) {
@@ -427,6 +607,7 @@ func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, v
 		Source:          ent.peer.Source,
 		SubnetKey:       ent.peer.SubnetKey,
 		Score:           ent.peer.Score,
+		Economic:        ent.peer.Economic,
 	}
 	return changed, store.AppendJSONL(s.path, rec)
 }
@@ -561,6 +742,7 @@ func (s *Store) SetAddrUnverified(p Peer, addr string, persist bool) (bool, erro
 		Source:          ent.peer.Source,
 		SubnetKey:       ent.peer.SubnetKey,
 		Score:           ent.peer.Score,
+		Economic:        ent.peer.Economic,
 	}
 	return changed, store.AppendJSONL(s.path, rec)
 }
@@ -820,6 +1002,7 @@ func (s *Store) loadLast(limit int) error {
 			Source:          rec.Source,
 			SubnetKey:       rec.SubnetKey,
 			Score:           rec.Score,
+			Economic:        rec.Economic,
 		})
 	}
 	return nil
@@ -964,6 +1147,7 @@ func (s *Store) setAddrLocked(ent *entry, addr string, now time.Time, ignoreCool
 			s.addrIndex[addr] = ent.peer.NodeID
 			s.addrVerified[ent.peer.NodeID] = true
 			s.addrChange[ent.peer.NodeID] = now
+			_ = applyEconomicDefault(&ent.peer.Economic, true, now.Unix())
 			if hint, ok := s.addrHints[ent.peer.NodeID]; ok {
 				delete(s.addrHints, ent.peer.NodeID)
 				if owner, ok := s.hintIndex[hint]; ok && owner == ent.peer.NodeID {
@@ -994,6 +1178,7 @@ func (s *Store) setAddrLocked(ent *entry, addr string, now time.Time, ignoreCool
 	}
 	s.addrChange[ent.peer.NodeID] = now
 	s.addrVerified[ent.peer.NodeID] = verified
+	_ = applyEconomicDefault(&ent.peer.Economic, verified, now.Unix())
 	if hint, ok := s.addrHints[ent.peer.NodeID]; ok {
 		delete(s.addrHints, ent.peer.NodeID)
 		if owner, ok := s.hintIndex[hint]; ok && owner == ent.peer.NodeID {
@@ -1140,6 +1325,7 @@ func (s *Store) persistPeer(p Peer) error {
 		Source:          p.Source,
 		SubnetKey:       p.SubnetKey,
 		Score:           p.Score,
+		Economic:        p.Economic,
 	}
 	return store.AppendJSONL(s.path, rec)
 }
@@ -1196,7 +1382,92 @@ func mergePeerMeta(dst *Peer, src Peer, now time.Time) {
 	if dst.LastSeenUnix == 0 {
 		dst.LastSeenUnix = now.Unix()
 	}
+	if dst.Economic.LastUpdateUnix == 0 && src.Economic.LastUpdateUnix != 0 {
+		dst.Economic = src.Economic
+	}
+	seedEconomicState(&dst.Economic, false, now.Unix())
 	dst.Score = scoreForPeer(*dst, now)
+}
+
+func applyEconomicDefault(st *EconomicState, verified bool, nowUnix int64) bool {
+	if st == nil {
+		return false
+	}
+	changed := false
+	if st.LastUpdateUnix == 0 {
+		seedEconomicState(st, verified, nowUnix)
+		return true
+	}
+	if verified && st.Debt == 0 && st.Credit == economicCreditUnverified() {
+		st.Credit = economicCreditVerified()
+		changed = true
+	}
+	if st.LastRepayUnix == 0 {
+		st.LastRepayUnix = nowUnix
+		changed = true
+	}
+	if changed {
+		st.LastUpdateUnix = nowUnix
+	}
+	return changed
+}
+
+func seedEconomicState(st *EconomicState, verified bool, nowUnix int64) {
+	if st == nil {
+		return
+	}
+	if st.Credit == 0 && st.Debt == 0 && st.LastUpdateUnix == 0 {
+		if verified {
+			st.Credit = economicCreditVerified()
+		} else {
+			st.Credit = economicCreditUnverified()
+		}
+	}
+	if st.LastUpdateUnix == 0 {
+		st.LastUpdateUnix = nowUnix
+	}
+	if st.LastRepayUnix == 0 {
+		st.LastRepayUnix = nowUnix
+	}
+}
+
+func economicCreditUnverified() uint64 {
+	return envUint64Default("WEB4_CREDIT_UNVERIFIED", math.MaxUint64)
+}
+
+func economicCreditVerified() uint64 {
+	return envUint64Default("WEB4_CREDIT_VERIFIED", math.MaxUint64)
+}
+
+func economicGraceSec() int64 {
+	return int64(envUint64Default("WEB4_GRACE_SEC", 0))
+}
+
+func envUint64Default(key string, def uint64) uint64 {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
+
+func absToUint64(v int64) (uint64, error) {
+	if v == math.MinInt64 {
+		return 0, fmt.Errorf("delta magnitude overflow")
+	}
+	if v < 0 {
+		return uint64(-v), nil
+	}
+	return uint64(v), nil
+}
+
+func addUint64Overflow(a, b uint64) (uint64, bool) {
+	n := a + b
+	return n, n < a
 }
 
 func scoreForPeer(p Peer, now time.Time) float64 {

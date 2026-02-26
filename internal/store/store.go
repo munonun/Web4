@@ -371,7 +371,15 @@ func appendJSONL(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	return a.append(line)
+	if err := a.append(line); err != nil {
+		return err
+	}
+	// Default to durable cross-process visibility for CLI/test flows.
+	// Async buffered mode is opt-in.
+	if os.Getenv("WEB4_STORE_ASYNC_APPEND") != "1" {
+		return a.flush()
+	}
+	return nil
 }
 
 func AppendJSONL(path string, v any) error {

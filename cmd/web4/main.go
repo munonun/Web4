@@ -1205,6 +1205,27 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 				return nil, false, reject("invalid delta_b zk", err)
 			}
 		}
+		if self != nil && self.Peers != nil {
+			selfDelta := deltas[self.ID]
+			for id, d := range deltas {
+				if id == self.ID {
+					continue
+				}
+				if (selfDelta > 0 && d >= 0) || (selfDelta < 0 && d <= 0) {
+					continue
+				}
+				verified := false
+				if self.Members != nil && self.Members.HasScope(id, proto.InviteScopeGossip) {
+					verified = true
+				}
+				if err := self.Peers.EnsureEconomicState(id, verified, true); err != nil {
+					return nil, false, reject("economic state failed", err)
+				}
+			}
+			if err := self.Peers.ApplyEconomicDelta(self.ID, deltas, true); err != nil {
+				return nil, false, reject("economic rejected", err)
+			}
+		}
 		if self.Field == nil {
 			self.Field = state.NewField()
 		}
@@ -1968,7 +1989,7 @@ func handleGossipHello1Payload(data []byte, self *node.Node, senderAddr string, 
 			return false, errors.New("missing pq fields")
 		}
 		bind := pqBindInput(fromID, pqPub)
-		if !crypto.VerifyDigest(fromPub, crypto.SHA3_256(bind), pqBindSig) {
+		if !crypto.MLDSAVerify(pqPub, crypto.SHA3_256(bind), pqBindSig) {
 			return false, errors.New("bad pq binding")
 		}
 	}

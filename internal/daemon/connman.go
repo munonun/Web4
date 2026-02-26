@@ -204,6 +204,7 @@ func (c *connMan) tickOutbound(ctx context.Context) {
 		c.pickAndConnect(ctx, peers, explore, true)
 	}
 	c.enforcePeertableMax()
+	_ = c.self.Peers.EnforceEconomicGrace(now, true)
 	c.updateMetrics(now)
 }
 

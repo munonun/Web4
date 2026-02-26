@@ -260,3 +260,129 @@ func findPeer(peers []peer.Peer, id [32]byte) (peer.Peer, bool) {
 	}
 	return peer.Peer{}, false
 }
+
+func TestEconomicDebtIncreaseWithinCreditAccepted(t *testing.T) {
+	t.Setenv("WEB4_CREDIT_UNVERIFIED", "10")
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	selfPub := pubWithByte(11)
+	peerPub := pubWithByte(12)
+	selfID := node.DeriveNodeID(selfPub)
+	peerID := node.DeriveNodeID(peerPub)
+	if err := st.Upsert(peer.Peer{NodeID: peerID, PubKey: peerPub}, false); err != nil {
+		t.Fatalf("upsert peer failed: %v", err)
+	}
+	deltas := map[[32]byte]int64{selfID: 5, peerID: -5}
+	if err := st.ApplyEconomicDelta(selfID, deltas, false); err != nil {
+		t.Fatalf("apply economic delta failed: %v", err)
+	}
+	p, ok := st.Get(peerID)
+	if !ok {
+		t.Fatalf("peer missing")
+	}
+	if p.Economic.Debt != 5 {
+		t.Fatalf("expected debt=5 got %d", p.Economic.Debt)
+	}
+}
+
+func TestEconomicOverCreditRejected(t *testing.T) {
+	t.Setenv("WEB4_CREDIT_UNVERIFIED", "3")
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	selfPub := pubWithByte(13)
+	peerPub := pubWithByte(14)
+	selfID := node.DeriveNodeID(selfPub)
+	peerID := node.DeriveNodeID(peerPub)
+	if err := st.Upsert(peer.Peer{NodeID: peerID, PubKey: peerPub}, false); err != nil {
+		t.Fatalf("upsert peer failed: %v", err)
+	}
+	deltas := map[[32]byte]int64{selfID: 5, peerID: -5}
+	if err := st.ApplyEconomicDelta(selfID, deltas, false); err == nil {
+		t.Fatalf("expected over-credit rejection")
+	}
+}
+
+func TestEconomicRepaymentReducesDebt(t *testing.T) {
+	t.Setenv("WEB4_CREDIT_UNVERIFIED", "10")
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	selfPub := pubWithByte(15)
+	peerPub := pubWithByte(16)
+	selfID := node.DeriveNodeID(selfPub)
+	peerID := node.DeriveNodeID(peerPub)
+	if err := st.Upsert(peer.Peer{NodeID: peerID, PubKey: peerPub}, false); err != nil {
+		t.Fatalf("upsert peer failed: %v", err)
+	}
+	if err := st.ApplyEconomicDelta(selfID, map[[32]byte]int64{selfID: 5, peerID: -5}, false); err != nil {
+		t.Fatalf("initial debt apply failed: %v", err)
+	}
+	if err := st.ApplyEconomicDelta(selfID, map[[32]byte]int64{selfID: -3, peerID: 3}, false); err != nil {
+		t.Fatalf("repay apply failed: %v", err)
+	}
+	p, ok := st.Get(peerID)
+	if !ok {
+		t.Fatalf("peer missing")
+	}
+	if p.Economic.Debt != 2 {
+		t.Fatalf("expected debt=2 got %d", p.Economic.Debt)
+	}
+	if p.Economic.LastRepayUnix == 0 {
+		t.Fatalf("expected last_repay_unix updated")
+	}
+}
+
+func TestEconomicGraceTimeoutZeroesCredit(t *testing.T) {
+	t.Setenv("WEB4_CREDIT_UNVERIFIED", "10")
+	t.Setenv("WEB4_GRACE_SEC", "1")
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	selfPub := pubWithByte(17)
+	peerPub := pubWithByte(18)
+	selfID := node.DeriveNodeID(selfPub)
+	peerID := node.DeriveNodeID(peerPub)
+	if err := st.Upsert(peer.Peer{NodeID: peerID, PubKey: peerPub}, false); err != nil {
+		t.Fatalf("upsert peer failed: %v", err)
+	}
+	if err := st.ApplyEconomicDelta(selfID, map[[32]byte]int64{selfID: 5, peerID: -5}, false); err != nil {
+		t.Fatalf("initial debt apply failed: %v", err)
+	}
+	changed := st.EnforceEconomicGrace(time.Now().Add(2*time.Second), false)
+	if changed == 0 {
+		t.Fatalf("expected grace enforcement to change credit")
+	}
+	p, ok := st.Get(peerID)
+	if !ok {
+		t.Fatalf("peer missing")
+	}
+	if p.Economic.Credit != 0 {
+		t.Fatalf("expected credit=0 after grace timeout got %d", p.Economic.Credit)
+	}
+}
