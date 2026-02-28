@@ -425,7 +425,7 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 				cancel()
 				if err != nil {
 					if errors.Is(err, context.DeadlineExceeded) {
-						logInfo("quic accept stream timeout conn_id=%d since_last_stream=%s", connID, time.Since(lastStreamAt))
+						debugLog("quic accept stream timeout conn_id=%d since_last_stream=%s", connID, time.Since(lastStreamAt))
 						continue
 					}
 					if isBenignAcceptErr(err) {
@@ -616,7 +616,7 @@ func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, re
 				cancel()
 				if err != nil {
 					if errors.Is(err, context.DeadlineExceeded) {
-						logInfo("quic accept stream timeout conn_id=%d since_last_stream=%s", connID, time.Since(lastStreamAt))
+						debugLog("quic accept stream timeout conn_id=%d since_last_stream=%s", connID, time.Since(lastStreamAt))
 						continue
 					}
 					if isBenignAcceptErr(err) {

@@ -38,15 +38,11 @@ func (l *logger) start() {
 
 func Logf(format string, args ...any) {
 	msg := fmt.Sprintf(format+"\n", args...)
-	if !enabled() {
-		_, _ = os.Stderr.WriteString(msg)
-		return
-	}
 	global.start()
 	select {
 	case global.ch <- msg:
 	default:
-		// Drop when saturated to keep network goroutines non-blocking in debug mode.
+		// Drop when saturated to keep network goroutines non-blocking.
 	}
 }
 

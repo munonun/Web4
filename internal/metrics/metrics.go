@@ -1,8 +1,11 @@
 package metrics
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"hash/fnv"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -118,6 +121,9 @@ type Metrics struct {
 	snapMu              sync.RWMutex
 	lastSnap            Snapshot
 	lastSnapAt          time.Time
+	writeMu             sync.Mutex
+	lastWriteSig        uint64
+	lastWriteJSON       []byte
 }
 
 var rttBucketBounds = [...]time.Duration{
@@ -534,11 +540,124 @@ func (m *Metrics) WriteSnapshot(path string) error {
 		return nil
 	}
 	snap := m.CachedSnapshot(2 * time.Second)
-	data, err := json.MarshalIndent(snap, "", "  ")
+	sig := hashSnapshotNoTime(snap)
+	m.writeMu.Lock()
+	if sig == m.lastWriteSig && len(m.lastWriteJSON) > 0 {
+		m.writeMu.Unlock()
+		return nil
+	}
+	m.writeMu.Unlock()
+	data, err := json.Marshal(snap)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0600)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		return err
+	}
+	m.writeMu.Lock()
+	m.lastWriteSig = sig
+	m.lastWriteJSON = append(m.lastWriteJSON[:0], data...)
+	m.writeMu.Unlock()
+	return nil
+}
+
+func hashSnapshotNoTime(s Snapshot) uint64 {
+	h := fnv.New64a()
+	putUint64 := func(v uint64) {
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], v)
+		_, _ = h.Write(buf[:])
+	}
+	putInt64 := func(v int64) {
+		putUint64(uint64(v))
+	}
+	putString := func(v string) {
+		putUint64(uint64(len(v)))
+		if v != "" {
+			_, _ = h.Write([]byte(v))
+		}
+	}
+	putBool := func(v bool) {
+		if v {
+			putUint64(1)
+		} else {
+			putUint64(0)
+		}
+	}
+	hashMapU64 := func(m map[string]uint64) {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		putUint64(uint64(len(keys)))
+		for _, k := range keys {
+			putString(k)
+			putUint64(m[k])
+		}
+	}
+	hashMapI64 := func(m map[string]int64) {
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		putUint64(uint64(len(keys)))
+		for _, k := range keys {
+			putString(k)
+			putInt64(m[k])
+		}
+	}
+
+	putUint64(s.Delta.Verified)
+	putUint64(s.Delta.Relayed)
+	putUint64(s.Delta.DropDuplicate)
+	putUint64(s.Delta.DropRate)
+	putUint64(s.Delta.DropNonMember)
+	putUint64(s.Delta.DropZKFail)
+	putUint64(s.Gossip.Relayed)
+	putUint64(uint64(len(s.Recent)))
+	for _, r := range s.Recent {
+		putString(r.ScopeHash)
+		putString(r.ViewID)
+		putUint64(uint64(r.Entries))
+		putBool(r.Conserved)
+		putString(r.ZK)
+	}
+	hashMapU64(s.RecvByType)
+	hashMapU64(s.DropByReason)
+	putUint64(s.CurrentConns)
+	putUint64(s.CurrentStreams)
+	putUint64(s.PeerTableSize)
+	putUint64(s.OutboundConnected)
+	putUint64(s.InboundConnected)
+	putUint64(s.PexRequestsTotal)
+	putUint64(s.PexResponsesTotal)
+	putUint64(s.DialAttemptsTotal)
+	putUint64(s.DialSuccessTotal)
+	putUint64(s.PexReqSentTotal)
+	putUint64(s.PexRespRecvTotal)
+	putUint64(s.EvictionCountTotal)
+	hashMapU64(s.DialAttemptByReason)
+	hashMapU64(s.DialSuccessByReason)
+	hashMapU64(s.DialFailByReason)
+	putUint64(s.QuicConnectSuccessTotal)
+	putUint64(s.HelloHandshakeSuccessTotal)
+	putUint64(s.HelloHandshakeFailTotal)
+	hashMapU64(s.HelloHandshakeFailByReason)
+	putUint64(s.HelloSuccessTotal)
+	hashMapU64(s.HelloRejectByReason)
+	putUint64(s.CandidateAvailable)
+	putUint64(s.BackoffBlocked)
+	putUint64(s.SeedDialSkippedTotal)
+	putUint64(s.RecoveryPanicDials)
+	putBool(s.RecoveryModeActive)
+	putUint64(s.RecoveryEnterTotal)
+	putUint64(s.RecoveryExitTotal)
+	hashMapI64(s.RTTBucketsHandshake)
+	hashMapI64(s.RTTBucketsPex)
+	hashMapU64(s.SignTotalByAlg)
+	return h.Sum64()
 }
 
 type DeltaRecent struct {

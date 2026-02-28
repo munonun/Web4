@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -56,6 +57,8 @@ type connMan struct {
 	bootPeers []bootstrapPeer
 	dialLog   map[[32]byte]time.Time
 	addrLog   map[string]time.Time
+	addrNext  map[string]time.Time
+	dialSem   chan struct{}
 	recovery  connManRecovery
 }
 
@@ -112,6 +115,8 @@ func newConnMan(r *Runner, devTLS bool) *connMan {
 		bootPeers: bootstrapPeers(),
 		dialLog:   make(map[[32]byte]time.Time),
 		addrLog:   make(map[string]time.Time),
+		addrNext:  make(map[string]time.Time),
+		dialSem:   make(chan struct{}, dialConcurrency()),
 	}
 }
 
@@ -300,6 +305,12 @@ func (c *connMan) pickAndConnectWithMode(ctx context.Context, peers []peer.Peer,
 			}
 			continue
 		}
+		if !c.shouldTryAddr(addr, now, force) {
+			if c.metrics != nil {
+				c.metrics.IncBackoffBlocked()
+			}
+			continue
+		}
 		if c.isOutboundConnected(p.NodeID) {
 			continue
 		}
@@ -314,6 +325,9 @@ func (c *connMan) pickAndConnectWithMode(ctx context.Context, peers []peer.Peer,
 			c.metrics.IncDialAttemptByReason(dialReason)
 		}
 		if err := c.handshake(ctx, p.NodeID, addr, dialReason, force); err != nil {
+			if errors.Is(err, errDialAddrBackoff) {
+				continue
+			}
 			c.logDialError(p.NodeID, err)
 			if force {
 				c.logForcedDialDecision(dialReason, p, c.nextTryAt(p.NodeID), "fail", err.Error())
@@ -339,6 +353,10 @@ func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string, d
 	if c.self == nil {
 		return fmt.Errorf("missing node")
 	}
+	now := time.Now()
+	if !c.shouldTryAddr(addr, now, force) {
+		return errDialAddrBackoff
+	}
 	if c.metrics != nil {
 		c.metrics.IncDialAttemptsTotal()
 	}
@@ -358,6 +376,12 @@ func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string, d
 	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout())
 	defer cancel()
+	release, err := c.acquireDialSlot(ctx)
+	if err != nil {
+		return fmt.Errorf("dial slot: %w", err)
+	}
+	defer release()
+	c.markAddrAttempt(addr, now)
 	hsStarted := time.Now()
 	respData, err := network.ExchangeOnceWithContext(ctx, addr, data, false, c.devTLS, c.devTLSCA)
 	c.metrics.ObserveHandshakeRTT(time.Since(hsStarted))
@@ -417,6 +441,9 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	c.ensurePubKey()
 	if !c.self.Sessions.Has(p.NodeID) {
 		if err := c.handshake(ctx, p.NodeID, addr, dialReason("pex_handshake", p.Source), false); err != nil {
+			if errors.Is(err, errDialAddrBackoff) {
+				return err
+			}
 			c.markFailure(p.NodeID)
 			return err
 		}
@@ -452,8 +479,18 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	if err != nil {
 		return err
 	}
+	now := time.Now()
+	if !c.shouldTryAddr(addr, now, false) {
+		return errDialAddrBackoff
+	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout())
 	defer cancel()
+	release, err := c.acquireDialSlot(ctx)
+	if err != nil {
+		return fmt.Errorf("dial slot: %w", err)
+	}
+	defer release()
+	c.markAddrAttempt(addr, now)
 	pexStarted := time.Now()
 	respData, err := network.ExchangeOnceWithContext(ctx, addr, secureReq, false, c.devTLS, c.devTLSCA)
 	c.metrics.ObservePexRTT(time.Since(pexStarted))
@@ -497,6 +534,10 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		if !isValidAddr(addr) {
 			continue
 		}
+		now := time.Now()
+		if !c.shouldTryAddr(addr, now, false) {
+			continue
+		}
 		if c.metrics != nil {
 			c.metrics.IncPexRequestsTotal()
 			c.metrics.IncPexReqSentTotal()
@@ -523,8 +564,15 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			continue
 		}
 		reqCtx, cancel := context.WithTimeout(ctx, dialTimeout())
+		release, slotErr := c.acquireDialSlot(reqCtx)
+		if slotErr != nil {
+			cancel()
+			continue
+		}
+		c.markAddrAttempt(addr, now)
 		pexStarted := time.Now()
 		respData, err := network.ExchangeOnceWithContext(reqCtx, addr, data, false, c.devTLS, c.devTLSCA)
+		release()
 		c.metrics.ObservePexRTT(time.Since(pexStarted))
 		cancel()
 		if err != nil {
@@ -684,6 +732,44 @@ func (c *connMan) shouldTry(id [32]byte, now time.Time, force bool) bool {
 	return now.After(next)
 }
 
+func (c *connMan) shouldTryAddr(addr string, now time.Time, force bool) bool {
+	if addr == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next, ok := c.addrNext[addr]
+	if !ok {
+		return true
+	}
+	// Forced dials still obey per-address minimum retry to avoid thundering-herd retries.
+	_ = force
+	return now.After(next)
+}
+
+func (c *connMan) markAddrAttempt(addr string, now time.Time) {
+	if addr == "" {
+		return
+	}
+	c.mu.Lock()
+	c.addrNext[addr] = now.Add(dialAddrMinRetry())
+	c.mu.Unlock()
+}
+
+func (c *connMan) acquireDialSlot(ctx context.Context) (func(), error) {
+	if c == nil || c.dialSem == nil {
+		return func() {}, nil
+	}
+	select {
+	case c.dialSem <- struct{}{}:
+		return func() {
+			<-c.dialSem
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func nextBackoffDuration(self *node.Node, id [32]byte, rng *rand.Rand) time.Duration {
 	return nextBackoffDurationWithCap(self, id, rng, maxBackoff())
 }
@@ -747,6 +833,7 @@ func recoveryBackoffCap() time.Duration {
 }
 
 var connManDialHook func()
+var errDialAddrBackoff = errors.New("dial addr backoff")
 
 const dialLogTTL = 30 * time.Second
 
@@ -830,6 +917,20 @@ func dialTimeout() time.Duration {
 		return time.Duration(v) * time.Millisecond
 	}
 	return 8 * time.Second
+}
+
+func dialConcurrency() int {
+	if v, ok := envInt("WEB4_DIAL_CONCURRENCY"); ok && v > 0 {
+		return v
+	}
+	return 8
+}
+
+func dialAddrMinRetry() time.Duration {
+	if v, ok := envInt("WEB4_DIAL_MIN_RETRY_MS"); ok && v > 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return 500 * time.Millisecond
 }
 
 func peertableMax() int {
@@ -1003,6 +1104,9 @@ func (c *connMan) panicDialTick(ctx context.Context) {
 			c.metrics.IncDialAttemptByReason(reason)
 		}
 		if err := c.handshake(ctx, bp.id, bp.addr, reason, true); err != nil {
+			if errors.Is(err, errDialAddrBackoff) {
+				continue
+			}
 			c.logForcedDialDecision(reason, p, c.nextTryAt(bp.id), "fail", err.Error())
 			c.logDialError(bp.id, err)
 			if c.metrics != nil {

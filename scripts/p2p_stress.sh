@@ -34,7 +34,26 @@ cd "${REPO_ROOT}"
 : "${P2P_STRESS_SCENARIOS:=all}"
 : "${P2P_STRESS_PPROF:=0}"
 : "${P2P_STRESS_PPROF_ADDR:=127.0.0.1:6060}"
+: "${P2P_STRESS_MUTEX_PROFILE_FRACTION:=0}"
+: "${P2P_STRESS_BLOCK_PROFILE_RATE:=0}"
 : "${P2P_STRESS_KEEPALIVE:=0}"
+
+# Backward-compatible env mapping for users who pass WEB4_* directly.
+if [[ "${P2P_STRESS_PPROF}" != "1" && "${WEB4_PPROF:-}" == "1" ]]; then
+  P2P_STRESS_PPROF=1
+fi
+if [[ -n "${WEB4_PPROF_ADDR:-}" && "${P2P_STRESS_PPROF_ADDR}" == "127.0.0.1:6060" ]]; then
+  P2P_STRESS_PPROF_ADDR="${WEB4_PPROF_ADDR}"
+fi
+if [[ "${P2P_STRESS_MUTEX_PROFILE_FRACTION}" == "0" && -n "${WEB4_MUTEX_PROFILE_FRACTION:-}" ]]; then
+  P2P_STRESS_MUTEX_PROFILE_FRACTION="${WEB4_MUTEX_PROFILE_FRACTION}"
+fi
+if [[ "${P2P_STRESS_BLOCK_PROFILE_RATE}" == "0" && -n "${WEB4_BLOCK_PROFILE_RATE:-}" ]]; then
+  P2P_STRESS_BLOCK_PROFILE_RATE="${WEB4_BLOCK_PROFILE_RATE}"
+fi
+
+# Prevent parent WEB4_* profiler env from leaking into every subprocess.
+unset WEB4_PPROF WEB4_PPROF_ADDR WEB4_MUTEX_PROFILE_FRACTION WEB4_BLOCK_PROFILE_RATE
 RTT_METRICS_ENABLED=0
 if [[ "${WEB4_RTT_METRICS:-}" == "1" ]]; then
   RTT_METRICS_ENABLED=1
@@ -878,8 +897,17 @@ start_node() {
   if [[ -n "${bootstrap_addr}" ]]; then
     envs+=("WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr}")
   fi
-  if [[ "${idx}" == "0" && "${P2P_STRESS_PPROF}" == "1" ]]; then
-    envs+=("WEB4_PPROF=1" "WEB4_PPROF_ADDR=${P2P_STRESS_PPROF_ADDR}")
+  if [[ "${P2P_STRESS_PPROF}" == "1" ]]; then
+    if [[ "${idx}" == "0" ]]; then
+      envs+=(
+        "WEB4_PPROF=1"
+        "WEB4_PPROF_ADDR=${P2P_STRESS_PPROF_ADDR}"
+        "WEB4_MUTEX_PROFILE_FRACTION=${P2P_STRESS_MUTEX_PROFILE_FRACTION}"
+        "WEB4_BLOCK_PROFILE_RATE=${P2P_STRESS_BLOCK_PROFILE_RATE}"
+      )
+    else
+      envs+=("WEB4_PPROF=0")
+    fi
   fi
   if [[ "${idx}" == "0" && "${RTT_METRICS_ENABLED}" == "1" && "${WEB4_METRICS_DISK_WRITE_SEC_IS_SET}" != "1" ]]; then
     envs+=("WEB4_METRICS_DISK_WRITE_SEC=1")

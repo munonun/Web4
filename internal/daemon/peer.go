@@ -115,7 +115,7 @@ func (r *Runner) StartSnapshotWriter(interval time.Duration) {
 	if interval <= 0 {
 		interval = time.Second
 	}
-	diskWriteEvery := envIntDefaultLocal("WEB4_METRICS_DISK_WRITE_SEC", 1)
+	diskWriteEvery := envIntDefaultLocal("WEB4_METRICS_DISK_WRITE_SEC", 2)
 	if diskWriteEvery < 0 {
 		diskWriteEvery = 0
 	}
