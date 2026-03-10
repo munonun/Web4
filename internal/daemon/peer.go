@@ -209,10 +209,14 @@ func (r *Runner) HandleRaw(data []byte) error {
 }
 
 func (r *Runner) Run(addr string, devTLS bool) error {
-	return r.RunWithContext(context.Background(), addr, devTLS, nil)
+	return r.RunWithTLSContext(context.Background(), addr, devTLS, nil, "", "")
 }
 
 func (r *Runner) RunWithContext(ctx context.Context, addr string, devTLS bool, ready chan<- string) error {
+	return r.RunWithTLSContext(ctx, addr, devTLS, ready, "", "")
+}
+
+func (r *Runner) RunWithTLSContext(ctx context.Context, addr string, devTLS bool, ready chan<- string, tlsCertPath string, tlsKeyPath string) error {
 	if r == nil {
 		return fmt.Errorf("missing runner")
 	}
@@ -220,7 +224,7 @@ func (r *Runner) RunWithContext(ctx context.Context, addr string, devTLS bool, r
 	internalReady := make(chan string, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- network.ListenAndServeWithResponderFromContext(ctx, addr, internalReady, devTLS, func(senderAddr string, data []byte) ([]byte, error) {
+		errCh <- network.ListenAndServeWithResponderFromContextTLS(ctx, addr, internalReady, devTLS, tlsCertPath, tlsKeyPath, func(senderAddr string, data []byte) ([]byte, error) {
 			resp, _, err := r.recvDataWithResponse(data, senderAddr)
 			if err != nil {
 				if os.Getenv("WEB4_DEBUG") == "1" {
@@ -257,6 +261,17 @@ func (r *Runner) RunWithContext(ctx context.Context, addr string, devTLS bool, r
 	err := <-errCh
 	r.StopSnapshotWriter()
 	return err
+}
+
+func (r *Runner) RunOutboundOnlyWithContext(ctx context.Context, devTLS bool) error {
+	if r == nil {
+		return fmt.Errorf("missing runner")
+	}
+	r.StartSnapshotWriter(time.Second)
+	startConnManAfterReady(ctx, r, devTLS)
+	<-ctx.Done()
+	r.StopSnapshotWriter()
+	return ctx.Err()
 }
 
 func (r *Runner) setListenAddr(addr string) {
@@ -602,6 +617,9 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 
 	switch hdr.Type {
 	case proto.MsgTypeHello1:
+		if nodeMode() == nodeModeBootstrap {
+			return nil, false, reject("bootstrap discovery-only", errors.New("bootstrap discovery-only: hello forbidden"))
+		}
 		m, err := proto.DecodeHello1Msg(data)
 		if err != nil {
 			return nil, false, reject("decode hello1 failed", err)
@@ -644,6 +662,9 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 		return out, true, nil
 
 	case proto.MsgTypeHello2:
+		if nodeMode() == nodeModeBootstrap {
+			return nil, false, reject("bootstrap discovery-only", errors.New("bootstrap discovery-only: hello forbidden"))
+		}
 		m, err := proto.DecodeHello2Msg(data)
 		if err != nil {
 			return nil, false, reject("decode hello2 failed", err)
@@ -1628,6 +1649,13 @@ func handleGossipPushInner(msg proto.GossipPushMsg, data []byte, st *store.Store
 	if os.Getenv("WEB4_DEBUG") == "1" {
 		gossipDebugf("gossip_push opened payload_len=%d type=%s", len(envelope), hdr.Type)
 	}
+	if isForbiddenGossipInnerType(hdr.Type) {
+		err := fmt.Errorf("forbidden type")
+		gossipDebugf("DROP hello via gossip: to_id mismatch / forbidden type inner_type=%s", hdr.Type)
+		drop("forbidden_hello_via_gossip", hdr.Type, err)
+		check6Drop(msgID, "forbidden_type", hdr.Type)
+		return false, &recvError{msg: "gossip payload failed", err: err}
+	}
 	var hash [32]byte
 	hashInput := make([]byte, 0, len(envelope)+len(self.ID))
 	hashInput = append(hashInput, envelope...)
@@ -1663,6 +1691,11 @@ func handleGossipPushInner(msg proto.GossipPushMsg, data []byte, st *store.Store
 func forwardGossip(msg proto.GossipPushMsg, envelope []byte, innerType string, msgID string, self *node.Node, senderAddr string) {
 	if self == nil || self.Peers == nil {
 		check6Drop(msgID, "no_members", "peer store unavailable")
+		return
+	}
+	if isForbiddenGossipInnerType(innerType) {
+		gossipDebugf("DROP hello via gossip: to_id mismatch / forbidden type inner_type=%s", innerType)
+		check6Drop(msgID, "forbidden_type", innerType)
 		return
 	}
 	hops := msg.Hops
@@ -2154,6 +2187,15 @@ func requiredMemberScope(msgType string) (uint32, bool) {
 func isBootstrapDiscoveryType(msgType string) bool {
 	switch msgType {
 	case proto.MsgTypeHello1, proto.MsgTypeHello2, proto.MsgTypePeerExchangeReq, proto.MsgTypePeerExchangeResp:
+		return true
+	default:
+		return false
+	}
+}
+
+func isForbiddenGossipInnerType(msgType string) bool {
+	switch msgType {
+	case proto.MsgTypeHello1, proto.MsgTypeHello2:
 		return true
 	default:
 		return false

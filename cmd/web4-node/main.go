@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -79,7 +80,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: web4-node [run|status|peers|members|delta|field|pay|wallet] [args]")
 	fmt.Fprintln(w, "  (no args) starts interactive peer mode")
-	fmt.Fprintln(w, "  run    --addr <ip:port> [--devtls] [--debug] [--bootstrap] (interactive if TTY)")
+	fmt.Fprintln(w, "  run    --addr <ip:port> [--devtls] [--tls-cert <pem> --tls-key <pem>] [--outbound-only] [--debug] [--bootstrap] (interactive if TTY)")
 	fmt.Fprintln(w, "  status")
 	fmt.Fprintln(w, "  peers")
 	fmt.Fprintln(w, "  members")
@@ -106,6 +107,9 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	addr := fs.String("addr", "", "listen addr (host:port)")
 	devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
+	tlsCert := fs.String("tls-cert", "", "TLS certificate chain PEM path (e.g. fullchain.pem)")
+	tlsKey := fs.String("tls-key", "", "TLS private key PEM path (e.g. privkey.pem)")
+	outboundOnly := fs.Bool("outbound-only", false, "client-only mode: no listener, outbound connman/pex only")
 	debug := fs.Bool("debug", false, "enable debug logging")
 	bootstrap := fs.Bool("bootstrap", false, "run in bootstrap mode (stricter limits)")
 	if err := fs.Parse(args); err != nil {
@@ -114,22 +118,28 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	if *bootstrap && os.Getenv("WEB4_NODE_MODE") == "" {
 		_ = os.Setenv("WEB4_NODE_MODE", "bootstrap")
 	}
-	if *addr == "" {
-		fmt.Fprintln(stderr, "missing --addr")
-		return 1
-	}
 	if *debug {
 		_ = os.Setenv("WEB4_DEBUG", "1")
 	}
-	if !*devTLS {
-		color.New(color.FgYellow).Fprintln(stderr, "dev TLS disabled by default; pass --devtls to enable")
+	outboundOnlyEnabled := *outboundOnly || strings.TrimSpace(os.Getenv("WEB4_OUTBOUND_ONLY")) == "1"
+	if err := validateRunTLSConfig(outboundOnlyEnabled, *devTLS, *tlsCert, *tlsKey); err != nil {
+		fmt.Fprintln(stderr, err.Error())
 		return 1
 	}
-	color.New(color.FgYellow).Fprintln(stderr, "WARNING: using deterministic dev TLS certificates")
-	if isInteractive() {
-		return runInteractiveWithAddr(stdout, stderr, *addr, *devTLS)
+	if *devTLS && strings.TrimSpace(*tlsCert) == "" {
+		color.New(color.FgYellow).Fprintln(stderr, "WARNING: using deterministic dev TLS certificates")
 	}
-	runner, readyAddr, errCh, err := startRunner(context.Background(), *addr, *devTLS)
+	if isInteractive() && !outboundOnlyEnabled {
+		return runInteractiveWithAddr(stdout, stderr, *addr, *devTLS, *tlsCert, *tlsKey)
+	}
+	if outboundOnlyEnabled && *addr == "" {
+		*addr = "outbound-only"
+	}
+	if !outboundOnlyEnabled && *addr == "" {
+		fmt.Fprintln(stderr, "missing --addr")
+		return 1
+	}
+	runner, readyAddr, errCh, err := startRunner(context.Background(), *addr, *devTLS, *tlsCert, *tlsKey, outboundOnlyEnabled)
 	if err != nil {
 		fmt.Fprintf(stderr, "load node failed: %v\n", err)
 		return 1
@@ -139,12 +149,28 @@ func runNode(args []string, stdout, stderr io.Writer) int {
 	printWalletLine(stdout, runner.Self)
 	printModeSummary(stderr, runner.Mode)
 	fmt.Fprintf(stdout, "READY addr=%s node_id=%s\n", readyAddr, hex.EncodeToString(runner.Self.ID[:]))
-	startBootstrapConnections(context.Background(), runner.Self, *devTLS)
+	if !outboundOnlyEnabled {
+		startBootstrapConnections(context.Background(), runner.Self, *devTLS)
+	}
 	if err := <-errCh; err != nil {
-		fmt.Fprintf(stderr, "run failed: %v\n", err)
-		return 1
+		if !outboundOnlyEnabled || !errors.Is(err, context.Canceled) {
+			fmt.Fprintf(stderr, "run failed: %v\n", err)
+			return 1
+		}
 	}
 	return 0
+}
+
+func validateRunTLSConfig(outboundOnly bool, devTLS bool, tlsCertPath string, tlsKeyPath string) error {
+	tlsCertPath = strings.TrimSpace(tlsCertPath)
+	tlsKeyPath = strings.TrimSpace(tlsKeyPath)
+	if (tlsCertPath == "") != (tlsKeyPath == "") {
+		return fmt.Errorf("invalid TLS config: both --tls-cert and --tls-key are required together")
+	}
+	if !outboundOnly && !devTLS && tlsCertPath == "" {
+		return fmt.Errorf("missing TLS mode: provide --devtls or both --tls-cert and --tls-key")
+	}
+	return nil
 }
 
 func runStatus(args []string, stdout, _ io.Writer) int {
@@ -882,10 +908,6 @@ func runPay(args []string, stdout, stderr io.Writer) int {
 	}
 	color.New(color.FgGreen).Fprintf(stdout, "OK claim stored id=%s delta_id=%s\n", claim.ID, claim.DeltaID)
 	if *send {
-		if !*devTLS {
-			color.New(color.FgYellow).Fprintln(stderr, "dev TLS disabled by default; pass --devtls to enable")
-			return 1
-		}
 		if toAddr == "" {
 			color.New(color.FgRed).Fprintln(stderr, "pay: recipient addr unknown (not in peers list)")
 			return 1
@@ -1020,17 +1042,19 @@ func runInteractive(stdout, stderr io.Writer) int {
 	if addr == "" {
 		addr = "127.0.0.1:0"
 	}
-	return runInteractiveWithAddr(stdout, stderr, addr, true)
+	return runInteractiveWithAddr(stdout, stderr, addr, true, "", "")
 }
 
-func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool) int {
+func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool, tlsCertPath string, tlsKeyPath string) int {
 	if os.Getenv("WEB4_DEBUG") == "1" {
 		_ = os.Setenv("WEB4_DEBUG", "1")
 	}
-	color.New(color.FgYellow).Fprintln(stderr, "WARNING: using deterministic dev TLS certificates")
+	if devTLS && strings.TrimSpace(tlsCertPath) == "" {
+		color.New(color.FgYellow).Fprintln(stderr, "WARNING: using deterministic dev TLS certificates")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	runner, _, errCh, err := startRunner(ctx, addr, devTLS)
+	runner, _, errCh, err := startRunner(ctx, addr, devTLS, tlsCertPath, tlsKeyPath, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "load node failed: %v\n", err)
 		return 1
@@ -1089,7 +1113,7 @@ func runInteractiveWithAddr(stdout, stderr io.Writer, addr string, devTLS bool) 
 	return 0
 }
 
-func startRunner(ctx context.Context, addr string, devTLS bool) (*daemon.Runner, string, <-chan error, error) {
+func startRunner(ctx context.Context, addr string, devTLS bool, tlsCertPath string, tlsKeyPath string, outboundOnly bool) (*daemon.Runner, string, <-chan error, error) {
 	root := homeDir()
 	_ = os.Setenv("WEB4_SUPPRESS_READY", "1")
 	runner, err := daemon.NewRunner(root, daemon.Options{Metrics: metrics.New()})
@@ -1102,12 +1126,20 @@ func startRunner(ctx context.Context, addr string, devTLS bool) (*daemon.Runner,
 	ready := make(chan string, 1)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- runner.RunWithContext(ctx, addr, devTLS, ready)
+		if outboundOnly {
+			errCh <- runner.RunOutboundOnlyWithContext(ctx, devTLS)
+			return
+		}
+		errCh <- runner.RunWithTLSContext(ctx, addr, devTLS, ready, tlsCertPath, tlsKeyPath)
 	}()
 	readyAddr := addr
-	select {
-	case readyAddr = <-ready:
-	case <-time.After(2 * time.Second):
+	if outboundOnly {
+		readyAddr = "outbound-only"
+	} else {
+		select {
+		case readyAddr = <-ready:
+		case <-time.After(2 * time.Second):
+		}
 	}
 	return runner, readyAddr, errCh, nil
 }
@@ -1247,6 +1279,10 @@ func handshakeWithPeer(ctx context.Context, self *node.Node, peerID [32]byte, ad
 	if self == nil {
 		return fmt.Errorf("missing node")
 	}
+	debugOutboundHelloTarget(addr, peerID)
+	if err := validateOutboundHelloTarget(self, peerID, addr); err != nil {
+		return err
+	}
 	hello1, err := self.BuildHello1(peerID)
 	if err != nil {
 		return err
@@ -1269,6 +1305,74 @@ func handshakeWithPeer(ctx context.Context, self *node.Node, peerID [32]byte, ad
 		return err
 	}
 	return self.HandleHello2(hello2)
+}
+
+func validateOutboundHelloTarget(self *node.Node, peerID [32]byte, addr string) error {
+	if self == nil || self.Peers == nil || isZeroNodeID(peerID) {
+		return nil
+	}
+	targetAddr := strings.TrimSpace(addr)
+	if targetAddr == "" {
+		return nil
+	}
+	if isBootstrapAddr(targetAddr) {
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(
+				os.Stderr,
+				"DROP outbound hello1: target addr / to_id mismatch addr=%s target_peer_id=%x bootstrap=true\n",
+				targetAddr, peerID[:],
+			)
+		}
+		return fmt.Errorf("outbound hello1 target mismatch")
+	}
+	for _, p := range self.Peers.List() {
+		if strings.TrimSpace(p.DialAddr) != "" {
+			if strings.TrimSpace(p.DialAddr) != targetAddr {
+				continue
+			}
+		} else if strings.TrimSpace(p.Addr) != targetAddr {
+			continue
+		}
+		if p.NodeID == peerID {
+			return nil
+		}
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(
+				os.Stderr,
+				"DROP outbound hello1: target addr / to_id mismatch addr=%s addr_node_id=%x hello_to_id=%x source=%s\n",
+				targetAddr, p.NodeID[:], peerID[:], p.Source,
+			)
+		}
+		return fmt.Errorf("outbound hello1 target mismatch")
+	}
+	return nil
+}
+
+func debugOutboundHelloTarget(addr string, peerID [32]byte) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(
+		os.Stderr,
+		"outbound hello1 target addr=%s target_peer_id=%x bootstrap=%t\n",
+		strings.TrimSpace(addr), peerID[:], isBootstrapAddr(addr),
+	)
+}
+
+func isBootstrapAddr(addr string) bool {
+	targetAddr := strings.TrimSpace(addr)
+	for _, bp := range parseBootstrapPeers() {
+		if strings.TrimSpace(bp.addr) == targetAddr {
+			return true
+		}
+	}
+	addrs := strings.Split(strings.TrimSpace(os.Getenv("WEB4_BOOTSTRAP_ADDRS")), ",")
+	for _, seedAddr := range addrs {
+		if strings.TrimSpace(seedAddr) == targetAddr {
+			return true
+		}
+	}
+	return false
 }
 
 type replHandlers struct {

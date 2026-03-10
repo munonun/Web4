@@ -10,8 +10,8 @@ import (
 	"web4mvp/internal/proto"
 )
 
-func TestGossipHello1RateLimitedBeforeVerify(t *testing.T) {
-	// Keep this test lightweight while validating limiter order on gossip hello1.
+func TestGossipHello1ForbiddenBeforeVerify(t *testing.T) {
+	// Hello messages must never be processed through gossip forwarding.
 	t.Setenv("WEB4_HANDSHAKE_DISABLE_SUITE0", "1")
 	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
 
@@ -58,8 +58,7 @@ func TestGossipHello1RateLimitedBeforeVerify(t *testing.T) {
 	peerB := peer.Peer{NodeID: selfB.ID, PubKey: selfB.PubKey}
 
 	const attempts = 6
-	rateLimited := 0
-	verifyFailed := 0
+	forbidden := 0
 	for i := 0; i < attempts; i++ {
 		hello1, err := selfD.BuildHello1(selfA.ID)
 		if err != nil {
@@ -89,24 +88,18 @@ func TestGossipHello1RateLimitedBeforeVerify(t *testing.T) {
 			t.Fatalf("expected gossip payload failure")
 		}
 		errText := strings.ToLower(recvErr.err.Error())
-		if strings.Contains(errText, "rate") {
-			rateLimited++
-		}
-		if strings.Contains(errText, "bad hello1 signature") {
-			verifyFailed++
+		if strings.Contains(errText, "forbidden type") {
+			forbidden++
 		}
 	}
 
-	if rateLimited < attempts-2 {
-		t.Fatalf("expected most attempts to be rate-limited, got %d/%d", rateLimited, attempts)
-	}
-	if verifyFailed > 1 {
-		t.Fatalf("expected at most one verify failure, got %d", verifyFailed)
+	if forbidden != attempts {
+		t.Fatalf("expected all attempts to be forbidden, got %d/%d", forbidden, attempts)
 	}
 	debugCount.mu.Lock()
 	verifyCount := debugCount.verifyFail["hello1"]
 	debugCount.mu.Unlock()
-	if verifyCount > 1 {
-		t.Fatalf("expected hello1 verify counter <= 1, got %d", verifyCount)
+	if verifyCount != 0 {
+		t.Fatalf("expected hello1 verify counter 0, got %d", verifyCount)
 	}
 }

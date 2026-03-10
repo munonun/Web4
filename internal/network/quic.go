@@ -127,21 +127,34 @@ func devTLSCertIPs() []net.IP {
 	return out
 }
 
-func serverTLSConfig(devTLS bool) (*tls.Config, error) {
+func serverTLSConfig(devTLS bool, tlsCertPath string, tlsKeyPath string) (*tls.Config, error) {
+	tlsCertPath = strings.TrimSpace(tlsCertPath)
+	tlsKeyPath = strings.TrimSpace(tlsKeyPath)
+	if (tlsCertPath == "") != (tlsKeyPath == "") {
+		return nil, fmt.Errorf("both tls cert and key are required")
+	}
 	var cert tls.Certificate
-	if devTLS {
+	if tlsCertPath != "" && tlsKeyPath != "" {
+		loaded, err := tls.LoadX509KeyPair(tlsCertPath, tlsKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("load tls cert/key: %w", err)
+		}
+		cert = loaded
+	} else if devTLS {
 		if loaded, ok, err := loadDevTLSCertFromConfiguredPaths(); err != nil {
 			return nil, err
 		} else if ok {
 			cert = loaded
 		}
-	}
-	if len(cert.Certificate) == 0 {
-		var err error
-		cert, _, err = devTLSCert()
-		if err != nil {
-			return nil, err
+		if len(cert.Certificate) == 0 {
+			var err error
+			cert, _, err = devTLSCert()
+			if err != nil {
+				return nil, err
+			}
 		}
+	} else {
+		return nil, fmt.Errorf("tls cert/key required unless --devtls is enabled")
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -344,13 +357,22 @@ func ListenAndServeWithResponder(addr string, ready chan<- struct{}, devTLS bool
 }
 
 func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS bool, handle func(string, []byte) ([]byte, error)) error {
+	return ListenAndServeWithResponderFromTLS(addr, ready, devTLS, "", "", handle)
+}
+
+func ListenAndServeWithResponderFromTLS(addr string, ready chan<- struct{}, devTLS bool, tlsCertPath string, tlsKeyPath string, handle func(string, []byte) ([]byte, error)) error {
+	if devTLS {
+		if strings.TrimSpace(tlsCertPath) != "" || strings.TrimSpace(tlsKeyPath) != "" {
+			devTLS = false
+		}
+	}
 	if devTLS {
 		if err := ensureDevTLSCA(); err != nil {
 			return err
 		}
 	}
 	refreshLimits()
-	tlsConf, err := serverTLSConfig(devTLS)
+	tlsConf, err := serverTLSConfig(devTLS, tlsCertPath, tlsKeyPath)
 	if err != nil {
 		return err
 	}
@@ -524,13 +546,22 @@ func ListenAndServeWithResponderFrom(addr string, ready chan<- struct{}, devTLS 
 }
 
 func ListenAndServeWithResponderFromContext(ctx context.Context, addr string, ready chan<- string, devTLS bool, handle func(string, []byte) ([]byte, error)) error {
+	return ListenAndServeWithResponderFromContextTLS(ctx, addr, ready, devTLS, "", "", handle)
+}
+
+func ListenAndServeWithResponderFromContextTLS(ctx context.Context, addr string, ready chan<- string, devTLS bool, tlsCertPath string, tlsKeyPath string, handle func(string, []byte) ([]byte, error)) error {
+	if devTLS {
+		if strings.TrimSpace(tlsCertPath) != "" || strings.TrimSpace(tlsKeyPath) != "" {
+			devTLS = false
+		}
+	}
 	if devTLS {
 		if err := ensureDevTLSCA(); err != nil {
 			return err
 		}
 	}
 	refreshLimits()
-	tlsConf, err := serverTLSConfig(devTLS)
+	tlsConf, err := serverTLSConfig(devTLS, tlsCertPath, tlsKeyPath)
 	if err != nil {
 		return err
 	}

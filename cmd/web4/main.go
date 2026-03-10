@@ -218,6 +218,10 @@ func handshakeWithPeerWithExchange(self *node.Node, peerID [32]byte, addr string
 	if exchange == nil {
 		return fmt.Errorf("missing exchange")
 	}
+	debugOutboundHelloTarget(addr, peerID)
+	if err := validateOutboundHelloTarget(self, peerID, addr); err != nil {
+		return err
+	}
 	const maxAttempts = 3
 	backoff := 100 * time.Millisecond
 	var lastErr error
@@ -286,6 +290,77 @@ func handshakeWithPeerWithExchange(self *node.Node, peerID [32]byte, addr string
 		return lastErr
 	}
 	return fmt.Errorf("handshake failed")
+}
+
+func validateOutboundHelloTarget(self *node.Node, peerID [32]byte, addr string) error {
+	if self == nil || self.Peers == nil || isZeroNodeID(peerID) {
+		return nil
+	}
+	targetAddr := strings.TrimSpace(addr)
+	if targetAddr == "" {
+		return nil
+	}
+	if isBootstrapAddr(targetAddr) {
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(
+				os.Stderr,
+				"DROP outbound hello1: target addr / to_id mismatch addr=%s target_peer_id=%x bootstrap=true\n",
+				targetAddr, peerID[:],
+			)
+		}
+		return fmt.Errorf("outbound hello1 target mismatch")
+	}
+	for _, p := range self.Peers.List() {
+		pAddr := strings.TrimSpace(p.DialAddr)
+		if pAddr == "" {
+			pAddr = strings.TrimSpace(p.Addr)
+		}
+		if pAddr != targetAddr {
+			continue
+		}
+		if p.NodeID == peerID {
+			return nil
+		}
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(
+				os.Stderr,
+				"DROP outbound hello1: target addr / to_id mismatch addr=%s addr_node_id=%x hello_to_id=%x source=%s\n",
+				targetAddr, p.NodeID[:], peerID[:], p.Source,
+			)
+		}
+		return fmt.Errorf("outbound hello1 target mismatch")
+	}
+	return nil
+}
+
+func debugOutboundHelloTarget(addr string, peerID [32]byte) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(
+		os.Stderr,
+		"outbound hello1 target addr=%s target_peer_id=%x bootstrap=%t\n",
+		strings.TrimSpace(addr), peerID[:], isBootstrapAddr(addr),
+	)
+}
+
+func isBootstrapAddr(addr string) bool {
+	targetAddr := strings.TrimSpace(addr)
+	addrs := strings.Split(strings.TrimSpace(os.Getenv("WEB4_BOOTSTRAP_ADDRS")), ",")
+	ids := strings.Split(strings.TrimSpace(os.Getenv("WEB4_BOOTSTRAP_IDS")), ",")
+	if len(addrs) == len(ids) {
+		for i := range addrs {
+			if strings.TrimSpace(addrs[i]) == targetAddr {
+				return true
+			}
+		}
+	}
+	for _, seedAddr := range addrs {
+		if strings.TrimSpace(seedAddr) == targetAddr {
+			return true
+		}
+	}
+	return false
 }
 
 type recvError struct {
@@ -1718,6 +1793,13 @@ func handleGossipPushInner(msg proto.GossipPushMsg, data []byte, st *store.Store
 	if os.Getenv("WEB4_DEBUG") == "1" {
 		gossipDebugf("gossip_push opened payload_len=%d type=%s", len(envelope), hdr.Type)
 	}
+	if isForbiddenGossipInnerType(hdr.Type) {
+		err := fmt.Errorf("forbidden type")
+		gossipDebugf("DROP hello via gossip: to_id mismatch / forbidden type inner_type=%s", hdr.Type)
+		drop("forbidden_hello_via_gossip", hdr.Type, err)
+		check6Drop(msgID, "forbidden_type", hdr.Type)
+		return false, &recvError{msg: "gossip payload failed", err: err}
+	}
 	var hash [32]byte
 	hashInput := make([]byte, 0, len(envelope)+len(self.ID))
 	hashInput = append(hashInput, envelope...)
@@ -1753,6 +1835,11 @@ func handleGossipPushInner(msg proto.GossipPushMsg, data []byte, st *store.Store
 func forwardGossip(msg proto.GossipPushMsg, envelope []byte, innerType string, msgID string, self *node.Node, senderAddr string) {
 	if self == nil || self.Peers == nil {
 		check6Drop(msgID, "no_members", "peer store unavailable")
+		return
+	}
+	if isForbiddenGossipInnerType(innerType) {
+		gossipDebugf("DROP hello via gossip: to_id mismatch / forbidden type inner_type=%s", innerType)
+		check6Drop(msgID, "forbidden_type", innerType)
 		return
 	}
 	hops := msg.Hops
@@ -2881,6 +2968,15 @@ func requiredMemberScope(msgType string) (uint32, bool) {
 	}
 }
 
+func isForbiddenGossipInnerType(msgType string) bool {
+	switch msgType {
+	case proto.MsgTypeHello1, proto.MsgTypeHello2:
+		return true
+	default:
+		return false
+	}
+}
+
 func validateInviteCert(cert proto.InviteCert, invites *peer.InviteStore, now time.Time) ([32]byte, [32]byte, error) {
 	var zero [32]byte
 	if len(cert.InviteePub) == 0 {
@@ -3427,20 +3523,27 @@ func main() {
 		addr := fs.String("addr", "", "listen addr (host:port)")
 		_ = fs.Bool("insecure", false, "skip certificate verification (client only)")
 		devTLS := fs.Bool("devtls", false, "allow deterministic dev TLS certs (unsafe)")
+		tlsCert := fs.String("tls-cert", "", "TLS certificate chain PEM path (e.g. fullchain.pem)")
+		tlsKey := fs.String("tls-key", "", "TLS private key PEM path (e.g. privkey.pem)")
 		_ = fs.Parse(os.Args[2:])
 		if *addr == "" {
 			die("missing --addr", fmt.Errorf("address required"))
 		}
-		if !*devTLS {
-			dieMsg("dev TLS disabled by default; pass --devtls to enable")
+		if (strings.TrimSpace(*tlsCert) == "") != (strings.TrimSpace(*tlsKey) == "") {
+			die("invalid TLS config", fmt.Errorf("both --tls-cert and --tls-key are required together"))
 		}
-		fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
+		if !*devTLS && strings.TrimSpace(*tlsCert) == "" {
+			die("missing TLS mode", fmt.Errorf("provide --devtls or both --tls-cert and --tls-key"))
+		}
+		if *devTLS && strings.TrimSpace(*tlsCert) == "" {
+			fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
+		}
 		fmt.Println("QUIC LISTEN", *addr)
 		runner, err := daemon.NewRunner(root, daemon.Options{Store: st, Checker: checker})
 		if err != nil {
 			die("load keys failed", err)
 		}
-		if err := runner.Run(*addr, *devTLS); err != nil {
+		if err := runner.RunWithTLSContext(context.Background(), *addr, *devTLS, nil, *tlsCert, *tlsKey); err != nil {
 			die("quic listen failed", err)
 		}
 
@@ -3458,10 +3561,9 @@ func main() {
 		if *inPath == "" {
 			die("missing --in", fmt.Errorf("path required"))
 		}
-		if !*devTLS {
-			dieMsg("dev TLS disabled by default; pass --devtls to enable")
+		if *devTLS {
+			fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 		}
-		fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 		data, err := os.ReadFile(*inPath)
 		if err != nil {
 			die("read message failed", err)
@@ -3496,10 +3598,9 @@ func main() {
 		if !*stdinPaths && *inPath == "" {
 			die("missing --in", fmt.Errorf("path required"))
 		}
-		if !*devTLS {
-			dieMsg("dev TLS disabled by default; pass --devtls to enable")
+		if *devTLS {
+			fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 		}
-		fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 		self, err := node.NewNode(root, node.Options{})
 		if err != nil {
 			die("load node failed", err)
@@ -3871,10 +3972,9 @@ func main() {
 				die("missing --addr", fmt.Errorf("address required"))
 			}
 			if *outPath == "" {
-				if !*devTLS {
-					dieMsg("dev TLS disabled by default; pass --devtls to enable")
+				if *devTLS {
+					fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 				}
-				fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 			}
 
 			fail := func(msg string, err error) {
@@ -3935,6 +4035,9 @@ func main() {
 				return
 			}
 			if *advertiseAddr != "" {
+				if err := validateOutboundHelloTarget(self, toID, *addr); err != nil {
+					fail("handshake failed", err)
+				}
 				msg, err := self.BuildHello1(toID)
 				if err != nil {
 					fail("build hello1 failed", err)
@@ -3974,10 +4077,9 @@ func main() {
 			if *addr == "" {
 				die("missing --addr", fmt.Errorf("address required"))
 			}
-			if !*devTLS {
-				dieMsg("dev TLS disabled by default; pass --devtls to enable")
+			if *devTLS {
+				fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 			}
-			fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 
 			fail := func(msg string, err error) {
 				reason := msg
@@ -4097,10 +4199,9 @@ func main() {
 			if *inPath == "" {
 				die("missing --in", fmt.Errorf("path required"))
 			}
-			if !*devTLS {
-				dieMsg("dev TLS disabled by default; pass --devtls to enable")
+			if *devTLS {
+				fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 			}
-			fmt.Fprintln(os.Stderr, "WARNING: using deterministic dev TLS certificates")
 
 			fail := func(msg string, err error) {
 				if os.Getenv("WEB4_DEBUG") == "1" {

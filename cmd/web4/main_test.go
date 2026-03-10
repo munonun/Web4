@@ -2591,7 +2591,7 @@ func TestGossipRejectsUnknownSender(t *testing.T) {
 	}
 }
 
-func TestGossipForwardHello1LearnsPeer(t *testing.T) {
+func TestGossipHello1RejectedAndNotForwarded(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()
 	homeC := t.TempDir()
@@ -2695,21 +2695,19 @@ func TestGossipForwardHello1LearnsPeer(t *testing.T) {
 		t.Fatalf("build gossip push failed: %v", err)
 	}
 	_, _, recvErr := handleGossipPush(gossipData, nil, selfB, checker, "127.0.0.1:1111")
-	if recvErr != nil {
-		t.Fatalf("handle gossip push failed: msg=%s err=%v", recvErr.msg, recvErr.err)
+	if recvErr == nil || recvErr.err == nil {
+		t.Fatalf("expected gossip hello1 rejection")
 	}
-
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, ok := findPeer(selfC.Peers.List(), selfD.ID); ok {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	if !strings.Contains(strings.ToLower(recvErr.err.Error()), "forbidden type") {
+		t.Fatalf("expected forbidden type rejection, got %v", recvErr.err)
 	}
-	t.Fatalf("expected C to learn D from forwarded gossip")
+	time.Sleep(200 * time.Millisecond)
+	if _, ok := findPeer(selfC.Peers.List(), selfD.ID); ok {
+		t.Fatalf("expected C not to learn D from gossip hello1")
+	}
 }
 
-func TestGossipForwardSendsGossipPush(t *testing.T) {
+func TestGossipForwardDoesNotSendHello1(t *testing.T) {
 	homeB := t.TempDir()
 	homeC := t.TempDir()
 
@@ -2761,21 +2759,12 @@ func TestGossipForwardSendsGossipPush(t *testing.T) {
 		t.Fatalf("encode hello1 failed: %v", err)
 	}
 	forwardGossip(proto.GossipPushMsg{Hops: 2}, envelope, proto.MsgTypeHello1, "testmsgid", selfB, "127.0.0.1:12345")
-	if len(sent) == 0 {
-		t.Fatalf("expected gossip forward send")
-	}
-	var hdr struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(sent, &hdr); err != nil {
-		t.Fatalf("decode forwarded message failed: %v", err)
-	}
-	if hdr.Type != proto.MsgTypeGossipPush {
-		t.Fatalf("expected gossip_push, got %q", hdr.Type)
+	if len(sent) != 0 {
+		t.Fatalf("expected hello1 gossip forward to be dropped")
 	}
 }
 
-func TestGossipHello1RateLimitedBeforeVerify(t *testing.T) {
+func TestGossipHello1ForbiddenBeforeVerify(t *testing.T) {
 	cases := []struct {
 		name         string
 		disableSuite string
@@ -2832,8 +2821,7 @@ func TestGossipHello1RateLimitedBeforeVerify(t *testing.T) {
 			peerB := peer.Peer{NodeID: selfB.ID, PubKey: selfB.PubKey}
 
 			const attempts = 8
-			rateLimited := 0
-			verifyFailed := 0
+			forbidden := 0
 			for i := 0; i < attempts; i++ {
 				hello1, err := selfD.BuildHello1(selfA.ID)
 				if err != nil {
@@ -2863,25 +2851,19 @@ func TestGossipHello1RateLimitedBeforeVerify(t *testing.T) {
 					t.Fatalf("expected gossip payload failure")
 				}
 				errText := strings.ToLower(recvErr.err.Error())
-				if strings.Contains(errText, "rate") {
-					rateLimited++
-				}
-				if strings.Contains(errText, "bad hello1 signature") {
-					verifyFailed++
+				if strings.Contains(errText, "forbidden type") {
+					forbidden++
 				}
 			}
 
-			if rateLimited < attempts-2 {
-				t.Fatalf("expected most attempts to be rate-limited, got %d/%d", rateLimited, attempts)
-			}
-			if verifyFailed > 1 {
-				t.Fatalf("expected at most one verify failure, got %d", verifyFailed)
+			if forbidden != attempts {
+				t.Fatalf("expected all attempts to be forbidden, got %d/%d", forbidden, attempts)
 			}
 			debugCount.mu.Lock()
 			verifyCount := debugCount.verifyFail["hello1"]
 			debugCount.mu.Unlock()
-			if verifyCount > 1 {
-				t.Fatalf("expected hello1 verify counter <= 1, got %d", verifyCount)
+			if verifyCount != 0 {
+				t.Fatalf("expected hello1 verify counter 0, got %d", verifyCount)
 			}
 		})
 	}

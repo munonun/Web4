@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"web4mvp/internal/crypto"
+	"web4mvp/internal/debuglog"
 	"web4mvp/internal/metrics"
 	"web4mvp/internal/network"
 	"web4mvp/internal/node"
@@ -26,6 +27,8 @@ const (
 	defaultOutboundExplore = 2
 	defaultMaxBackoffSec   = 300
 	defaultPexIntervalSec  = 20
+	defaultBootstrapPexSec = 10
+	defaultBootstrapPexMax = 120
 	defaultRecoveryGrace   = 8
 	defaultRecoveryWindow  = 30
 	defaultRecoveryStable  = 10
@@ -44,22 +47,25 @@ const (
 var connManTick = 5 * time.Second
 
 type connMan struct {
-	self      *node.Node
-	metrics   *metrics.Metrics
-	devTLS    bool
-	devTLSCA  string
-	root      string
-	mu        sync.Mutex
-	nextTry   map[[32]byte]time.Time
-	outbound  map[[32]byte]time.Time
-	rng       *rand.Rand
-	bootstrap []string
-	bootPeers []bootstrapPeer
-	dialLog   map[[32]byte]time.Time
-	addrLog   map[string]time.Time
-	addrNext  map[string]time.Time
-	dialSem   chan struct{}
-	recovery  connManRecovery
+	self            *node.Node
+	metrics         *metrics.Metrics
+	devTLS          bool
+	devTLSCA        string
+	root            string
+	mu              sync.Mutex
+	nextTry         map[[32]byte]time.Time
+	outbound        map[[32]byte]time.Time
+	rng             *rand.Rand
+	bootstrap       []string
+	bootPeers       []bootstrapPeer
+	dialLog         map[[32]byte]time.Time
+	addrLog         map[string]time.Time
+	addrNext        map[string]time.Time
+	bootPexNext     map[string]time.Time
+	bootPexInFlight map[string]bool
+	bootPexFail     map[string]int
+	dialSem         chan struct{}
+	recovery        connManRecovery
 }
 
 type connManRecovery struct {
@@ -103,20 +109,23 @@ func newConnMan(r *Runner, devTLS bool) *connMan {
 		}
 	}
 	return &connMan{
-		self:      r.Self,
-		metrics:   r.Metrics,
-		devTLS:    devTLS,
-		devTLSCA:  devTLSCA,
-		root:      r.Root,
-		nextTry:   make(map[[32]byte]time.Time),
-		outbound:  make(map[[32]byte]time.Time),
-		rng:       rand.New(rand.NewSource(time.Now().UnixNano())),
-		bootstrap: bootstrapAddrs(),
-		bootPeers: bootstrapPeers(),
-		dialLog:   make(map[[32]byte]time.Time),
-		addrLog:   make(map[string]time.Time),
-		addrNext:  make(map[string]time.Time),
-		dialSem:   make(chan struct{}, dialConcurrency()),
+		self:            r.Self,
+		metrics:         r.Metrics,
+		devTLS:          devTLS,
+		devTLSCA:        devTLSCA,
+		root:            r.Root,
+		nextTry:         make(map[[32]byte]time.Time),
+		outbound:        make(map[[32]byte]time.Time),
+		rng:             rand.New(rand.NewSource(time.Now().UnixNano())),
+		bootstrap:       bootstrapAddrs(),
+		bootPeers:       bootstrapPeers(),
+		dialLog:         make(map[[32]byte]time.Time),
+		addrLog:         make(map[string]time.Time),
+		addrNext:        make(map[string]time.Time),
+		bootPexNext:     make(map[string]time.Time),
+		bootPexInFlight: make(map[string]bool),
+		bootPexFail:     make(map[string]int),
+		dialSem:         make(chan struct{}, dialConcurrency()),
 	}
 }
 
@@ -218,6 +227,14 @@ func (c *connMan) tickPex(ctx context.Context) {
 		return
 	}
 	peers := c.self.Peers.ListPeersRanked(64, peer.PeerFilter{AllowNoAddr: false})
+	filtered := peers[:0]
+	for _, p := range peers {
+		if c.isBootstrapAddr(peerDialAddr(p)) {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	peers = filtered
 	if c.self.Sessions != nil {
 		connected := make([]peer.Peer, 0, len(peers))
 		for _, p := range peers {
@@ -296,6 +313,9 @@ func (c *connMan) pickAndConnectWithMode(ctx context.Context, peers []peer.Peer,
 		if addr == "" || isZeroNodeID(p.NodeID) {
 			continue
 		}
+		if c.isBootstrapAddr(addr) {
+			continue
+		}
 		if c.metrics != nil {
 			c.metrics.IncCandidateAvailable()
 		}
@@ -352,6 +372,10 @@ func (c *connMan) pickAndConnectWithMode(ctx context.Context, peers []peer.Peer,
 func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string, dialReason string, force bool) error {
 	if c.self == nil {
 		return fmt.Errorf("missing node")
+	}
+	c.debugOutboundHelloTarget(addr, peerID)
+	if err := c.validateOutboundHello1Target(peerID, addr); err != nil {
+		return err
 	}
 	now := time.Now()
 	if !c.shouldTryAddr(addr, now, force) {
@@ -428,6 +452,72 @@ func (c *connMan) handshake(ctx context.Context, peerID [32]byte, addr string, d
 		c.logForcedDialStage(dialReason, peerID, addr, "hello", "ok", nil)
 	}
 	return nil
+}
+
+func (c *connMan) validateOutboundHello1Target(peerID [32]byte, addr string) error {
+	if c == nil || c.self == nil || c.self.Peers == nil || isZeroNodeID(peerID) {
+		return nil
+	}
+	targetAddr := strings.TrimSpace(addr)
+	if targetAddr == "" {
+		return nil
+	}
+	if c.isBootstrapAddr(targetAddr) {
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(
+				os.Stderr,
+				"DROP outbound hello1: target addr / to_id mismatch addr=%s target_peer_id=%x bootstrap=true\n",
+				targetAddr, peerID[:],
+			)
+		}
+		return fmt.Errorf("outbound hello1 target mismatch")
+	}
+	for _, p := range c.self.Peers.List() {
+		if peerDialAddr(p) != targetAddr {
+			continue
+		}
+		if p.NodeID == peerID {
+			return nil
+		}
+		if os.Getenv("WEB4_DEBUG") == "1" {
+			fmt.Fprintf(
+				os.Stderr,
+				"DROP outbound hello1: target addr / to_id mismatch addr=%s addr_node_id=%x hello_to_id=%x source=%s\n",
+				targetAddr, p.NodeID[:], peerID[:], p.Source,
+			)
+		}
+		return fmt.Errorf("outbound hello1 target mismatch")
+	}
+	return nil
+}
+
+func (c *connMan) debugOutboundHelloTarget(addr string, peerID [32]byte) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(
+		os.Stderr,
+		"outbound hello1 target addr=%s target_peer_id=%x bootstrap=%t\n",
+		strings.TrimSpace(addr), peerID[:], c.isBootstrapAddr(addr),
+	)
+}
+
+func (c *connMan) isBootstrapAddr(addr string) bool {
+	targetAddr := strings.TrimSpace(addr)
+	if targetAddr == "" {
+		return false
+	}
+	for _, seedAddr := range c.bootstrap {
+		if strings.TrimSpace(seedAddr) == targetAddr {
+			return true
+		}
+	}
+	for _, bp := range c.bootPeers {
+		if strings.TrimSpace(bp.addr) == targetAddr {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
@@ -535,7 +625,17 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			continue
 		}
 		now := time.Now()
+		startedBootstrapPex := false
+		if c.isBootstrapAddr(addr) {
+			if !c.beginBootstrapPex(addr, now) {
+				continue
+			}
+			startedBootstrapPex = true
+		}
 		if !c.shouldTryAddr(addr, now, false) {
+			if startedBootstrapPex {
+				c.finishBootstrapPex(addr, now, errDialAddrBackoff)
+			}
 			continue
 		}
 		if c.metrics != nil {
@@ -566,6 +666,9 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		reqCtx, cancel := context.WithTimeout(ctx, dialTimeout())
 		release, slotErr := c.acquireDialSlot(reqCtx)
 		if slotErr != nil {
+			if startedBootstrapPex {
+				c.finishBootstrapPex(addr, time.Now(), slotErr)
+			}
 			cancel()
 			continue
 		}
@@ -576,6 +679,9 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		c.metrics.ObservePexRTT(time.Since(pexStarted))
 		cancel()
 		if err != nil {
+			if startedBootstrapPex {
+				c.finishBootstrapPex(addr, time.Now(), err)
+			}
 			if c.metrics != nil {
 				c.metrics.IncDialFailByReason(reason)
 			}
@@ -589,6 +695,9 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		}
 		resp, err := proto.DecodePeerExchangeResp(respData)
 		if err != nil {
+			if startedBootstrapPex {
+				c.finishBootstrapPex(addr, time.Now(), err)
+			}
 			if c.metrics != nil {
 				c.metrics.IncDialFailByReason(reason + ":decode")
 			}
@@ -600,10 +709,16 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			c.metrics.IncPexRespRecvTotal()
 		}
 		if _, err := applyPeerExchangeResp(c.self, resp); err != nil {
+			if startedBootstrapPex {
+				c.finishBootstrapPex(addr, time.Now(), err)
+			}
 			if c.metrics != nil {
 				c.metrics.IncDialFailByReason(reason + ":apply")
 			}
 			continue
+		}
+		if startedBootstrapPex {
+			c.finishBootstrapPex(addr, time.Now(), nil)
 		}
 		c.promoteSeed(resp, addr)
 	}
@@ -873,6 +988,10 @@ func (c *connMan) logPexError(addr string, err error) {
 	if err == nil || addr == "" {
 		return
 	}
+	if c != nil && c.isBootstrapAddr(addr) {
+		debuglog.RateLimitedf("bootstrap_pex_"+addr, 10*time.Second, "pex dial failed addr=%s err=%v", addr, err)
+		return
+	}
 	now := time.Now()
 	c.mu.Lock()
 	last := c.addrLog[addr]
@@ -885,6 +1004,53 @@ func (c *connMan) logPexError(addr string, err error) {
 	fmt.Fprintf(os.Stderr, "pex dial failed addr=%s err=%v\n", addr, err)
 }
 
+func (c *connMan) beginBootstrapPex(addr string, now time.Time) bool {
+	if c == nil || !c.isBootstrapAddr(addr) {
+		return true
+	}
+	addr = strings.TrimSpace(addr)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.bootPexInFlight[addr] {
+		return false
+	}
+	if next, ok := c.bootPexNext[addr]; ok && now.Before(next) {
+		return false
+	}
+	c.bootPexInFlight[addr] = true
+	return true
+}
+
+func (c *connMan) finishBootstrapPex(addr string, now time.Time, err error) {
+	if c == nil || !c.isBootstrapAddr(addr) {
+		return
+	}
+	addr = strings.TrimSpace(addr)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.bootPexInFlight, addr)
+	base := bootstrapPexMinInterval()
+	if err == nil {
+		c.bootPexFail[addr] = 0
+		c.bootPexNext[addr] = now.Add(base)
+		return
+	}
+	fail := c.bootPexFail[addr] + 1
+	c.bootPexFail[addr] = fail
+	backoff := base
+	for i := 1; i < fail; i++ {
+		backoff *= 2
+		if backoff >= bootstrapPexMaxBackoff() {
+			backoff = bootstrapPexMaxBackoff()
+			break
+		}
+	}
+	if backoff > bootstrapPexMaxBackoff() {
+		backoff = bootstrapPexMaxBackoff()
+	}
+	c.bootPexNext[addr] = now.Add(backoff)
+}
+
 func pexInterval() time.Duration {
 	if v, ok := envInt("WEB4_PEX_INTERVAL_MS"); ok && v > 0 {
 		return time.Duration(v) * time.Millisecond
@@ -893,6 +1059,23 @@ func pexInterval() time.Duration {
 		return time.Duration(v) * time.Second
 	}
 	return time.Duration(defaultPexIntervalSec) * time.Second
+}
+
+func bootstrapPexMinInterval() time.Duration {
+	if v, ok := envInt("WEB4_BOOTSTRAP_PEX_INTERVAL_MS"); ok && v > 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	if v, ok := envInt("WEB4_BOOTSTRAP_PEX_INTERVAL_SEC"); ok && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return time.Duration(defaultBootstrapPexSec) * time.Second
+}
+
+func bootstrapPexMaxBackoff() time.Duration {
+	if v, ok := envInt("WEB4_BOOTSTRAP_PEX_MAX_BACKOFF_SEC"); ok && v > 0 {
+		return time.Duration(v) * time.Second
+	}
+	return time.Duration(defaultBootstrapPexMax) * time.Second
 }
 
 func (c *connMan) currentPexInterval() time.Duration {
@@ -1085,48 +1268,7 @@ func (c *connMan) panicDialTick(ctx context.Context) {
 		return
 	}
 
-	// First, force-dial known bootstrap identities.
-	for _, bp := range c.bootPeers {
-		if remaining <= 0 {
-			break
-		}
-		if bp.addr == "" || isZeroNodeID(bp.id) || !isValidAddr(bp.addr) {
-			continue
-		}
-		if c.isOutboundConnected(bp.id) {
-			continue
-		}
-		p := peer.Peer{NodeID: bp.id, Addr: bp.addr, Source: "seed"}
-		reason := dialReason("panic", "seed")
-		c.logForcedDialDecision(reason, p, c.nextTryAt(bp.id), "attempt", "")
-		if c.metrics != nil {
-			c.metrics.IncRecoveryPanicDialsTotal()
-			c.metrics.IncDialAttemptByReason(reason)
-		}
-		if err := c.handshake(ctx, bp.id, bp.addr, reason, true); err != nil {
-			if errors.Is(err, errDialAddrBackoff) {
-				continue
-			}
-			c.logForcedDialDecision(reason, p, c.nextTryAt(bp.id), "fail", err.Error())
-			c.logDialError(bp.id, err)
-			if c.metrics != nil {
-				c.metrics.IncDialFailByReason(reason)
-			}
-			c.markFailure(bp.id)
-		} else {
-			c.markSuccess(bp.id)
-			if c.metrics != nil {
-				c.metrics.IncDialSuccessByReason(reason)
-			}
-			c.logForcedDialDecision(reason, p, c.nextTryAt(bp.id), "success", "")
-			if c.outboundCount() >= recoveryMinOutbound() {
-				return
-			}
-		}
-		remaining--
-	}
-
-	// If still isolated, force one plain bootstrap query to rediscover live peers.
+	// Bootstrap remains discovery-only even during recovery; use plain PEX only.
 	if remaining > 0 && len(c.bootstrap) > 0 {
 		addr := c.bootstrap[0]
 		var zero [32]byte
