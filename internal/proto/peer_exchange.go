@@ -19,6 +19,7 @@ type PeerExchangeReqMsg struct {
 	Suite        string `json:"suite"`
 	K            int    `json:"k"`
 	FromNodeID   string `json:"from_node_id,omitempty"`
+	ListenAddr   string `json:"listen_addr,omitempty"`
 	PubKey       string `json:"pubkey,omitempty"`
 	SigFrom      string `json:"sig_from,omitempty"`
 }
@@ -50,6 +51,28 @@ func EncodePeerExchangeReq(m PeerExchangeReqMsg) ([]byte, error) {
 		m.Suite = Suite
 	}
 	return json.Marshal(m)
+}
+
+func EncodePeerExchangeReqBudgeted(m PeerExchangeReqMsg) ([]byte, bool, error) {
+	data, err := EncodePeerExchangeReq(m)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(data) <= MaxPeerExchangeReqSize {
+		return data, false, nil
+	}
+	if m.PubKey != "" {
+		trimmed := m
+		trimmed.PubKey = ""
+		data, err = EncodePeerExchangeReq(trimmed)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(data) <= MaxPeerExchangeReqSize {
+			return data, true, nil
+		}
+	}
+	return nil, false, fmt.Errorf("message too large")
 }
 
 func DecodePeerExchangeReq(data []byte) (PeerExchangeReqMsg, error) {

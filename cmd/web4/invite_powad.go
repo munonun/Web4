@@ -230,7 +230,7 @@ func handleInviteRequest(self *node.Node, data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("invite_request to_id mismatch")
 	}
 	fromPub, err := hex.DecodeString(msg.FromPub)
-	if err != nil || len(fromPub) == 0 || !crypto.IsRSAPublicKey(fromPub) {
+	if err != nil || len(fromPub) == 0 || !crypto.IsIdentityPublicKey(fromPub) {
 		return nil, fmt.Errorf("bad from_pub")
 	}
 	if node.DeriveNodeID(fromPub) != fromID {
@@ -293,7 +293,7 @@ func handlePoWaDSolution(self *node.Node, data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("powad_solution to_id mismatch")
 	}
 	fromPub, err := hex.DecodeString(msg.FromPub)
-	if err != nil || len(fromPub) == 0 || !crypto.IsRSAPublicKey(fromPub) {
+	if err != nil || len(fromPub) == 0 || !crypto.IsIdentityPublicKey(fromPub) {
 		return nil, fmt.Errorf("bad from_pub")
 	}
 	if node.DeriveNodeID(fromPub) != fromID {

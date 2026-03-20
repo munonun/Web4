@@ -132,9 +132,9 @@ func TestSignDigestDefaultUsesMLDSA(t *testing.T) {
 
 func TestSignDigestRejectsRSAWithoutFlag(t *testing.T) {
 	t.Setenv("WEB4_ALLOW_RSA_PSS", "")
-	_, priv, err := GenKeypair()
+	_, priv, err := GenRSAKeypair()
 	if err != nil {
-		t.Fatalf("GenKeypair failed: %v", err)
+		t.Fatalf("GenRSAKeypair failed: %v", err)
 	}
 	_, err = SignDigest(priv, SHA3_256([]byte("rsa-disabled")))
 	if err == nil {
@@ -147,9 +147,9 @@ func TestSignDigestRejectsRSAWithoutFlag(t *testing.T) {
 
 func TestSignDigestAllowsRSAWithFlag(t *testing.T) {
 	t.Setenv("WEB4_ALLOW_RSA_PSS", "1")
-	pub, priv, err := GenKeypair()
+	pub, priv, err := GenRSAKeypair()
 	if err != nil {
-		t.Fatalf("GenKeypair failed: %v", err)
+		t.Fatalf("GenRSAKeypair failed: %v", err)
 	}
 	digest := SHA3_256([]byte("rsa-enabled"))
 	sig, err := SignDigest(priv, digest)

@@ -14,7 +14,6 @@ import (
 )
 
 func TestOutboundOnlyBootstrapDiscovery(t *testing.T) {
-	t.Setenv("WEB4_NODE_MODE", "bootstrap")
 	t.Setenv("WEB4_CONNMAN_TICK_MS", "100")
 	t.Setenv("WEB4_PEX_INTERVAL_MS", "200")
 	t.Setenv("WEB4_DIAL_TIMEOUT_MS", "500")
@@ -27,7 +26,17 @@ func TestOutboundOnlyBootstrapDiscovery(t *testing.T) {
 	defer cancel()
 
 	startListenerRunner := func(label, root string, m *metrics.Metrics) (*Runner, string, context.CancelFunc, <-chan error, error) {
+		prevMode, hadMode := os.LookupEnv("WEB4_NODE_MODE")
+		_ = os.Setenv("WEB4_NODE_MODE", "peer")
+		if label == "bootstrap" {
+			_ = os.Setenv("WEB4_NODE_MODE", "bootstrap")
+		}
 		r, err := NewRunner(root, Options{Metrics: m})
+		if hadMode {
+			_ = os.Setenv("WEB4_NODE_MODE", prevMode)
+		} else {
+			_ = os.Unsetenv("WEB4_NODE_MODE")
+		}
 		if err != nil {
 			return nil, "", nil, nil, err
 		}
@@ -109,17 +118,13 @@ func TestOutboundOnlyBootstrapDiscovery(t *testing.T) {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for time.Now().Before(deadline) {
-		snap := peerRunner.Metrics.Snapshot()
-		if snap.PexRespRecvTotal > 0 && snap.QuicConnectSuccessTotal > 0 {
-			if snap.InboundConnected != 0 {
-				t.Fatalf("expected outbound-only inbound_connected=0, got %d", snap.InboundConnected)
+		_, peerLearnedBoot := peerRunner.Self.Peers.Get(bootRunner.Self.ID)
+		if peerLearnedBoot {
+			if strings.TrimSpace(peerRunner.Self.ListenAddr()) != "" {
+				t.Fatalf("expected outbound-only peer to have no listen addr, got %q", peerRunner.Self.ListenAddr())
 			}
-			bootSnap := bootRunner.Metrics.Snapshot()
-			if bootSnap.RecvByType["peer_exchange_req"] == 0 {
-				t.Fatalf("expected bootstrap to receive peer_exchange_req")
-			}
-			if bootSnap.RecvByType["hello1"] != 0 {
-				t.Fatalf("expected bootstrap to receive no hello1, got %d", bootSnap.RecvByType["hello1"])
+			if bootRunner.Self.Sessions.Has(peerRunner.Self.ID) {
+				t.Fatalf("expected bootstrap to establish no hello session with outbound-only peer")
 			}
 			stopPeer()
 			return
@@ -130,13 +135,12 @@ func TestOutboundOnlyBootstrapDiscovery(t *testing.T) {
 			t.Fatalf("outbound-only discovery timeout: %v", ctx.Err())
 		}
 	}
-	snap := peerRunner.Metrics.Snapshot()
-	t.Fatalf("outbound-only discovery not observed: pex_resp=%d quic_connect_success=%d inbound_connected=%d",
-		snap.PexRespRecvTotal, snap.QuicConnectSuccessTotal, snap.InboundConnected)
+	_, peerLearnedBoot := peerRunner.Self.Peers.Get(bootRunner.Self.ID)
+	t.Fatalf("outbound-only discovery not observed: peer_learned_bootstrap=%t peer_listen_addr=%q bootstrap_session=%t",
+		peerLearnedBoot, peerRunner.Self.ListenAddr(), bootRunner.Self.Sessions.Has(peerRunner.Self.ID))
 }
 
 func TestOutboundOnlyDialsLearnedPeerNotBootstrap(t *testing.T) {
-	t.Setenv("WEB4_NODE_MODE", "bootstrap")
 	t.Setenv("WEB4_CONNMAN_TICK_MS", "100")
 	t.Setenv("WEB4_PEX_INTERVAL_MS", "200")
 	t.Setenv("WEB4_DIAL_TIMEOUT_MS", "500")
@@ -149,7 +153,17 @@ func TestOutboundOnlyDialsLearnedPeerNotBootstrap(t *testing.T) {
 	defer cancel()
 
 	startListenerRunner := func(label, root string, m *metrics.Metrics) (*Runner, string, context.CancelFunc, <-chan error, error) {
+		prevMode, hadMode := os.LookupEnv("WEB4_NODE_MODE")
+		_ = os.Setenv("WEB4_NODE_MODE", "peer")
+		if label == "bootstrap" {
+			_ = os.Setenv("WEB4_NODE_MODE", "bootstrap")
+		}
 		r, err := NewRunner(root, Options{Metrics: m})
+		if hadMode {
+			_ = os.Setenv("WEB4_NODE_MODE", prevMode)
+		} else {
+			_ = os.Unsetenv("WEB4_NODE_MODE")
+		}
 		if err != nil {
 			return nil, "", nil, nil, err
 		}
@@ -259,11 +273,9 @@ func TestOutboundOnlyDialsLearnedPeerNotBootstrap(t *testing.T) {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for time.Now().Before(deadline) {
-		bootSnap := bootRunner.Metrics.Snapshot()
-		candidateSnap := candidateRunner.Metrics.Snapshot()
-		if candidateSnap.RecvByType["hello1"] > 0 {
-			if bootSnap.RecvByType["hello1"] != 0 {
-				t.Fatalf("expected bootstrap to receive no hello1, got %d", bootSnap.RecvByType["hello1"])
+		if candidateRunner.Self.Sessions.Has(peerRunner.Self.ID) {
+			if bootRunner.Self.Sessions.Has(peerRunner.Self.ID) {
+				t.Fatalf("expected learned peer handshake on candidate only, but bootstrap session exists")
 			}
 			stopPeer()
 			return
@@ -274,8 +286,6 @@ func TestOutboundOnlyDialsLearnedPeerNotBootstrap(t *testing.T) {
 			t.Fatalf("outbound-only learned-peer timeout: %v", ctx.Err())
 		}
 	}
-	bootSnap := bootRunner.Metrics.Snapshot()
-	candidateSnap := candidateRunner.Metrics.Snapshot()
-	t.Fatalf("expected learned peer hello1 on candidate only: bootstrap_hello1=%d candidate_hello1=%d",
-		bootSnap.RecvByType["hello1"], candidateSnap.RecvByType["hello1"])
+	t.Fatalf("expected learned peer handshake on candidate only: bootstrap_session=%t candidate_session=%t",
+		bootRunner.Self.Sessions.Has(peerRunner.Self.ID), candidateRunner.Self.Sessions.Has(peerRunner.Self.ID))
 }

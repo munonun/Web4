@@ -741,10 +741,13 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 		if err != nil {
 			return nil, false, reject("decode peer exchange resp failed", err)
 		}
+		pexDebugf("peer_exchange_resp received peers=%d from=%s", len(resp.Peers), senderAddr)
 		added, err := applyPeerExchangeResp(self, resp)
 		if err != nil {
+			pexDebugf("peer_exchange_resp rejected err=%v", err)
 			return nil, false, reject("apply peer exchange resp failed", err)
 		}
+		pexDebugf("peer_exchange_resp applied added=%d peers=%d", added, len(resp.Peers))
 		fmt.Println("RECV PEER EXCHANGE", added)
 		return nil, false, nil
 
@@ -828,7 +831,7 @@ func recvDataWithResponse(data []byte, st *store.Store, self *node.Node, checker
 			return nil, false, reject("invalid invite bundle", err)
 		}
 		inviteePub, err := hex.DecodeString(msg.InviteePub)
-		if err != nil || !crypto.IsRSAPublicKey(inviteePub) {
+		if err != nil || !crypto.IsIdentityPublicKey(inviteePub) {
 			return nil, false, reject("invalid invite bundle", fmt.Errorf("bad invitee pubkey"))
 		}
 		inviteeID := node.DeriveNodeID(inviteePub)
@@ -2805,9 +2808,9 @@ func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, e
 		k = maxPeerExchangeK
 	}
 	peers := self.Peers.List()
-	respPeers := make([]proto.PeerExchangePeer, 0, k)
+	candidates := make([]proto.PeerExchangePeer, 0, k)
 	for _, p := range peers {
-		if len(respPeers) >= k {
+		if len(candidates) >= k {
 			break
 		}
 		if p.Addr == "" || len(p.PubKey) == 0 {
@@ -2817,19 +2820,38 @@ func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, e
 		if isZeroNodeID(id) {
 			id = node.DeriveNodeID(p.PubKey)
 		}
-		peerMsg := proto.PeerExchangePeer{
+		candidates = append(candidates, proto.PeerExchangePeer{
 			ListenAddr: p.Addr,
-			Addr:       p.Addr,
 			NodeID:     hex.EncodeToString(id[:]),
 			PubKey:     hex.EncodeToString(p.PubKey),
-		}
-		respPeers = append(respPeers, peerMsg)
+		})
 	}
+	respPeers := make([]proto.PeerExchangePeer, 0, len(candidates))
+	for _, candidate := range candidates {
+		nextPeers := append(append([]proto.PeerExchangePeer(nil), respPeers...), candidate)
+		msg, encoded, err := finalizePeerExchangeResp(self, nextPeers)
+		if err != nil {
+			return proto.PeerExchangeRespMsg{}, err
+		}
+		if err := enforceTypeMax(proto.MsgTypePeerExchangeResp, len(encoded)); err != nil {
+			break
+		}
+		respPeers = nextPeers
+		_ = msg
+	}
+	msg, _, err := finalizePeerExchangeResp(self, respPeers)
+	if err != nil {
+		return proto.PeerExchangeRespMsg{}, err
+	}
+	return msg, nil
+}
+
+func finalizePeerExchangeResp(self *node.Node, peers []proto.PeerExchangePeer) (proto.PeerExchangeRespMsg, []byte, error) {
 	msg := proto.PeerExchangeRespMsg{
 		Type:         proto.MsgTypePeerExchangeResp,
 		ProtoVersion: proto.ProtoVersion,
 		Suite:        proto.Suite,
-		Peers:        respPeers,
+		Peers:        peers,
 	}
 	fromID := self.ID
 	msg.FromNodeID = hex.EncodeToString(fromID[:])
@@ -2837,11 +2859,15 @@ func buildPeerExchangeResp(self *node.Node, k int) (proto.PeerExchangeRespMsg, e
 	payloadMsg.SigFrom = ""
 	payload, err := proto.EncodePeerExchangeResp(payloadMsg)
 	if err != nil {
-		return proto.PeerExchangeRespMsg{}, err
+		return proto.PeerExchangeRespMsg{}, nil, err
 	}
 	sig := sigFromBytes(msg.ProtoVersion, msg.Suite, msg.Type, fromID, payload, self.PrivKey)
 	msg.SigFrom = hex.EncodeToString(sig)
-	return msg, nil
+	encoded, err := proto.EncodePeerExchangeResp(msg)
+	if err != nil {
+		return proto.PeerExchangeRespMsg{}, nil, err
+	}
+	return msg, encoded, nil
 }
 
 func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int, error) {
@@ -2856,23 +2882,68 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 	for i := 0; i < limit; i++ {
 		p, err := decodePeerExchangePeer(resp.Peers[i])
 		if err != nil {
+			pexDebugf("peer_exchange_resp drop index=%d reason=decode_peer err=%v", i, err)
 			return added, err
 		}
 		dialAddr := p.Addr
+		_, prevAddr, _ := pexPersistedPeer(self, p.NodeID)
+		overwriteReason := "pex_no_addr"
 		if dialAddr != "" && self.Candidates != nil {
 			self.Candidates.Add(dialAddr)
 		}
 		if dialAddr != "" && self.Peers != nil {
-			_, _ = self.Peers.SetAddrUnverified(p, dialAddr, true)
+			changed, err := self.Peers.SetAddrUnverified(p, dialAddr, true)
+			if err != nil {
+				overwriteReason = "pex_addr_rejected"
+				pexDebugf("peer_exchange_resp addr index=%d node_id=%x prev_addr=%s incoming_addr=%s reason=set_addr err=%v", i, p.NodeID[:], prevAddr, dialAddr, err)
+			} else {
+				if changed {
+					overwriteReason = "pex_addr_applied"
+				} else if prevAddr == dialAddr {
+					overwriteReason = "pex_addr_kept_same"
+				} else {
+					overwriteReason = "pex_addr_kept_existing"
+				}
+				pexDebugf("peer_exchange_resp addr index=%d node_id=%x prev_addr=%s incoming_addr=%s changed=%t reason=%s", i, p.NodeID[:], prevAddr, dialAddr, changed, overwriteReason)
+			}
 		}
 		p.Addr = ""
 		persist := len(p.PubKey) > 0
 		if err := self.Peers.Upsert(p, persist); err != nil {
+			pexDebugf("peer_exchange_resp drop index=%d node_id=%x reason=upsert err=%v", i, p.NodeID[:], err)
 			return added, err
 		}
+		persisted, addr, ok := pexPersistedPeer(self, p.NodeID)
+		pexDebugf("peer_exchange_resp applied index=%d node_id=%x prev_addr=%s incoming_addr=%s final_addr=%s reason=%s verified=%t persisted=%t present=%t", i, p.NodeID[:], prevAddr, pexIncomingAddr(resp.Peers[i]), addr, overwriteReason, len(p.PubKey) > 0, persisted, ok)
 		added++
 	}
 	return added, nil
+}
+
+func pexDebugf(format string, args ...any) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func pexPersistedPeer(self *node.Node, id [32]byte) (bool, string, bool) {
+	if self == nil || self.Peers == nil {
+		return false, "", false
+	}
+	for _, p := range self.Peers.List() {
+		if p.NodeID == id {
+			return p.Addr != "", p.Addr, true
+		}
+	}
+	return false, "", false
+}
+
+func pexIncomingAddr(p proto.PeerExchangePeer) string {
+	if p.ListenAddr != "" {
+		return p.ListenAddr
+	}
+	return p.Addr
 }
 
 func decodePeerExchangePeer(w proto.PeerExchangePeer) (peer.Peer, error) {
@@ -2891,7 +2962,7 @@ func decodePeerExchangePeer(w proto.PeerExchangePeer) (peer.Peer, error) {
 		return peer.Peer{}, fmt.Errorf("missing pubkey")
 	}
 	pubBytes, err := hex.DecodeString(w.PubKey)
-	if err != nil || !crypto.IsRSAPublicKey(pubBytes) {
+	if err != nil || !crypto.IsIdentityPublicKey(pubBytes) {
 		return peer.Peer{}, fmt.Errorf("bad pubkey")
 	}
 	pub = pubBytes
@@ -2985,10 +3056,10 @@ func validateInviteCert(cert proto.InviteCert, invites *peer.InviteStore, now ti
 	if len(cert.InviterPub) == 0 {
 		return zero, zero, fmt.Errorf("missing inviter_pub")
 	}
-	if !crypto.IsRSAPublicKey(cert.InviteePub) {
+	if !crypto.IsIdentityPublicKey(cert.InviteePub) {
 		return zero, zero, fmt.Errorf("invitee node_id mismatch")
 	}
-	if !crypto.IsRSAPublicKey(cert.InviterPub) {
+	if !crypto.IsIdentityPublicKey(cert.InviterPub) {
 		return zero, zero, fmt.Errorf("inviter node_id mismatch")
 	}
 	if len(cert.InviteID) != 16 && len(cert.InviteID) != 32 {
@@ -3167,8 +3238,8 @@ func main() {
 			die("load keys failed", err)
 		}
 		to, err := hex.DecodeString(*toHex)
-		if err != nil || !crypto.IsRSAPublicKey(to) {
-			die("invalid --to pubkey", fmt.Errorf("need RSA public key DER hex"))
+		if err != nil || !crypto.IsIdentityPublicKey(to) {
+			die("invalid --to pubkey", fmt.Errorf("need supported identity public key hex"))
 		}
 
 		iou := proto.IOU{Creditor: to, Debtor: pub, Amount: *amount, Nonce: *nonce}
@@ -3240,6 +3311,28 @@ func main() {
 			return
 		}
 		fmt.Println("OPEN", hex.EncodeToString(cid[:]))
+
+	case "open-id":
+		fs := flag.NewFlagSet("open-id", flag.ExitOnError)
+		inPath := fs.String("in", "", "read ContractOpenMsg from file")
+		_ = fs.Parse(os.Args[2:])
+		if strings.TrimSpace(*inPath) == "" {
+			dieMsg("need --in")
+		}
+		data, err := os.ReadFile(*inPath)
+		if err != nil {
+			die("read message failed", err)
+		}
+		msg, err := proto.DecodeContractOpenMsg(data)
+		if err != nil {
+			die("decode open message failed", err)
+		}
+		contract, err := proto.ContractFromOpenMsg(msg)
+		if err != nil {
+			die("decode contract failed", err)
+		}
+		cid := proto.ContractID(contract.IOU)
+		fmt.Println(hex.EncodeToString(cid[:]))
 
 	case "list":
 		cs, err := st.ListContracts()
@@ -3776,7 +3869,7 @@ func main() {
 			}
 			var inviteePub []byte
 			var inviteeID [32]byte
-			if crypto.IsRSAPublicKey(toBytes) {
+			if crypto.IsIdentityPublicKey(toBytes) {
 				inviteePub = toBytes
 				inviteeID = node.DeriveNodeID(inviteePub)
 			} else if len(toBytes) == 32 {
@@ -3914,7 +4007,7 @@ func main() {
 			var inviteeID [32]byte
 			if len(toBytes) == 32 {
 				copy(inviteeID[:], toBytes)
-			} else if crypto.IsRSAPublicKey(toBytes) {
+			} else if crypto.IsIdentityPublicKey(toBytes) {
 				inviteeID = node.DeriveNodeID(toBytes)
 			} else {
 				die("invalid --to", fmt.Errorf("need pubkey or node id hex"))

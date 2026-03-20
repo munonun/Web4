@@ -358,8 +358,10 @@ func claimStorePath(root string) string {
 type walletExport struct {
 	Algo          string `json:"algo"`
 	NodeIDHex     string `json:"node_id_hex"`
-	PrivateKeyPEM string `json:"private_key_pem"`
+	PrivateKeyPEM string `json:"private_key_pem,omitempty"`
 	PublicKeyPEM  string `json:"public_key_pem,omitempty"`
+	PrivateKeyHex string `json:"private_key_hex,omitempty"`
+	PublicKeyHex  string `json:"public_key_hex,omitempty"`
 }
 
 func loadNode(root string) (*node.Node, error) {
@@ -401,27 +403,34 @@ func exportWallet(root, out string) error {
 	if err != nil {
 		return err
 	}
-	privKey, err := crypto.ParseRSAPrivateKey(priv)
-	if err != nil {
-		return err
-	}
-	pubKey, err := crypto.ParseRSAPublicKey(pub)
-	if err != nil {
-		return err
-	}
-	privDER := x509.MarshalPKCS1PrivateKey(privKey)
-	privPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privDER})
-	pubDER, err := x509.MarshalPKIXPublicKey(pubKey)
-	if err != nil {
-		return err
-	}
-	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
 	id := node.DeriveNodeID(pub)
-	payload := walletExport{
-		Algo:          "rsa",
-		NodeIDHex:     hex.EncodeToString(id[:]),
-		PrivateKeyPEM: string(privPEM),
-		PublicKeyPEM:  string(pubPEM),
+	payload := walletExport{NodeIDHex: hex.EncodeToString(id[:])}
+	switch {
+	case crypto.IsMLDSAPrivateKey(priv) && crypto.IsMLDSAPublicKey(pub):
+		payload.Algo = "mldsa"
+		payload.PrivateKeyHex = hex.EncodeToString(priv)
+		payload.PublicKeyHex = hex.EncodeToString(pub)
+	case crypto.IsRSAPrivateKey(priv) && crypto.IsRSAPublicKey(pub):
+		privKey, err := crypto.ParseRSAPrivateKey(priv)
+		if err != nil {
+			return err
+		}
+		pubKey, err := crypto.ParseRSAPublicKey(pub)
+		if err != nil {
+			return err
+		}
+		privDER := x509.MarshalPKCS1PrivateKey(privKey)
+		privPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: privDER})
+		pubDER, err := x509.MarshalPKIXPublicKey(pubKey)
+		if err != nil {
+			return err
+		}
+		pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER})
+		payload.Algo = "rsa"
+		payload.PrivateKeyPEM = string(privPEM)
+		payload.PublicKeyPEM = string(pubPEM)
+	default:
+		return fmt.Errorf("unsupported wallet key type")
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
@@ -447,18 +456,10 @@ func importWallet(root, in string, force bool) error {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return err
 	}
-	if payload.Algo != "" && payload.Algo != "rsa" {
+	if payload.Algo != "" && payload.Algo != "rsa" && payload.Algo != "mldsa" {
 		return fmt.Errorf("unsupported algo")
 	}
-	privKey, pubKey, err := parseWalletKeys(payload)
-	if err != nil {
-		return err
-	}
-	pubDER, err := x509.MarshalPKIXPublicKey(pubKey)
-	if err != nil {
-		return err
-	}
-	privDER, err := x509.MarshalPKCS8PrivateKey(privKey)
+	pubDER, privDER, err := parseWalletKeys(payload)
 	if err != nil {
 		return err
 	}
@@ -483,7 +484,27 @@ func shortFingerprint(pub []byte) string {
 	return hex.EncodeToString(sum[:4])
 }
 
-func parseWalletKeys(payload walletExport) (*rsa.PrivateKey, *rsa.PublicKey, error) {
+func parseWalletKeys(payload walletExport) ([]byte, []byte, error) {
+	if strings.EqualFold(payload.Algo, "mldsa") || strings.TrimSpace(payload.PrivateKeyHex) != "" {
+		priv := strings.TrimSpace(payload.PrivateKeyHex)
+		pub := strings.TrimSpace(payload.PublicKeyHex)
+		if priv == "" {
+			return nil, nil, fmt.Errorf("missing private_key_hex")
+		}
+		privBytes, err := hex.DecodeString(priv)
+		if err != nil || !crypto.IsMLDSAPrivateKey(privBytes) {
+			return nil, nil, fmt.Errorf("bad private_key_hex")
+		}
+		var pubBytes []byte
+		if pub == "" {
+			return nil, nil, fmt.Errorf("missing public_key_hex")
+		}
+		pubBytes, err = hex.DecodeString(pub)
+		if err != nil || !crypto.IsMLDSAPublicKey(pubBytes) {
+			return nil, nil, fmt.Errorf("bad public_key_hex")
+		}
+		return pubBytes, privBytes, nil
+	}
 	if strings.TrimSpace(payload.PrivateKeyPEM) == "" {
 		return nil, nil, fmt.Errorf("missing private_key_pem")
 	}
@@ -527,7 +548,15 @@ func parseWalletKeys(payload walletExport) (*rsa.PrivateKey, *rsa.PublicKey, err
 		}
 		pubKey = rsaKey
 	}
-	return privKey, pubKey, nil
+	pubDER, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	privDER, err := x509.MarshalPKCS8PrivateKey(privKey)
+	if err != nil {
+		return nil, nil, err
+	}
+	return pubDER, privDER, nil
 }
 
 func rotateWallet(root string) (string, string, []string, error) {

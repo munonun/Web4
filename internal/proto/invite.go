@@ -13,11 +13,11 @@ const (
 	MsgTypeInviteReq    = "invite_request"
 	MsgTypePoWaDChal    = "powad_challenge"
 	MsgTypePoWaDSol     = "powad_solution"
-	MaxInviteCertSize   = 8 << 10
+	MaxInviteCertSize   = 24 << 10
 	MaxInviteAckSize    = 2 << 10
-	MaxInviteReqSize    = 4 << 10
-	MaxPoWaDChalSize    = 4 << 10
-	MaxPoWaDSolSize     = 4 << 10
+	MaxInviteReqSize    = 12 << 10
+	MaxPoWaDChalSize    = 12 << 10
+	MaxPoWaDSolSize     = 12 << 10
 	InvitePoWaDBits     = 26
 	InviteScopeGossip   = uint32(1 << 0)
 	InviteScopeContract = uint32(1 << 1)

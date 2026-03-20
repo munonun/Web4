@@ -9,7 +9,7 @@ import (
 
 const (
 	MsgTypeRevoke   = "revoke_member"
-	MaxRevokeSize   = 4 << 10
+	MaxRevokeSize   = 12 << 10
 	maxRevokeReason = 256
 )
 

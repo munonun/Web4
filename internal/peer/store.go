@@ -612,6 +612,88 @@ func (s *Store) ObserveAddr(p Peer, observedAddr string, candidateAddr string, v
 	return changed, store.AppendJSONL(s.path, rec)
 }
 
+func (s *Store) ObserveAddrDiscovery(id [32]byte, observedAddr string, candidateAddr string, verified bool, persist bool) (bool, error) {
+	if observedAddr == "" {
+		return false, nil
+	}
+	if isZeroNodeID(id) {
+		return false, fmt.Errorf("missing node_id")
+	}
+	s.mu.Lock()
+	s.pruneLocked()
+	now := time.Now()
+	key := hex.EncodeToString(id[:])
+	var ent *entry
+	var entEl *list.Element
+	if el, ok := s.hot[key]; ok {
+		entEl = el
+		ent = el.Value.(*entry)
+		ensureAddrCompat(&ent.peer)
+	}
+	if ent == nil {
+		if s.cap > 0 && len(s.hot) >= s.cap {
+			s.evictLocked(len(s.hot) - s.cap + 1)
+		}
+		ent = &entry{key: key, peer: Peer{NodeID: id}, expiresAt: now.Add(s.ttl)}
+		entEl = s.order.PushFront(ent)
+		s.hot[key] = entEl
+	} else {
+		ent.peer.NodeID = id
+		ent.expiresAt = now.Add(s.ttl)
+		s.order.MoveToFront(entEl)
+	}
+	ent.peer.LastSeenUnix = now.Unix()
+	ent.peer.ObservedAddr = observedAddr
+	host := hostForAddr(observedAddr)
+	obsByHost := s.addrObs[id]
+	if obsByHost == nil {
+		obsByHost = make(map[string]*addrObservation)
+		s.addrObs[id] = obsByHost
+	}
+	obs := obsByHost[host]
+	if obs == nil {
+		obs = &addrObservation{}
+		obsByHost[host] = obs
+	}
+	obs.count++
+	obs.lastSeen = now
+	if candidateAddr == "" {
+		s.mu.Unlock()
+		return false, nil
+	}
+	allowUpdate := verified || obs.count >= s.addrObservation
+	if !allowUpdate {
+		s.mu.Unlock()
+		return false, nil
+	}
+	prevAddr := ent.peer.Addr
+	if err := s.setAddrLocked(ent, candidateAddr, now, false, verified); err != nil {
+		s.mu.Unlock()
+		return false, err
+	}
+	changed := ent.peer.Addr != prevAddr
+	rec := diskPeer{
+		NodeID:          hex.EncodeToString(ent.peer.NodeID[:]),
+		PubKey:          hex.EncodeToString(ent.peer.PubKey),
+		DialAddr:        dialAddrOf(ent.peer),
+		ObservedAddr:    ent.peer.ObservedAddr,
+		Addr:            dialAddrOf(ent.peer),
+		LastSeenUnix:    ent.peer.LastSeenUnix,
+		LastSuccessUnix: ent.peer.LastSuccessUnix,
+		FailCount:       ent.peer.FailCount,
+		RTTMs:           ent.peer.RTTMs,
+		Source:          ent.peer.Source,
+		SubnetKey:       ent.peer.SubnetKey,
+		Score:           ent.peer.Score,
+		Economic:        ent.peer.Economic,
+	}
+	s.mu.Unlock()
+	if !persist {
+		return changed, nil
+	}
+	return changed, store.AppendJSONL(s.path, rec)
+}
+
 func (s *Store) List() []Peer {
 	s.mu.Lock()
 	s.pruneLocked()
@@ -980,7 +1062,7 @@ func (s *Store) loadLast(limit int) error {
 	}
 	for _, rec := range records {
 		pub, err := hex.DecodeString(rec.PubKey)
-		if err != nil || !crypto.IsRSAPublicKey(pub) {
+		if err != nil || !crypto.IsIdentityPublicKey(pub) {
 			continue
 		}
 		idBytes, err := hex.DecodeString(rec.NodeID)

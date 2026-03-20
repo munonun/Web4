@@ -9,7 +9,7 @@ import (
 
 const (
 	MsgTypeInviteBundle = "invite_bundle"
-	MaxInviteBundleSize = 16 << 10
+	MaxInviteBundleSize = 32 << 10
 )
 
 type InviteApproval struct {

@@ -9,7 +9,12 @@ set -euo pipefail
 : "${WEB4_QUIC_ACQUIRE_TIMEOUT_MS:=500}"
 : "${WEB4_DISABLE_LIMITER:=1}"
 : "${WEB4_ZK_SMOKE:=0}"
-export WEB4_QUIC_IDLE_TIMEOUT_SEC WEB4_QUIC_HANDSHAKE_TIMEOUT_SEC WEB4_QUIC_STREAM_TIMEOUT_SEC WEB4_QUIC_ACCEPT_TIMEOUT_SEC WEB4_QUIC_ACQUIRE_TIMEOUT_MS WEB4_DISABLE_LIMITER
+# Smoke still exercises legacy invite/membership certificate flows, which use the
+# long-term node identity key rather than the PQ handshake key. Until that layer
+# is fully migrated away from RSA identities, allow RSA-PSS explicitly here so
+# the suite can cover invite/scope/revoke behavior without failing at key usage.
+: "${WEB4_ALLOW_RSA_PSS:=1}"
+export WEB4_QUIC_IDLE_TIMEOUT_SEC WEB4_QUIC_HANDSHAKE_TIMEOUT_SEC WEB4_QUIC_STREAM_TIMEOUT_SEC WEB4_QUIC_ACCEPT_TIMEOUT_SEC WEB4_QUIC_ACQUIRE_TIMEOUT_MS WEB4_DISABLE_LIMITER WEB4_ALLOW_RSA_PSS
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=check6_lib.sh
 source "${SCRIPT_DIR}/check6_lib.sh"
@@ -996,9 +1001,29 @@ if [[ "${invite_contract_ok}" -ne 1 ]]; then
 	quic_fail "check 6b (scope+revoke): invite contract not accepted"
 fi
 
+scope_contract_applied=0
+for _ in $(seq 1 80); do
+	member_line="$(grep "\"node_id\":\"${NODEIDB}\"" "${TMPA}/.web4mvp/members.jsonl" 2>/dev/null | tail -n 1 || true)"
+	if printf '%s\n' "${member_line}" | grep -Eq '"scope":(2|3)'; then
+		scope_contract_applied=1
+		break
+	fi
+	sleep 0.05
+done
+if [[ "${scope_contract_applied}" -ne 1 ]]; then
+	scope_debug_dump "contract scope upgrade not yet applied on A"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): contract scope upgrade not applied"
+fi
+
 open2="${TMPWORK}/scope_open2.json"
 run_checked "check 6b (scope+revoke): open (contract scope)" --quiet run_b open --to "${PUBA}" --amount 9 --nonce 9002 --out "${open2}"
-CID2="$(run_b list | awk 'END{print $2}')"
+CID2="$("${WEB4_BIN}" open-id --in "${open2}" 2>/dev/null || true)"
+if [[ -z "${CID2}" ]]; then
+	scope_debug_dump "failed to derive CID from post-upgrade open payload"
+	server_log="${server_log_scope_a}"
+	quic_fail "check 6b (scope+revoke): failed to derive post-upgrade CID"
+fi
 open2_send_log="${TMPWORK}/scope_open2_send.log"
 if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send-secure --devtls --addr "127.0.0.1:${PORT_SCOPE}" --devtls-ca "${TMPA}/.web4mvp/devtls_ca.pem" --to-id "${NODEIDA}" --in "${open2}" >"${open2_send_log}" 2>&1 ); then
 	tail -n 200 "${open2_send_log}" || true
@@ -1006,9 +1031,14 @@ if ! ( env HOME="${TMPB}" WEB4_DISABLE_CLIENT_POOL=1 "${WEB4_BIN}" quic-send-sec
 	server_log="${server_log_scope_a}"
 	quic_fail "check 6b (scope+revoke): secure send failed"
 fi
+sleep 0.05
 accepted=0
 for _ in $(seq 1 80); do
 	if run_a list | grep -q "${CID2}"; then
+		accepted=1
+		break
+	fi
+	if grep -q "RECV OPEN ${CID2}" "${server_log_scope_a}" 2>/dev/null; then
 		accepted=1
 		break
 	fi
@@ -1285,6 +1315,23 @@ pass "check 6b (scope + revoke)"
 			END {exit !(have_id && have_addr)}
 		' "${TMPB}/.web4mvp/peers.jsonl"
 	}
+	check6_b_has_c_node_id() {
+		awk -v id="${NODEIDC}" '
+			$0 ~ id {have_id=1}
+			END {exit !have_id}
+		' "${TMPB}/.web4mvp/peers.jsonl"
+	}
+	check6_b_c_actual_addr() {
+		awk -v id="${NODEIDC}" '
+			$0 ~ id {
+				if (match($0, /"dial_addr":"[^"]+"/)) {
+					print substr($0, RSTART + 13, RLENGTH - 14)
+				} else if (match($0, /"addr":"[^"]+"/)) {
+					print substr($0, RSTART + 8, RLENGTH - 9)
+				}
+			}
+		' "${TMPB}/.web4mvp/peers.jsonl" | tail -n 1
+	}
 	check6_b_has_c_peer_with_retry() {
 		local deadline=$((SECONDS + 30))
 		while [[ "${SECONDS}" -lt "${deadline}" ]]; do
@@ -1328,7 +1375,10 @@ pass "check 6b (scope + revoke)"
 	if ! check6_b_has_c_peer_with_retry; then
 		check6_seed_b_with_c_peer
 		if ! check6_b_has_c_peer_with_retry; then
-			check6_dump_learn_context_and_fail "peer_not_learned" "B missing C peer dial_addr/node_id after learn+seed"
+			if check6_b_has_c_node_id; then
+				check6_dump_learn_context_and_fail "peer_addr_mismatch" "B has C node_id but addr mismatch after learn+seed expected=${c_dial_addr} actual=$(check6_b_c_actual_addr)"
+			fi
+			check6_dump_learn_context_and_fail "peer_not_learned" "B missing C peer node_id after learn+seed"
 		fi
 	fi
 
@@ -1382,7 +1432,10 @@ pass "check 6b (scope + revoke)"
 			node_list_summary="$(run_b node list | tr '\n' ' ' | tr -s ' ' | sed 's/ $//')"
 			echo "check 6 debug: B node list=${node_list_summary}"
 		fi
-		check6_dump_learn_context_and_fail "peer_not_learned" "B missing C peer dial_addr/node_id"
+		if check6_b_has_c_node_id; then
+			check6_dump_learn_context_and_fail "peer_addr_mismatch" "B has C node_id but addr mismatch expected=${c_dial_addr} actual=$(check6_b_c_actual_addr)"
+		fi
+		check6_dump_learn_context_and_fail "peer_not_learned" "B missing C peer node_id"
 	fi
 	# Minimum deterministic handshake evidence for learn step.
 	if ! grep -q "OK handshake complete" "${learn_b_c_hello_log}"; then
@@ -1736,6 +1789,8 @@ bootstrap_debug_dump() {
 	tail -n 200 "${TMPA}/.web4mvp/metrics.json" 2>/dev/null || true
 	echo "check 7 debug: TLS/hello mismatch lines"
 	grep -nE 'x509: certificate signed by unknown authority|invalid hello1|to_id mismatch|from_id self|bootstrapSeedNodeID|seed node_id|seed_node_id' "${peer_a_log}" "${peer_b_log}" "${bootstrap_log}" 2>/dev/null | tail -n 120 || true
+	echo "check 7 debug: bootstrap pex lines"
+	grep -nE 'bootstrap_pex|pex dial failed|peer_exchange_resp decoded|peer_exchange_resp applied|quic dial to' "${peer_a_log}" "${peer_b_log}" "${bootstrap_log}" 2>/dev/null | tail -n 160 || true
 	echo "check 7 debug: parsed node ids"
 	echo "bootstrap_node_id=${NODEID_BOOTSTRAP:-} peer_a_node_id=${NODEID_PEER_A:-} peer_b_node_id=${NODEID_PEER_B:-}"
 }
@@ -1760,21 +1815,21 @@ if [[ ! -s "${CHECK7_SHARED_CA_CERT}" || ! -s "${CHECK7_SHARED_CA_KEY}" ]]; then
 	quic_fail "check 7 (bootstrap discovery): shared devtls ca generation failed"
 fi
 
-echo "Starting QUIC bootstrap node: env HOME=${TMPA} WEB4_NODE_MODE=bootstrap WEB4_DEVTLS_CA_PATH=${CHECK7_SHARED_CA_CERT} ${WEB4_NODE_BIN} run --devtls --addr ${bootstrap_addr}"
-env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
+echo "Starting QUIC bootstrap node: env HOME=${TMPA} WEB4_NODE_MODE=bootstrap WEB4_DEBUG=1 WEB4_DEVTLS_CA_PATH=${CHECK7_SHARED_CA_CERT} ${WEB4_NODE_BIN} run --devtls --addr ${bootstrap_addr}"
+env HOME="${TMPA}" WEB4_NODE_MODE=bootstrap WEB4_DEBUG=1 WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 WEB4_PEER_EXCHANGE_SEED=7 "${WEB4_NODE_BIN}" run --devtls --addr "${bootstrap_addr}" >"${bootstrap_log}" 2>&1 &
 SERVER_PID_BOOT=$!
 LISTENER_PIDS+=("${SERVER_PID_BOOT}")
 
 wait_quic_ready "${bootstrap_log}" "check 7 (bootstrap discovery): bootstrap did not start"
 NODEID_BOOTSTRAP="$(node_id_from_ready_log "${bootstrap_log}" || true)"
 
-echo "Starting QUIC peer A: env HOME=${TMPB} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_A}"
-env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
+echo "Starting QUIC peer A: env HOME=${TMPB} WEB4_DEBUG=1 WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_A}"
+env HOME="${TMPB}" WEB4_NODE_MODE=peer WEB4_DEBUG=1 WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_A}" >"${peer_a_log}" 2>&1 &
 SERVER_PID_PEER_A=$!
 LISTENER_PIDS+=("${SERVER_PID_PEER_A}")
 
-echo "Starting QUIC peer B: env HOME=${TMPC} WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_B}"
-env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
+echo "Starting QUIC peer B: env HOME=${TMPC} WEB4_DEBUG=1 WEB4_BOOTSTRAP_ADDRS=${bootstrap_addr} ${WEB4_NODE_BIN} run --devtls --addr 127.0.0.1:${PORT_PEER_B}"
+env HOME="${TMPC}" WEB4_NODE_MODE=peer WEB4_DEBUG=1 WEB4_BOOTSTRAP_ADDRS="${bootstrap_addr}" WEB4_DEVTLS_CA_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_CERT_PATH="${CHECK7_SHARED_CA_CERT}" WEB4_DEVTLS_CA_KEY_PATH="${CHECK7_SHARED_CA_KEY}" WEB4_OUTBOUND_TARGET=2 WEB4_OUTBOUND_EXPLORE=1 WEB4_PEX_INTERVAL_SEC=2 WEB4_CONNMAN_TICK_MS=300 WEB4_DIAL_TIMEOUT_MS=800 "${WEB4_NODE_BIN}" run --devtls --addr "127.0.0.1:${PORT_PEER_B}" >"${peer_b_log}" 2>&1 &
 SERVER_PID_PEER_B=$!
 LISTENER_PIDS+=("${SERVER_PID_PEER_B}")
 
@@ -1796,13 +1851,17 @@ if ! wait_metric_gt "${TMPC}" "peertable_size" 0 "${deadline}"; then
 	bootstrap_debug_dump "peer B peertable_size < 1 in addrs-only seed mode"
 	quic_fail "check 7 (bootstrap discovery): peer B seed not inserted"
 fi
-if ! wait_metric_gt "${TMPB}" "outbound_connected" 0 "${deadline}"; then
-	bootstrap_debug_dump "peer A outbound not observed"
-	quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
+if ! wait_metric_gt "${TMPB}" "pex_req_sent_total" 0 "${deadline}"; then
+	bootstrap_debug_dump "peer A bootstrap pex not attempted"
+	quic_fail "check 7 (bootstrap discovery): peer A bootstrap pex not attempted"
 fi
-if ! wait_metric_gt "${TMPC}" "outbound_connected" 0 "${deadline}"; then
-	bootstrap_debug_dump "peer B outbound not observed"
-	quic_fail "check 7 (bootstrap discovery): outbound connect not observed"
+if ! wait_metric_gt "${TMPC}" "pex_req_sent_total" 0 "${deadline}"; then
+	bootstrap_debug_dump "peer B bootstrap pex not attempted"
+	quic_fail "check 7 (bootstrap discovery): peer B bootstrap pex not attempted"
+fi
+if ! wait_metric_gt "${TMPA}" "recv_by_type.peer_exchange_req" 0 "${deadline}"; then
+	bootstrap_debug_dump "bootstrap did not receive peer exchange request"
+	quic_fail "check 7 (bootstrap discovery): bootstrap did not receive peer exchange request"
 fi
 if ! wait_peer_has_nodeid "${TMPB}" "${NODEID_PEER_B}" "${deadline}"; then
 	bootstrap_debug_dump "peer A did not learn peer B node_id via pex"

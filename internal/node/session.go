@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -179,6 +180,7 @@ func (n *Node) BuildHello1(toID [32]byte) (proto.Hello1Msg, error) {
 	}
 	fromID := n.ID
 	listenAddr := normalizeListenAddr(n.ListenAddr())
+	helloAddrDebugf("hello1 build from=%x to=%x advertised_addr=%s", fromID[:], toID[:], listenAddr)
 	h1Bytes := hello1TranscriptBytes(suiteID, fromID, toID, listenAddr, ea, na, mlkemPub)
 	h1TranscriptHash := crypto.SHA3_256(h1Bytes)
 	hello1SessionID := sessionIDForHandshake(suiteID, fromID, toID, ea, zero32(), h1TranscriptHash)
@@ -245,6 +247,8 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 		return proto.Hello2Msg{}, errors.New("hello1 to_id mismatch")
 	}
 	listenAddr := advertisedListenAddr(m.ListenAddr, m.FromAddr)
+	prevAddr, _ := peerAddrForID(n.Peers, fromID)
+	overwriteReason := "observed_only"
 	peerSupports := parseSupportedSuites(m.SupportedSuites)
 	selfSupports := supportedSuites()
 	suiteID, err := validateSuiteSelection(byte(m.SuiteID), selfSupports, peerSupports)
@@ -305,16 +309,42 @@ func (n *Node) HandleHello1From(m proto.Hello1Msg, senderAddr string) (proto.Hel
 	if err := n.Peers.Upsert(peerInfo, true); err != nil {
 		return proto.Hello2Msg{}, err
 	}
-	if senderAddr != "" {
-		if _, err := n.Peers.ObserveAddr(peerInfo, senderAddr, "", false, true); err != nil {
-			return proto.Hello2Msg{}, err
-		}
-	}
+	candidateAddr := ""
+	verifiedAddr := false
 	if listenAddr != "" && (senderAddr == "" || sameHost(senderAddr, listenAddr)) {
-		if _, err := n.Peers.SetAddrUnverified(peerInfo, listenAddr, true); err != nil {
+		candidateAddr = listenAddr
+		verifiedAddr = true
+	}
+	if senderAddr != "" {
+		changed, err := n.Peers.ObserveAddr(peerInfo, senderAddr, candidateAddr, verifiedAddr, true)
+		if err != nil {
 			return proto.Hello2Msg{}, err
 		}
+		if candidateAddr != "" {
+			if changed {
+				overwriteReason = "advertised_addr_verified_applied"
+			} else {
+				overwriteReason = "advertised_addr_verified_kept"
+			}
+		} else if listenAddr != "" {
+			overwriteReason = "advertised_addr_host_mismatch"
+		}
+	} else if candidateAddr != "" {
+		changed, err := n.Peers.SetAddrUnverified(peerInfo, listenAddr, true)
+		if err != nil {
+			return proto.Hello2Msg{}, err
+		}
+		if changed {
+			overwriteReason = "advertised_addr_applied_no_observed"
+		} else {
+			overwriteReason = "advertised_addr_kept_no_observed"
+		}
 	}
+	finalAddr, _ := peerAddrForID(n.Peers, fromID)
+	helloAddrDebugf(
+		"hello1 recv node_id=%x advertised_addr=%s observed_addr=%s prev_addr=%s final_addr=%s overwrite_reason=%s",
+		fromID[:], listenAddr, senderAddr, prevAddr, finalAddr, overwriteReason,
+	)
 	eph, err := crypto.GenerateEphemeral()
 	if err != nil {
 		return proto.Hello2Msg{}, err
@@ -858,4 +888,23 @@ func normalizeListenAddr(addr string) string {
 func advertisedListenAddr(listenAddr, legacyFromAddr string) string {
 	_ = legacyFromAddr
 	return normalizeListenAddr(listenAddr)
+}
+
+func helloAddrDebugf(format string, args ...any) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func peerAddrForID(st *peer.Store, id [32]byte) (string, bool) {
+	if st == nil {
+		return "", false
+	}
+	for _, p := range st.List() {
+		if p.NodeID == id {
+			return p.Addr, true
+		}
+	}
+	return "", false
 }

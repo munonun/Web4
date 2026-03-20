@@ -170,7 +170,7 @@ func TestHello1RejectsToIDMismatch(t *testing.T) {
 	}
 }
 
-func TestHello1FromAddrPersistsUnverifiedHint(t *testing.T) {
+func TestHello1FromAddrPrefersAdvertisedAddrOnSameHost(t *testing.T) {
 	dirA := t.TempDir()
 	dirB := t.TempDir()
 	nodeA, err := NewNode(dirA, Options{})
@@ -189,11 +189,22 @@ func TestHello1FromAddrPersistsUnverifiedHint(t *testing.T) {
 	if _, err := nodeB.HandleHello1From(hello1, "127.0.0.1:32790"); err != nil {
 		t.Fatalf("handle hello1 failed: %v", err)
 	}
-	if addr, ok := nodeB.Peers.AddrHint(nodeA.ID); !ok || addr != "127.0.0.1:46043" {
-		t.Fatalf("expected addr hint to persist, got %q ok=%v", addr, ok)
+	peers := nodeB.Peers.List()
+	found := false
+	for _, p := range peers {
+		if p.NodeID == nodeA.ID {
+			found = true
+			if p.Addr != "127.0.0.1:46043" {
+				t.Fatalf("expected advertised addr to win, got %q", p.Addr)
+			}
+			break
+		}
 	}
-	if nodeB.Peers.IsAddrVerified(nodeA.ID) {
-		t.Fatalf("expected addr to be unverified")
+	if !found {
+		t.Fatalf("expected peer A to be present")
+	}
+	if !nodeB.Peers.IsAddrVerified(nodeA.ID) {
+		t.Fatalf("expected addr to be verified")
 	}
 }
 
@@ -264,6 +275,30 @@ func TestHandshakeRejectsHello2ReplayAcrossDifferentTranscript(t *testing.T) {
 	// Replay hello2 from transcript A into transcript B pending state.
 	if err := nodeA.HandleHello2(hello2a); err == nil {
 		t.Fatalf("expected replayed hello2 rejection for mismatched transcript")
+	}
+}
+
+func TestBuildHello1SerializesAdvertisedAddr(t *testing.T) {
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	nodeA, err := NewNode(dirA, Options{})
+	if err != nil {
+		t.Fatalf("new node A failed: %v", err)
+	}
+	nodeB, err := NewNode(dirB, Options{})
+	if err != nil {
+		t.Fatalf("new node B failed: %v", err)
+	}
+	nodeA.SetListenAddr("127.0.0.1:54057")
+	hello1, err := nodeA.BuildHello1(nodeB.ID)
+	if err != nil {
+		t.Fatalf("build hello1 failed: %v", err)
+	}
+	if hello1.ListenAddr != "127.0.0.1:54057" {
+		t.Fatalf("expected hello1 listen_addr to serialize advertise addr, got %q", hello1.ListenAddr)
+	}
+	if hello1.FromAddr != "127.0.0.1:54057" {
+		t.Fatalf("expected hello1 from_addr to mirror advertise addr, got %q", hello1.FromAddr)
 	}
 }
 

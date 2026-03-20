@@ -262,10 +262,14 @@ type MVVerifier interface {
 }
 
 // -----------------------------------------------------------------------------
-// MVP 호환 API (현재는 RSA-PSS를 서명 백엔드로 사용)
+// MVP identity key API
 // -----------------------------------------------------------------------------
 
 func GenKeypair() ([]byte, []byte, error) {
+	return GenMLDSAKeypair()
+}
+
+func GenRSAKeypair() ([]byte, []byte, error) {
 	priv, err := rsa.GenerateKey(rand.Reader, RSABits)
 	if err != nil {
 		return nil, nil, err
@@ -390,6 +394,14 @@ func IsRSAPublicKey(pub []byte) bool {
 func IsRSAPrivateKey(priv []byte) bool {
 	_, err := ParseRSAPrivateKey(priv)
 	return err == nil
+}
+
+func IsIdentityPublicKey(pub []byte) bool {
+	return IsMLDSAPublicKey(pub) || IsRSAPublicKey(pub)
+}
+
+func IsIdentityPrivateKey(priv []byte) bool {
+	return IsMLDSAPrivateKey(priv) || IsRSAPrivateKey(priv)
 }
 
 func parseMLDSAPublicKey(pub []byte) (mldsa65.PublicKey, error) {

@@ -205,6 +205,40 @@ func TestObserveAddrDoesNotOverrideDialAddrFromRemote(t *testing.T) {
 	}
 }
 
+func TestObserveAddrDiscoveryStoresAdvertisedListenAddrWithoutPubKey(t *testing.T) {
+	dir := t.TempDir()
+	st, err := peer.NewStore(filepath.Join(dir, "peers.jsonl"), peer.Options{
+		TTL:          time.Hour,
+		LoadLimit:    0,
+		DeriveNodeID: node.DeriveNodeID,
+	})
+	if err != nil {
+		t.Fatalf("new store failed: %v", err)
+	}
+	pub := pubWithByte(8)
+	id := node.DeriveNodeID(pub)
+	if err := st.UpsertUnverified(peer.Peer{NodeID: id}); err != nil {
+		t.Fatalf("upsert unverified failed: %v", err)
+	}
+	changed, err := st.ObserveAddrDiscovery(id, "127.0.0.1:32001", "127.0.0.1:46043", true, true)
+	if err != nil {
+		t.Fatalf("observe discovery failed: %v", err)
+	}
+	if !changed {
+		t.Fatalf("expected discovery observe to apply advertised addr")
+	}
+	p, ok := findPeer(st.List(), id)
+	if !ok {
+		t.Fatalf("peer missing")
+	}
+	if p.Addr != "127.0.0.1:46043" {
+		t.Fatalf("unexpected addr: %q", p.Addr)
+	}
+	if p.ObservedAddr != "127.0.0.1:32001" {
+		t.Fatalf("unexpected observed addr: %q", p.ObservedAddr)
+	}
+}
+
 func TestSetAddrUnverifiedRejectsLoopbackWhenEnabled(t *testing.T) {
 	t.Setenv("WEB4_REJECT_LOOPBACK_DIAL_ADDR", "1")
 	dir := t.TempDir()

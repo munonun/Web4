@@ -10,6 +10,7 @@ import (
 
 	"crypto/x509"
 
+	"web4mvp/internal/crypto"
 	"web4mvp/internal/wallet"
 )
 
@@ -74,7 +75,11 @@ func TestWalletImportRejectsTamperedNodeID(t *testing.T) {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	payload.NodeIDHex = "00" + payload.NodeIDHex[2:]
+	if payload.NodeIDHex[0] == '0' {
+		payload.NodeIDHex = "1" + payload.NodeIDHex[1:]
+	} else {
+		payload.NodeIDHex = "0" + payload.NodeIDHex[1:]
+	}
 	data, _ = json.Marshal(payload)
 	tampered := filepath.Join(t.TempDir(), "wallet_bad.json")
 	if err := os.WriteFile(tampered, data, 0600); err != nil {
@@ -87,22 +92,38 @@ func TestWalletImportRejectsTamperedNodeID(t *testing.T) {
 }
 
 func TestWalletImportAcceptsPKCS1AndPKCS8(t *testing.T) {
-	root := filepath.Join(t.TempDir(), ".web4mvp")
-	self, err := loadNode(root)
+	pubDER, privDER, err := crypto.GenRSAKeypair()
 	if err != nil {
-		t.Fatalf("load node: %v", err)
+		t.Fatalf("GenRSAKeypair: %v", err)
+	}
+	privKey, err := crypto.ParseRSAPrivateKey(privDER)
+	if err != nil {
+		t.Fatalf("ParseRSAPrivateKey: %v", err)
+	}
+	pubKey, err := crypto.ParseRSAPublicKey(pubDER)
+	if err != nil {
+		t.Fatalf("ParseRSAPublicKey: %v", err)
+	}
+	privPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privKey)})
+	pubPKIX, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		t.Fatalf("MarshalPKIXPublicKey: %v", err)
+	}
+	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubPKIX})
+	id := crypto.SHA3_256(pubDER)
+	payload := walletExport{
+		Algo:          "rsa",
+		NodeIDHex:     hex.EncodeToString(id[:]),
+		PrivateKeyPEM: string(privPEM),
+		PublicKeyPEM:  string(pubPEM),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
 	}
 	out := filepath.Join(t.TempDir(), "wallet.json")
-	if err := exportWallet(root, out); err != nil {
-		t.Fatalf("export wallet: %v", err)
-	}
-	data, err := os.ReadFile(out)
-	if err != nil {
-		t.Fatalf("read export: %v", err)
-	}
-	var payload walletExport
-	if err := json.Unmarshal(data, &payload); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	if err := os.WriteFile(out, data, 0600); err != nil {
+		t.Fatalf("write export: %v", err)
 	}
 
 	// PKCS1 private key (already default)
@@ -111,7 +132,9 @@ func TestWalletImportAcceptsPKCS1AndPKCS8(t *testing.T) {
 		t.Fatalf("import pkcs1: %v", err)
 	}
 	self1, _ := loadNode(root1)
-	if self.ID != self1.ID {
+	var expectedID [32]byte
+	copy(expectedID[:], id[:])
+	if expectedID != self1.ID {
 		t.Fatalf("pkcs1 id mismatch")
 	}
 
@@ -120,7 +143,7 @@ func TestWalletImportAcceptsPKCS1AndPKCS8(t *testing.T) {
 	if block == nil {
 		t.Fatalf("decode pem")
 	}
-	privKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	privKey, err = x509.ParsePKCS1PrivateKey(block.Bytes)
 	if err != nil {
 		t.Fatalf("parse pkcs1: %v", err)
 	}
@@ -139,7 +162,7 @@ func TestWalletImportAcceptsPKCS1AndPKCS8(t *testing.T) {
 		t.Fatalf("import pkcs8: %v", err)
 	}
 	self2, _ := loadNode(root2)
-	if self.ID != self2.ID {
+	if expectedID != self2.ID {
 		t.Fatalf("pkcs8 id mismatch")
 	}
 }

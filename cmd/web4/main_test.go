@@ -121,6 +121,41 @@ func TestOpenCloseAckFlow(t *testing.T) {
 	}
 }
 
+func TestOpenIDFromSavedOpenMessage(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pubA, _, err := crypto.LoadKeypair(filepath.Join(homeA, ".web4mvp"))
+	if err != nil {
+		t.Fatalf("load A keypair failed: %v", err)
+	}
+	pubB, _, err := crypto.LoadKeypair(filepath.Join(homeB, ".web4mvp"))
+	if err != nil {
+		t.Fatalf("load B keypair failed: %v", err)
+	}
+
+	openPath := filepath.Join(t.TempDir(), "open.json")
+	runOK(t, homeB, "open", "--to", hex.EncodeToString(pubA), "--amount", "9", "--nonce", "123", "--out", openPath)
+
+	out, err := runWithHomeOutput(homeB, "open-id", "--in", openPath)
+	if err != nil {
+		t.Fatalf("open-id failed: %v", err)
+	}
+
+	want := proto.ContractID(proto.IOU{
+		Creditor: pubA,
+		Debtor:   pubB,
+		Amount:   9,
+		Nonce:    123,
+	})
+	if got := strings.TrimSpace(out); got != hex.EncodeToString(want[:]) {
+		t.Fatalf("open-id mismatch: got %q want %q", got, hex.EncodeToString(want[:]))
+	}
+}
+
 func TestOpenSealedDecrypt(t *testing.T) {
 	homeA := t.TempDir()
 	homeB := t.TempDir()
@@ -1342,6 +1377,28 @@ func runWithHome(home string, args ...string) error {
 	return nil
 }
 
+func runWithHomeOutput(home string, args ...string) (string, error) {
+	if err := ensureGoCaches(); err != nil {
+		return "", err
+	}
+	cmd := exec.Command("go", append([]string{"run", "."}, args...)...)
+	wd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	cmd.Dir = wd
+	cmd.Env = applyEnv(os.Environ(),
+		"HOME="+home,
+		"GOMODCACHE="+modCacheDir,
+		"GOCACHE="+goCacheDir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("command failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
 func sendNodeHello(t *testing.T, addr string, pub, priv []byte, target peer.Peer, caPath string, devTLS bool) error {
 	t.Helper()
 	dir := t.TempDir()
@@ -2403,6 +2460,86 @@ func TestNodeExchange(t *testing.T) {
 	}
 	if reloadB.Members.Has(peerC.NodeID) {
 		t.Fatalf("did not expect member from exchange")
+	}
+}
+
+func TestPeerExchangeTruncatedResponseAllowsRepeatedSecureRequests(t *testing.T) {
+	homeA := t.TempDir()
+	homeB := t.TempDir()
+
+	runOK(t, homeA, "keygen")
+	runOK(t, homeB, "keygen")
+
+	pair := newSessionPair(t, homeA, homeB, nil, nil)
+	for i := 0; i < 12; i++ {
+		pub, _, err := crypto.GenKeypair()
+		if err != nil {
+			t.Fatalf("gen key: %v", err)
+		}
+		id := node.DeriveNodeID(pub)
+		addr := fmt.Sprintf("127.0.0.1:%d", 43000+i)
+		p := peer.Peer{NodeID: id, PubKey: pub, Addr: addr}
+		if err := pair.b.Peers.Upsert(p, true); err != nil {
+			t.Fatalf("upsert peer: %v", err)
+		}
+		if _, err := pair.b.Peers.ObserveAddr(p, addr, addr, true, true); err != nil {
+			t.Fatalf("observe addr: %v", err)
+		}
+	}
+
+	req := proto.PeerExchangeReqMsg{
+		Type:         proto.MsgTypePeerExchangeReq,
+		ProtoVersion: proto.ProtoVersion,
+		Suite:        proto.Suite,
+		K:            64,
+	}
+	payload, err := proto.EncodePeerExchangeReq(req)
+	if err != nil {
+		t.Fatalf("encode req: %v", err)
+	}
+
+	var firstCount int
+	for i := 0; i < 2; i++ {
+		secureReq, err := sealSecureEnvelope(pair.a, pair.b.ID, proto.MsgTypePeerExchangeReq, "", payload)
+		if err != nil {
+			t.Fatalf("seal req %d: %v", i, err)
+		}
+		respSecure, _, recvErr := recvDataWithResponse(secureReq, pair.stB, pair.b, pair.checkerB, "10.0.0.9:9999")
+		if recvErr != nil {
+			t.Fatalf("recv req %d failed: %v", i, recvErr)
+		}
+		env, err := proto.DecodeSecureEnvelope(respSecure)
+		if err != nil {
+			t.Fatalf("decode secure resp %d: %v", i, err)
+		}
+		msgType, plain, _, err := openSecureEnvelope(pair.a, env)
+		if err != nil {
+			t.Fatalf("open secure resp %d: %v", i, err)
+		}
+		if msgType != proto.MsgTypePeerExchangeResp {
+			t.Fatalf("unexpected resp type %d: %s", i, msgType)
+		}
+		if err := enforceTypeMax(proto.MsgTypePeerExchangeResp, len(plain)); err != nil {
+			t.Fatalf("resp %d too large: %v", i, err)
+		}
+		resp, err := proto.DecodePeerExchangeResp(plain)
+		if err != nil {
+			t.Fatalf("decode resp %d: %v", i, err)
+		}
+		if len(resp.Peers) == 0 {
+			t.Fatalf("expected truncated resp peers on iter %d", i)
+		}
+		if len(resp.Peers) >= 12 {
+			t.Fatalf("expected byte-budget truncation, got %d peers on iter %d", len(resp.Peers), i)
+		}
+		if i == 0 {
+			firstCount = len(resp.Peers)
+		} else if len(resp.Peers) != firstCount {
+			t.Fatalf("expected stable truncated peer count, got %d then %d", firstCount, len(resp.Peers))
+		}
+		if _, err := applyPeerExchangeResp(pair.a, resp); err != nil {
+			t.Fatalf("apply resp %d: %v", i, err)
+		}
 	}
 }
 

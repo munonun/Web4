@@ -274,6 +274,16 @@ func (r *Runner) RunOutboundOnlyWithContext(ctx context.Context, devTLS bool) er
 	return ctx.Err()
 }
 
+func (r *Runner) mode() string {
+	if r == nil {
+		return nodeModePeer
+	}
+	if r.Mode == nodeModeBootstrap {
+		return nodeModeBootstrap
+	}
+	return nodeModePeer
+}
+
 func (r *Runner) setListenAddr(addr string) {
 	if r == nil {
 		return
@@ -603,7 +613,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 	}
 
 	if wasSecure {
-		if nodeMode() != nodeModeBootstrap || !isBootstrapDiscoveryType(hdr.Type) {
+		if r.mode() != nodeModeBootstrap || !isBootstrapDiscoveryType(hdr.Type) {
 			if scope, ok := requiredMemberScope(hdr.Type); ok {
 				if r.Self.Members == nil || !r.Self.Members.HasScope(secureFromID, scope) {
 					if os.Getenv("WEB4_DEBUG") == "1" {
@@ -617,7 +627,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 
 	switch hdr.Type {
 	case proto.MsgTypeHello1:
-		if nodeMode() == nodeModeBootstrap {
+		if r.mode() == nodeModeBootstrap {
 			return nil, false, reject("bootstrap discovery-only", errors.New("bootstrap discovery-only: hello forbidden"))
 		}
 		m, err := proto.DecodeHello1Msg(data)
@@ -662,7 +672,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 		return out, true, nil
 
 	case proto.MsgTypeHello2:
-		if nodeMode() == nodeModeBootstrap {
+		if r.mode() == nodeModeBootstrap {
 			return nil, false, reject("bootstrap discovery-only", errors.New("bootstrap discovery-only: hello forbidden"))
 		}
 		m, err := proto.DecodeHello2Msg(data)
@@ -711,10 +721,16 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 		}
 		if senderAddr != "" && r.Self != nil && r.Self.Peers != nil {
 			var fromID [32]byte
+			candidateAddr := ""
+			candidateVerified := false
 			if req.FromNodeID != "" {
 				if id, err := decodeNodeIDHex(req.FromNodeID); err == nil {
 					fromID = id
 				}
+			}
+			if req.ListenAddr != "" && isValidAddr(req.ListenAddr) && (senderAddr == "" || sameHost(senderAddr, req.ListenAddr)) {
+				candidateAddr = strings.TrimSpace(req.ListenAddr)
+				candidateVerified = true
 			}
 			if req.PubKey != "" {
 				pub, err := hex.DecodeString(req.PubKey)
@@ -724,7 +740,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 					}
 					if !isZeroNodeID(fromID) {
 						p := peer.Peer{NodeID: fromID, PubKey: pub, Source: "pex", SubnetKey: peer.SubnetKeyForAddr(senderAddr)}
-						_, _ = r.Self.Peers.ObserveAddr(p, senderAddr, "", false, true)
+						_, _ = r.Self.Peers.ObserveAddr(p, senderAddr, candidateAddr, candidateVerified, true)
 						r.Self.Peers.PeerSeen(fromID, "")
 						p.Addr = ""
 						_ = r.Self.Peers.Upsert(p, true)
@@ -735,16 +751,23 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 				} else if os.Getenv("WEB4_DEBUG") == "1" && err != nil {
 					fmt.Fprintf(os.Stderr, "peer_exchange_req invalid pubkey: %v\n", err)
 				}
-			} else if nodeMode() == nodeModeBootstrap && !isZeroNodeID(fromID) && isValidAddr(senderAddr) {
+			} else if r.mode() == nodeModeBootstrap && !isZeroNodeID(fromID) && isValidAddr(senderAddr) {
 				p := peer.Peer{NodeID: fromID, Addr: "", Source: "pex", SubnetKey: peer.SubnetKeyForAddr(senderAddr)}
 				_ = r.Self.Peers.UpsertUnverified(p)
-				_, _ = r.Self.Peers.ObserveAddr(p, senderAddr, "", false, true)
+				changed, err := r.Self.Peers.ObserveAddrDiscovery(fromID, senderAddr, candidateAddr, candidateVerified, true)
+				if os.Getenv("WEB4_DEBUG") == "1" {
+					finalAddr := ""
+					if stored, ok := r.Self.Peers.Get(fromID); ok {
+						finalAddr = stored.Addr
+					}
+					fmt.Fprintf(os.Stderr, "peer_exchange_req bootstrap learn node_id=%x observed_addr=%s listen_addr=%s final_addr=%s changed=%t err=%v\n", fromID[:], senderAddr, candidateAddr, finalAddr, changed, err)
+				}
 				if r.Self.Candidates != nil {
 					r.Self.Candidates.Add(senderAddr)
 				}
 			}
 		}
-		resp, err := buildPeerExchangeResp(r.Self, req.K, r.getListenAddr())
+		resp, err := buildPeerExchangeResp(r.Self, req.K, r.getListenAddr(), r.mode() == nodeModeBootstrap)
 		if err != nil {
 			return nil, false, reject("peer exchange failed", err)
 		}
@@ -768,10 +791,13 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 		if err != nil {
 			return nil, false, reject("decode peer exchange resp failed", err)
 		}
+		pexDebugf("peer_exchange_resp received peers=%d from=%s", len(resp.Peers), senderAddr)
 		added, err := applyPeerExchangeResp(r.Self, resp)
 		if err != nil {
+			pexDebugf("peer_exchange_resp rejected err=%v", err)
 			return nil, false, reject("apply peer exchange resp failed", err)
 		}
+		pexDebugf("peer_exchange_resp applied added=%d peers=%d", added, len(resp.Peers))
 		fmt.Println("RECV PEER EXCHANGE", added)
 		return nil, false, nil
 
@@ -847,7 +873,7 @@ func (r *Runner) recvDataWithResponse(data []byte, senderAddr string) ([]byte, b
 			return nil, false, reject("invalid invite bundle", err)
 		}
 		inviteePub, err := hex.DecodeString(msg.InviteePub)
-		if err != nil || !crypto.IsRSAPublicKey(inviteePub) {
+		if err != nil || !crypto.IsIdentityPublicKey(inviteePub) {
 			return nil, false, reject("invalid invite bundle", fmt.Errorf("bad invitee pubkey"))
 		}
 		inviteeID := node.DeriveNodeID(inviteePub)
@@ -2118,10 +2144,10 @@ func validateInviteCert(cert proto.InviteCert, invites *peer.InviteStore, now ti
 	if len(cert.InviterPub) == 0 {
 		return zero, zero, fmt.Errorf("missing inviter_pub")
 	}
-	if !crypto.IsRSAPublicKey(cert.InviteePub) {
+	if !crypto.IsIdentityPublicKey(cert.InviteePub) {
 		return zero, zero, fmt.Errorf("invitee node_id mismatch")
 	}
-	if !crypto.IsRSAPublicKey(cert.InviterPub) {
+	if !crypto.IsIdentityPublicKey(cert.InviterPub) {
 		return zero, zero, fmt.Errorf("inviter node_id mismatch")
 	}
 	if len(cert.InviteID) != 16 && len(cert.InviteID) != 32 {
@@ -3448,7 +3474,7 @@ func BuildDeltaBZK(entries []proto.DeltaBEntry, ctx []byte) (*proto.ZKLinearProo
 	return buildDeltaZK(entries, ctx)
 }
 
-func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.PeerExchangeRespMsg, error) {
+func buildPeerExchangeResp(self *node.Node, k int, listenAddr string, bootstrapMode bool) (proto.PeerExchangeRespMsg, error) {
 	if self == nil || self.Peers == nil {
 		return proto.PeerExchangeRespMsg{}, fmt.Errorf("peer store unavailable")
 	}
@@ -3460,14 +3486,13 @@ func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.Pee
 		k = cap
 	}
 	peers := self.Peers.List()
-	bootstrapMode := nodeMode() == nodeModeBootstrap
 	if bootstrapMode {
 		rng := peerExchangeRand()
 		rng.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
 	}
-	respPeers := make([]proto.PeerExchangePeer, 0, k)
+	candidates := make([]proto.PeerExchangePeer, 0, k+1)
 	for _, p := range peers {
-		if len(respPeers) >= k {
+		if len(candidates) >= k {
 			break
 		}
 		if p.Addr == "" {
@@ -3477,39 +3502,47 @@ func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.Pee
 			continue
 		}
 		id := p.NodeID
-		if isZeroNodeID(id) {
-			if len(p.PubKey) == 0 {
-				continue
-			}
+		if isZeroNodeID(id) && len(p.PubKey) > 0 {
 			id = node.DeriveNodeID(p.PubKey)
 		}
-		peerMsg := proto.PeerExchangePeer{
+		if isZeroNodeID(id) {
+			continue
+		}
+		candidates = append(candidates, proto.PeerExchangePeer{
 			ListenAddr: p.Addr,
-			Addr:       p.Addr,
 			NodeID:     hex.EncodeToString(id[:]),
-		}
-		if len(p.PubKey) > 0 {
-			peerMsg.PubKey = hex.EncodeToString(p.PubKey)
-		}
-		respPeers = append(respPeers, peerMsg)
+			PubKey:     hex.EncodeToString(p.PubKey),
+		})
 	}
-	if listenAddr != "" && len(self.PubKey) > 0 && len(respPeers) < k && isValidAddr(listenAddr) {
+	if listenAddr != "" && len(self.PubKey) > 0 && len(candidates) < k && isValidAddr(listenAddr) {
 		selfIDHex := hex.EncodeToString(self.ID[:])
 		dup := false
-		for _, p := range respPeers {
-			if p.NodeID == selfIDHex || p.Addr == listenAddr {
+		for _, p := range candidates {
+			if p.NodeID == selfIDHex || p.ListenAddr == listenAddr || p.Addr == listenAddr {
 				dup = true
 				break
 			}
 		}
 		if !dup {
-			respPeers = append(respPeers, proto.PeerExchangePeer{
+			candidates = append(candidates, proto.PeerExchangePeer{
 				ListenAddr: listenAddr,
-				Addr:       listenAddr,
 				NodeID:     selfIDHex,
 				PubKey:     hex.EncodeToString(self.PubKey),
 			})
 		}
+	}
+	respPeers := make([]proto.PeerExchangePeer, 0, len(candidates))
+	for _, candidate := range candidates {
+		nextPeers := append(append([]proto.PeerExchangePeer(nil), respPeers...), candidate)
+		msg, encoded, err := finalizePeerExchangeResp(self, nextPeers)
+		if err != nil {
+			return proto.PeerExchangeRespMsg{}, err
+		}
+		if err := enforceTypeMax(proto.MsgTypePeerExchangeResp, len(encoded)); err != nil {
+			break
+		}
+		respPeers = nextPeers
+		_ = msg
 	}
 	if os.Getenv("WEB4_DEBUG") == "1" {
 		selfIncluded := false
@@ -3522,11 +3555,19 @@ func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.Pee
 		}
 		fmt.Fprintf(os.Stderr, "peer_exchange_resp peers=%d self_included=%t addr=%s\n", len(respPeers), selfIncluded, listenAddr)
 	}
+	msg, _, err := finalizePeerExchangeResp(self, respPeers)
+	if err != nil {
+		return proto.PeerExchangeRespMsg{}, err
+	}
+	return msg, nil
+}
+
+func finalizePeerExchangeResp(self *node.Node, peers []proto.PeerExchangePeer) (proto.PeerExchangeRespMsg, []byte, error) {
 	msg := proto.PeerExchangeRespMsg{
 		Type:         proto.MsgTypePeerExchangeResp,
 		ProtoVersion: proto.ProtoVersion,
 		Suite:        proto.Suite,
-		Peers:        respPeers,
+		Peers:        peers,
 	}
 	fromID := self.ID
 	msg.FromNodeID = hex.EncodeToString(fromID[:])
@@ -3534,11 +3575,15 @@ func buildPeerExchangeResp(self *node.Node, k int, listenAddr string) (proto.Pee
 	payloadMsg.SigFrom = ""
 	payload, err := proto.EncodePeerExchangeResp(payloadMsg)
 	if err != nil {
-		return proto.PeerExchangeRespMsg{}, err
+		return proto.PeerExchangeRespMsg{}, nil, err
 	}
 	sig := sigFromBytes(msg.ProtoVersion, msg.Suite, msg.Type, fromID, payload, self.PrivKey)
 	msg.SigFrom = hex.EncodeToString(sig)
-	return msg, nil
+	encoded, err := proto.EncodePeerExchangeResp(msg)
+	if err != nil {
+		return proto.PeerExchangeRespMsg{}, nil, err
+	}
+	return msg, encoded, nil
 }
 
 func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int, error) {
@@ -3554,10 +3599,12 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 		}
 		p, err := decodePeerExchangePeer(resp.Peers[i])
 		if err != nil {
+			pexDebugf("peer_exchange_resp drop index=%d reason=decode_peer err=%v", i, err)
 			logPexDrop("decode_peer")
 			continue
 		}
 		if !isValidAddr(p.Addr) {
+			pexDebugf("peer_exchange_resp drop index=%d node_id=%x reason=invalid_addr addr=%s", i, p.NodeID[:], p.Addr)
 			logPexDrop("invalid_addr")
 			continue
 		}
@@ -3566,23 +3613,42 @@ func applyPeerExchangeResp(self *node.Node, resp proto.PeerExchangeRespMsg) (int
 		if p.Addr != "" && self.Candidates != nil {
 			self.Candidates.Add(p.Addr)
 		}
+		_, prevAddr, _ := pexPersistedPeer(self, p.NodeID)
+		overwriteReason := "pex_no_addr"
 		if len(p.PubKey) == 0 {
 			if err := self.Peers.UpsertUnverified(p); err != nil {
+				pexDebugf("peer_exchange_resp drop index=%d node_id=%x reason=upsert_unverified err=%v", i, p.NodeID[:], err)
 				logPexDrop("upsert_unverified")
 				continue
 			}
+			pexDebugf("peer_exchange_resp applied index=%d node_id=%x addr=%s verified=0 persisted=0", i, p.NodeID[:], p.Addr)
 		} else {
 			if p.Addr != "" && self.Peers != nil {
-				if _, err := self.Peers.SetAddrUnverified(p, p.Addr, true); err != nil {
+				changed, err := self.Peers.SetAddrUnverified(p, p.Addr, true)
+				if err != nil {
+					overwriteReason = "pex_addr_rejected"
+					pexDebugf("peer_exchange_resp addr index=%d node_id=%x prev_addr=%s incoming_addr=%s reason=addr_conflict err=%v", i, p.NodeID[:], prevAddr, p.Addr, err)
 					logPexDrop("addr_conflict")
+				} else {
+					if changed {
+						overwriteReason = "pex_addr_applied"
+					} else if prevAddr == p.Addr {
+						overwriteReason = "pex_addr_kept_same"
+					} else {
+						overwriteReason = "pex_addr_kept_existing"
+					}
+					pexDebugf("peer_exchange_resp addr index=%d node_id=%x prev_addr=%s incoming_addr=%s changed=%t reason=%s", i, p.NodeID[:], prevAddr, p.Addr, changed, overwriteReason)
 				}
 				self.Peers.PeerSeen(p.NodeID, "")
 			}
 			p.Addr = ""
 			if err := self.Peers.Upsert(p, true); err != nil {
+				pexDebugf("peer_exchange_resp drop index=%d node_id=%x reason=upsert err=%v", i, p.NodeID[:], err)
 				logPexDrop("upsert")
 				continue
 			}
+			persisted, addr, ok := pexPersistedPeer(self, p.NodeID)
+			pexDebugf("peer_exchange_resp applied index=%d node_id=%x prev_addr=%s incoming_addr=%s final_addr=%s reason=%s verified=1 persisted=%t present=%t", i, p.NodeID[:], prevAddr, pexIncomingAddr(resp.Peers[i]), addr, overwriteReason, persisted, ok)
 		}
 		added++
 	}
@@ -3612,6 +3678,32 @@ func logPexDrop(reason string) {
 		return
 	}
 	pexDropLogMu.Unlock()
+}
+
+func pexDebugf(format string, args ...any) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+}
+
+func pexPersistedPeer(self *node.Node, id [32]byte) (bool, string, bool) {
+	if self == nil || self.Peers == nil {
+		return false, "", false
+	}
+	for _, p := range self.Peers.List() {
+		if p.NodeID == id {
+			return p.Addr != "", p.Addr, true
+		}
+	}
+	return false, "", false
+}
+
+func pexIncomingAddr(p proto.PeerExchangePeer) string {
+	if p.ListenAddr != "" {
+		return p.ListenAddr
+	}
+	return p.Addr
 }
 
 func pexInsertCap() int {

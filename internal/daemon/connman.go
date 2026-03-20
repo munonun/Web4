@@ -554,16 +554,17 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 		K:            reqK,
 	}
 	req.FromNodeID = hex.EncodeToString(c.self.ID[:])
+	req.ListenAddr = strings.TrimSpace(c.self.ListenAddr())
 	req.PubKey = hex.EncodeToString(c.self.PubKey)
 	if req.PubKey == "" {
 		return fmt.Errorf("missing pubkey")
 	}
-	data, err := proto.EncodePeerExchangeReq(req)
+	data, compactedReq, err := proto.EncodePeerExchangeReqBudgeted(req)
 	if err != nil {
 		return err
 	}
-	if err := enforceTypeMax(proto.MsgTypePeerExchangeReq, len(data)); err != nil {
-		return err
+	if compactedReq {
+		pexConnDebugf("peer_exchange_req compacted node=%x addr=%s secure=1 omit_pubkey=1 bytes=%d", p.NodeID[:], addr, len(data))
 	}
 	secureReq, err := sealSecureEnvelope(c.self, p.NodeID, proto.MsgTypePeerExchangeReq, "", data)
 	if err != nil {
@@ -586,30 +587,41 @@ func (c *connMan) sendPeerExchange(ctx context.Context, p peer.Peer) error {
 	c.metrics.ObservePexRTT(time.Since(pexStarted))
 	if err != nil {
 		c.markFailure(p.NodeID)
+		c.logPexError(addr, err)
 		return err
 	}
+	pexConnDebugf("peer_exchange_resp raw secure bytes=%d addr=%s node=%x", len(respData), addr, p.NodeID[:])
 	env, err := proto.DecodeSecureEnvelope(respData)
 	if err != nil {
+		c.logPexError(addr, fmt.Errorf("decode secure envelope failed: %w", err))
 		return err
 	}
 	msgType, plain, _, err := openSecureEnvelope(c.self, env)
 	if err != nil {
+		c.logPexError(addr, fmt.Errorf("open secure envelope failed: %w", err))
 		return err
 	}
 	if msgType != proto.MsgTypePeerExchangeResp {
+		c.logPexError(addr, fmt.Errorf("unexpected peer exchange resp: %s", msgType))
 		return fmt.Errorf("unexpected peer exchange resp: %s", msgType)
 	}
+	pexConnDebugf("peer_exchange_resp opened bytes=%d addr=%s node=%x", len(plain), addr, p.NodeID[:])
 	resp, err := proto.DecodePeerExchangeResp(plain)
 	if err != nil {
+		c.logPexError(addr, fmt.Errorf("decode peer exchange resp failed: %w", err))
 		return err
 	}
+	pexConnDebugf("peer_exchange_resp decoded peers=%d addr=%s node=%x", len(resp.Peers), addr, p.NodeID[:])
 	if c.metrics != nil {
 		c.metrics.IncPexResponsesTotal()
 		c.metrics.IncPexRespRecvTotal()
 	}
-	if _, err := applyPeerExchangeResp(c.self, resp); err != nil {
+	added, err := applyPeerExchangeResp(c.self, resp)
+	if err != nil {
+		c.logPexError(addr, fmt.Errorf("apply peer exchange resp failed: %w", err))
 		return err
 	}
+	pexConnDebugf("peer_exchange_resp applied added=%d peers=%d addr=%s node=%x", added, len(resp.Peers), addr, p.NodeID[:])
 	c.promoteSeed(resp, addr)
 	return nil
 }
@@ -655,17 +667,20 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			K:            reqK,
 		}
 		req.FromNodeID = hex.EncodeToString(c.self.ID[:])
+		req.ListenAddr = strings.TrimSpace(c.self.ListenAddr())
 		req.PubKey = hex.EncodeToString(c.self.PubKey)
-		data, err := proto.EncodePeerExchangeReq(req)
+		data, compactedReq, err := proto.EncodePeerExchangeReqBudgeted(req)
 		if err != nil {
 			continue
 		}
-		if err := enforceTypeMax(proto.MsgTypePeerExchangeReq, len(data)); err != nil {
-			continue
+		if compactedReq {
+			pexConnDebugf("peer_exchange_req compacted addr=%s secure=0 omit_pubkey=1 bytes=%d", addr, len(data))
 		}
+		pexConnDebugf("bootstrap_pex start addr=%s req_bytes=%d devtls=%t", addr, len(data), c.devTLS)
 		reqCtx, cancel := context.WithTimeout(ctx, dialTimeout())
 		release, slotErr := c.acquireDialSlot(reqCtx)
 		if slotErr != nil {
+			pexConnDebugf("bootstrap_pex skipped addr=%s stage=dial_slot err=%v", addr, slotErr)
 			if startedBootstrapPex {
 				c.finishBootstrapPex(addr, time.Now(), slotErr)
 			}
@@ -679,6 +694,7 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		c.metrics.ObservePexRTT(time.Since(pexStarted))
 		cancel()
 		if err != nil {
+			pexConnDebugf("bootstrap_pex failed addr=%s stage=exchange err=%v", addr, err)
 			if startedBootstrapPex {
 				c.finishBootstrapPex(addr, time.Now(), err)
 			}
@@ -688,6 +704,7 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			c.logPexError(addr, err)
 			continue
 		}
+		pexConnDebugf("bootstrap_pex response addr=%s bytes=%d", addr, len(respData))
 		if c.metrics != nil {
 			c.metrics.IncDialSuccessTotal()
 			c.metrics.IncQuicConnectSuccessTotal()
@@ -695,6 +712,7 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 		}
 		resp, err := proto.DecodePeerExchangeResp(respData)
 		if err != nil {
+			pexConnDebugf("bootstrap_pex failed addr=%s stage=decode err=%v", addr, err)
 			if startedBootstrapPex {
 				c.finishBootstrapPex(addr, time.Now(), err)
 			}
@@ -704,19 +722,24 @@ func (c *connMan) sendPeerExchangePlain(ctx context.Context, addrs []string) {
 			c.logPexError(addr, err)
 			continue
 		}
+		pexConnDebugf("peer_exchange_resp decoded peers=%d addr=%s secure=0", len(resp.Peers), addr)
 		if c.metrics != nil {
 			c.metrics.IncPexResponsesTotal()
 			c.metrics.IncPexRespRecvTotal()
 		}
-		if _, err := applyPeerExchangeResp(c.self, resp); err != nil {
+		added, err := applyPeerExchangeResp(c.self, resp)
+		if err != nil {
+			pexConnDebugf("bootstrap_pex failed addr=%s stage=apply err=%v", addr, err)
 			if startedBootstrapPex {
 				c.finishBootstrapPex(addr, time.Now(), err)
 			}
 			if c.metrics != nil {
 				c.metrics.IncDialFailByReason(reason + ":apply")
 			}
+			c.logPexError(addr, fmt.Errorf("apply peer exchange resp failed: %w", err))
 			continue
 		}
+		pexConnDebugf("peer_exchange_resp applied added=%d peers=%d addr=%s secure=0", added, len(resp.Peers), addr)
 		if startedBootstrapPex {
 			c.finishBootstrapPex(addr, time.Now(), nil)
 		}
@@ -1002,6 +1025,13 @@ func (c *connMan) logPexError(addr string, err error) {
 	c.addrLog[addr] = now
 	c.mu.Unlock()
 	fmt.Fprintf(os.Stderr, "pex dial failed addr=%s err=%v\n", addr, err)
+}
+
+func pexConnDebugf(format string, args ...any) {
+	if os.Getenv("WEB4_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
 func (c *connMan) beginBootstrapPex(addr string, now time.Time) bool {

@@ -20,7 +20,7 @@ func TestBootstrapModeRejectsHello1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new sender node: %v", err)
 	}
-	r := &Runner{Self: self, Root: t.TempDir(), Metrics: metrics.New()}
+	r := &Runner{Self: self, Root: t.TempDir(), Metrics: metrics.New(), Mode: nodeModeBootstrap}
 
 	hello1, err := sender.BuildHello1(self.ID)
 	if err != nil {
